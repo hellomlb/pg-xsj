@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>PG习思集</title>
+    <link>https://hellomlb.github.io/pg-xsj</link>
+    <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
+    <language>zh-CN</language>
+    <lastBuildDate>Thu, 28 May 2026 10:32:37 +0800</lastBuildDate>
+    <item>
+      <title>CVE-2026-6473：全文搜索整数溢出导致服务端崩溃</title>
+      <link>https://hellomlb.github.io/pg-xsj/posts/cve-2026-6473-int-overflow.html</link>
+      <description>PG 16.14 修复了一个 CVSS Critical 整数溢出漏洞，影响 ts_headline、intarray 和 ltree 三个扩展。本文通过 PG 16.11 vs 16.14 双版本 SQL 回归测试，验证修复不影响正常功能。</description>
+      <pubDate>2026-05-25</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/posts/cve-2026-6473-int-overflow.html</guid>
+    </item>
+  </channel>
+</rss>
