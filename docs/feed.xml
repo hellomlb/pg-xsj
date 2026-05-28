@@ -5,13 +5,20 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 28 May 2026 13:41:26 +0800</lastBuildDate>
+    <lastBuildDate>Thu, 28 May 2026 17:30:27 +0800</lastBuildDate>
     <item>
       <title>commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/commit-delay-wal-tuning.html</link>
       <description>commit_delay 可能是 PG 中被误解最深的性能参数：九成人调了等于白调，设太高反而更慢。本文从 xlog.c 源码倒推出调优决策树，带你走完 pg_test_fsync → pg_stat_wal → 迭代测试的完整流程。</description>
       <pubDate>2026-05-28</pubDate>
       <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/commit-delay-wal-tuning.html</guid>
+    </item>
+    <item>
+      <title>CVE-2026-6637：refint 栈溢出 + SQL 注入——被遗忘的 1997 年定时炸弹</title>
+      <link>https://hellomlb.github.io/pg-xsj/cve/cve-2026-6637-refint-overflow.html</link>
+      <description>PostgreSQL 1997 年引入的 refint 扩展在 2026 年仍存在栈缓冲区溢出 + SQL 注入双漏洞（CVSS 8.8）。pg_upgrade 静默保留废弃扩展，升级即是埋雷。本文从 refint 机制、漏洞双路径、现场检测到迁移方案，一网打尽。</description>
+      <pubDate>2026-05-28</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/cve/cve-2026-6637-refint-overflow.html</guid>
     </item>
     <item>
       <title>Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</title>
