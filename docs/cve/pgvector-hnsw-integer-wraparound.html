@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pgvector 并行 HNSW 整数回绕：一次代码审计发现的理论缓冲区溢出 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="pgvector v0.8.1 并行 HNSW 索引构建存在整数回绕漏洞，共享内存分配无上限保护，极端情况下可导致缓冲区溢出。虽 SQL 不可复现，但代码审计+逻辑验证完善证明漏洞存在。本文逐点拆解 4 个漏洞点、修复对比、风险评估。">
+<meta property="og:title" content="pgvector 并行 HNSW 整数回绕：一次代码审计发现的理论缓冲区溢出">
+<meta property="og:description" content="pgvector v0.8.1 并行 HNSW 索引构建存在整数回绕漏洞，共享内存分配无上限保护，极端情况下可导致缓冲区溢出。虽 SQL 不可复现，但代码审计+逻辑验证完善证明漏洞存在。本文逐点拆解 4 个漏洞点、修复对比、风险评估。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://hellomlb.github.io/pg-xsj/cve/pgvector-hnsw-integer-wraparound.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>pgvector 并行 HNSW 整数回绕：一次代码审计发现的理论缓冲区溢出</h1>
+        <div class="post-meta">
+            
+            <time datetime="2026-05-28">2026-05-28</time>
+            <span class="post-category cve">
+                CVE 验证
+            </span>
+            <span class="post-tags">
+                <span class="tag">pgvector</span>
+<span class="tag">HNSW</span>
+<span class="tag">整数回绕</span>
+<span class="tag">缓冲区溢出</span>
+<span class="tag">代码审计</span>
+<span class="tag">安全加固</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>一、这是什么？</h2>
+
+<p>pgvector 是 PostgreSQL 最流行的向量相似性搜索扩展，HNSW（Hierarchical Navigable Small World）是其核心索引算法。在并行构建 HNSW 索引时，共享内存分配逻辑存在<strong>整数回绕（Integer Wraparound）漏洞</strong>。</p>
+
+<table>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+<tr>
+<td><strong>漏洞类型</strong></td>
+<td>整数回绕导致缓冲区溢出</td>
+</tr>
+<tr>
+<td><strong>影响组件</strong></td>
+<td><code>src/hnswbuild.c</code> — 并行 HNSW 索引构建</td>
+</tr>
+<tr>
+<td><strong>影响版本</strong></td>
+<td>pgvector v0.8.0 ~ v0.8.1</td>
+</tr>
+<tr>
+<td><strong>修复 Commit</strong></td>
+<td><a href="https://github.com/pgvector/pgvector/commit/b7e680d"><code>b7e680d</code></a></td>
+</tr>
+<tr>
+<td><strong>发现者</strong></td>
+<td>chungkn (OneMount Group)</td>
+</tr>
+<tr>
+<td><strong>严重程度</strong></td>
+<td>中危 — 理论可证明，实际触发条件极端</td>
+</tr>
+</table>
+
+<blockquote><strong>为什么 SQL 不可复现？</strong> 触发整数回绕需要 <code>memoryUsed</code> 接近 <code>SIZE_MAX</code>（64位系统约 18EB），远超实际可分配内存。但通过代码审计 + C 语言逻辑验证，可严格证明漏洞存在。</blockquote>
+
+<hr>
+
+<h2>二、漏洞原理：一根稻草压垮骆驼</h2>
+
+<h3>2.1 正常流程</h3>
+
+<p>并行 HNSW 索引构建的内存分配分三步：</p>
+
+<li><code>HnswBeginParallel()</code> 预估内存 → <code>maintenance_work_mem * 1024</code></li>
+<li><code>InitGraph()</code> 设置 <code>memoryTotal</code>（总配额）和 <code>memoryUsed = 0</code>（已用）</li>
+<li>工作进程通过 <code>HnswSharedMemoryAlloc()</code> 递增 <code>memoryUsed</code>，<code>InsertTuple()</code> 检查 <code>memoryUsed >= memoryTotal</code> 时 flush 到磁盘</li>
+
+<h3>2.2 问题出在哪？</h3>
+
+<p>核心数据结构 <code>HnswGraph</code> 中两个字段都是 <code>size_t</code>（<code>uint64_t</code>）：</p>
+
+<pre><code>Size memoryUsed;   // 当前已分配
+Size memoryTotal;  // 总内存配额</code></pre>
+
+<p>漏洞链分三步触发：</p>
+
+<table>
+<tr>
+<th>环节</th>
+<th>代码</th>
+<th>问题</th>
+</tr>
+<tr>
+<td>① 无上限</td>
+<td><code>graph->memoryTotal = memoryTotal</code></td>
+<td>直接赋值，无 <code>SIZE_MAX/2</code> 保护</td>
+</tr>
+<tr>
+<td>② 无溢出检查</td>
+<td><code>memoryUsed += MAXALIGN(size)</code></td>
+<td>加法溢出→回绕到小值</td>
+</tr>
+<tr>
+<td>③ 检查被绕过</td>
+<td><code>memoryUsed >= memoryTotal</code></td>
+<td>回绕后始终为 false，继续分配→越界</td>
+</tr>
+</table>
+
+<p>用大白话说：<strong>计数器从 99 加到 100 应该报警，但它直接翻回了 0，系统以为还有空间，继续往里塞数据——这时候已经写到别人的地盘了。</strong></p>
+
+<h3>2.3 那个"鸵鸟式" Hack</h3>
+
+<p>当前代码第 977-978 行藏了一段注释：</p>
+
+<pre><code>/* Report less than allocated so never fails */
+InitGraph(&amp;hnswshared-&gt;graphData, hnswarea, esthnswarea - 1024 * 1024);</code></pre>
+
+<p>人为少报 1MB 内存，试图"预留缓冲"。这不是修复——它只是让正常场景不暴露问题，整数回绕的风险依然存在。</p>
+
+<hr>
+
+<h2>三、四个漏洞点逐帧拆解</h2>
+
+<h3>漏洞点 #1：InitGraph 无上限（第 606 行）</h3>
+
+<pre><code>// v0.8.1（有漏洞）
+graph-&gt;memoryTotal = memoryTotal;  // 可能接近 SIZE_MAX！
+
+// b7e680d（修复后）
+graph-&gt;memoryTotal = Min(memoryTotal, HNSW_MAX_GRAPH_MEMORY);</code></pre>
+
+<h3>漏洞点 #2：内存分配无溢出检查（第 649 行）</h3>
+
+<pre><code>// v0.8.1（有漏洞）
+buildstate-&gt;graph-&gt;memoryUsed += MAXALIGN(size);  // 可能回绕！
+
+// b7e680d（修复后）— 配合 #1 的上限保护，不再需要单独溢出检查（SIZE_MAX/2 保证不会溢出）</code></pre>
+
+<h3>漏洞点 #3：裸内存检查无安全边距（第 513 行）</h3>
+
+<pre><code>// v0.8.1（有漏洞）
+if (graph-&gt;memoryUsed &gt;= graph-&gt;memoryTotal)
+
+// b7e680d（修复后）
+memoryMargin = base == NULL ? 0 : 1024 * 1024;
+if (graph-&gt;memoryUsed + memoryMargin &gt;= graph-&gt;memoryTotal)</code></pre>
+
+<h3>漏洞点 #4：Hack 规避代码（第 977-978 行）</h3>
+
+<pre><code>// v0.8.1（有漏洞）
+InitGraph(&amp;hnswshared-&gt;graphData, hnswarea, esthnswarea - 1024 * 1024);
+
+// b7e680d（修复后）
+InitGraph(&amp;hnswshared-&gt;graphData, hnswarea, esthnswarea);</code></pre>
+
+<hr>
+
+<h2>四、修复对比一览</h2>
+
+<table>
+<tr>
+<th>漏洞点</th>
+<th>修复前 (v0.8.1)</th>
+<th>修复后 (b7e680d)</th>
+<th>修复方式</th>
+</tr>
+<tr>
+<td>内存上限</td>
+<td>无</td>
+<td><code>SIZE_MAX / 2</code></td>
+<td>新增宏常量，硬限制</td>
+</tr>
+<tr>
+<td>上限保护</td>
+<td>无</td>
+<td><code>Min(memoryTotal, HNSW_MAX_GRAPH_MEMORY)</code></td>
+<td>InitGraph 入口拦截</td>
+</tr>
+<tr>
+<td>预估限制</td>
+<td>无</td>
+<td><code>Min(esthnswarea, HNSW_MAX_GRAPH_MEMORY)</code></td>
+<td>BeginParallel 入口拦截</td>
+</tr>
+<tr>
+<td>内存检查</td>
+<td><code>memoryUsed >= memoryTotal</code></td>
+<td><code>memoryUsed + memoryMargin >= memoryTotal</code></td>
+<td>加 1MB 安全边距</td>
+</tr>
+<tr>
+<td>Hack 代码</td>
+<td><code>esthnswarea - 1MB</code></td>
+<td>已移除</td>
+<td>根因修复后不再需要</td>
+</tr>
+</table>
+
+<p>修复的核心思路简单直接：<strong><code>SIZE_MAX/2</code> 一劳永逸</strong>。任何合法内存分配都不可能超过这个值，整数回绕从物理上被杜绝。</p>
+
+<hr>
+
+<h2>五、验证：不能跑 SQL，但能跑逻辑</h2>
+
+<h3>5.1 为什么 SQL 不可复现</h3>
+
+<table>
+<tr>
+<th>限制层</th>
+<th>说明</th>
+</tr>
+<tr>
+<td><strong>内存要求</strong></td>
+<td>需要约 18EB，64位地址空间的理论上限</td>
+</tr>
+<tr>
+<td><strong>PG 参数</strong></td>
+<td><code>maintenance_work_mem</code> 上限通常不超数 GB</td>
+</tr>
+<tr>
+<td><strong>OS 限制</strong></td>
+<td>共享内存（shm）远小于 18EB</td>
+</tr>
+<tr>
+<td><strong>实际场景</strong></td>
+<td>"减 1MB" hack 在正常场景下足够掩盖问题</td>
+</tr>
+</table>
+
+<h3>5.2 三种逻辑验证</h3>
+
+<p><strong>方法一：代码审计（已执行）</strong></p>
+
+<p>逐行确认 v0.8.1 代码中不存在任何修复 commit 的保护措施：</p>
+<li>❌ <code>HNSW_MAX_GRAPH_MEMORY</code> 宏不存在</li>
+<li>❌ <code>Min(memoryTotal, ...)</code> 上限检查不存在</li>
+<li>❌ <code>memoryMargin</code> 安全边距不存在</li>
+<li>❌ Hack 代码仍在第 977-978 行</li>
+
+<p><strong>方法二：C 语言整数回绕 PoC</strong></p>
+
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stddef.h&gt;
+
+int main() {
+    size_t memoryTotal = SIZE_MAX;
+    size_t memoryUsed  = SIZE_MAX - 100;
+    size_t allocSize   = 200;
+
+    memoryUsed += allocSize;  // 回绕！
+
+    printf(&quot;=== v0.8.1 模拟 ===\n&quot;);
+    printf(&quot;memoryTotal = %zu\n&quot;, memoryTotal);
+    printf(&quot;memoryUsed (回绕后) = %zu\n&quot;, memoryUsed);
+    printf(&quot;检查: memoryUsed &gt;= memoryTotal ? %s\n&quot;,
+           memoryUsed &gt;= memoryTotal ? &quot;true&quot; : &quot;false ← 被绕过！&quot;);
+    return 0;
+}</code></pre>
+
+<p>输出确认：<code>memoryUsed</code> 从 <code>SIZE_MAX - 100 + 200 = 100</code> 回绕成 100，远小于 <code>memoryTotal</code>，检查被绕过。</p>
+
+<p><strong>方法三：Commit Diff 对比</strong></p>
+
+<p>通过 <code>git diff b7e680d</code> 确认当前代码缺少 5 项修复。</p>
+
+<hr>
+
+<h2>六、风险评估与建议</h2>
+
+<table>
+<tr>
+<th>维度</th>
+<th>评估</th>
+</tr>
+<tr>
+<td><strong>可利用性</strong></td>
+<td>低 — 需要 18EB 内存，实际不可触发</td>
+</tr>
+<tr>
+<td><strong>影响范围</strong></td>
+<td>中 — 影响所有并行 HNSW 索引构建场景</td>
+</tr>
+<tr>
+<td><strong>数据安全</strong></td>
+<td>中 — 理论上的缓冲区溢出可能导致数据损坏或崩溃</td>
+</tr>
+<tr>
+<td><strong>综合评级</strong></td>
+<td><strong>中危</strong> — 防御性修复，建议升级</td>
+</tr>
+</table>
+
+<h3>建议</h3>
+
+<li><strong>升级 pgvector</strong> 至包含 commit <code>b7e680d</code> 的版本</li>
+<li>如无法立即升级，<strong>限制 <code>max_parallel_maintenance_workers</code></strong> 降低并行构建暴露面</li>
+<li>设置合理的 <code>maintenance_work_mem</code> 上限，避免极端配置</li>
+
+<hr>
+
+<h2>七、参考资料</h2>
+
+<li><a href="https://thebuild.com/blog/pgvec">漏洞公告 (The Build)</a></li>
+<li><a href="https://github.com/pgvector/pgvector/commit/b7e680d">修复 Commit</a></li>
+<li><a href="https://github.com/pgvector/pgvector">pgvector 仓库</a></li>
+<li>漏洞发现者：chungkn (OneMount Group)</li>
+
+    </div>
+
+    <div class="post-meta-box">
+        
+        
+        <p><strong>CVSS:</strong> 中危</p>
+        <p><strong>PG 版本:</strong> pgvector v0.8.0 ~ v0.8.1</p>
+    </div>
+</article>
+
+<nav class="post-nav">
+    <a href="/pg-xsj/">← 返回首页</a>
+</nav>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

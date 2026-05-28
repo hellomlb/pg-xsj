@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/cve/pgvector-hnsw-integer-wraparound.html">pgvector 并行 HNSW 整数回绕：一次代码审计发现的理论缓冲区溢出</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-05-28">2026-05-28</time>
+            <span class="post-category cve">CVE 验证</span>
+        </div>
+        <p class="post-excerpt">pgvector v0.8.1 并行 HNSW 索引构建存在整数回绕漏洞，共享内存分配无上限保护，极端情况下可导致缓冲区溢出。虽 SQL 不可复现，但代码审计+逻辑验证完善证明漏洞存在。本文逐点拆解 4 个漏洞点、修复对比、风险评估。</p>
+        <a href="/pg-xsj/cve/pgvector-hnsw-integer-wraparound.html" class="read-more">阅读全文 →</a>
+    </article>
+<article class="post-card">
         <h3><a href="/pg-xsj/cve/cve-2026-6637-refint-overflow.html">CVE-2026-6637：refint 栈溢出 + SQL 注入——被遗忘的 1997 年定时炸弹</a></h3>
         <div class="post-meta">
             <time datetime="2026-05-28">2026-05-28</time>
