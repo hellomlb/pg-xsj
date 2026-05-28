@@ -10,13 +10,18 @@
 <meta property="og:title" content="Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性">
 <meta property="og:description" content="PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。">
 <meta property="og:type" content="article">
-<meta property="og:url" content="https://hellomlb.github.io/pg-xsj/posts/pg16.14-bug17-merge-serializable.html">
+<meta property="og:url" content="https://hellomlb.github.io/pg-xsj/bug/pg16.14-bug17-merge-serializable.html">
 </head>
 <body>
     <header class="site-header">
         <div class="container">
             <h1><a href="/pg-xsj/">PG习思集</a></h1>
             <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/#cve">🛡️ CVE 验证</a>
+                <a href="/pg-xsj/#bug">🐛 Bug 分析</a>
+                <a href="/pg-xsj/#ops">🔧 运维实战</a>
+            </nav>
         </div>
     </header>
 
@@ -27,7 +32,7 @@
         <div class="post-meta">
             <span class="badge badge-verified" title="SQL 已在真实 PostgreSQL 环境中验证通过">✅ SQL 验证通过</span>
             <time datetime="2026-05-25">2026-05-25</time>
-            <span class="post-category bug-analysis">
+            <span class="post-category bug">
                 Bug 分析
             </span>
             <span class="post-tags">

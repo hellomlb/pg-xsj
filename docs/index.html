@@ -13,6 +13,11 @@
         <div class="container">
             <h1><a href="/pg-xsj/">PG习思集</a></h1>
             <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/#cve">🛡️ CVE 验证</a>
+                <a href="/pg-xsj/#bug">🐛 Bug 分析</a>
+                <a href="/pg-xsj/#ops">🔧 运维实战</a>
+            </nav>
         </div>
     </header>
 
@@ -22,25 +27,49 @@
     <p>老木（18年 PG 经验）+ 小木（AI 搭档），专注 PostgreSQL 内核研究、Bug 深度分析、CVE 漏洞验证。</p>
 </section>
 
-<section class="post-list">
-    <article class="post-card">
-        <h3><a href="/pg-xsj/posts/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
-        <div class="post-meta">
-            <time datetime="2026-05-25">2026-05-25</time>
-            
-        </div>
-        <p class="post-excerpt">PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</p>
-        <a href="/pg-xsj/posts/pg16.14-bug17-merge-serializable.html" class="read-more">阅读全文 →</a>
-    </article>
-<article class="post-card">
-        <h3><a href="/pg-xsj/posts/cve-2026-6473-int-overflow.html">CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</a></h3>
-        <div class="post-meta">
-            <time datetime="2026-05-25">2026-05-25</time>
-            
-        </div>
-        <p class="post-excerpt">PG 安全发布修复了一个 8.8 分整数溢出漏洞，影响 14~18 所有版本。本文通过 PG 16.11 vs 16.14 双版本实测验证：totallen 溢出直接导致服务端崩溃，numvar 溢出静默返回错误结果——两种均为可被未授权用户触发的真实安全威胁。</p>
-        <a href="/pg-xsj/posts/cve-2026-6473-int-overflow.html" class="read-more">阅读全文 →</a>
-    </article>
+<!-- CVE 专栏 -->
+<section class="category-section" id="cve">
+    <h2 class="section-title">🛡️ CVE 验证 <span class="count">(1)</span></h2>
+    <p class="section-desc">PostgreSQL 安全漏洞复现与验证</p>
+    <div class="post-grid">
+        <article class="post-card">
+            <h3><a href="/pg-xsj/cve/cve-2026-6473-int-overflow.html">CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</a></h3>
+            <div class="post-meta">
+                <time datetime="2026-05-25">2026-05-25</time>
+                <span class="post-category cve">CVE 验证</span>
+            </div>
+            <p class="post-excerpt">PG 安全发布修复了一个 8.8 分整数溢出漏洞，影响 14~18 所有版本。本文通过 PG 16.11 vs 16.14 双版本实测验证：totallen 溢出直接导致服务端崩溃，numvar 溢出静默返回错误结果——两种均为可被未授权用户触发的真实安全威胁。</p>
+            <a href="/pg-xsj/cve/cve-2026-6473-int-overflow.html" class="read-more">阅读全文 →</a>
+        </article>
+    </div>
+    {% else %}
+    <p class="empty-notice">暂无文章，敬请期待。</p>
+</section>
+
+<!-- Bug 专栏 -->
+<section class="category-section" id="bug">
+    <h2 class="section-title">🐛 Bug 分析 <span class="count">(1)</span></h2>
+    <p class="section-desc">PostgreSQL Bug 深度分析与修复解读</p>
+    <div class="post-grid">
+        <article class="post-card">
+            <h3><a href="/pg-xsj/bug/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
+            <div class="post-meta">
+                <time datetime="2026-05-25">2026-05-25</time>
+                <span class="post-category bug">Bug 分析</span>
+            </div>
+            <p class="post-excerpt">PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</p>
+            <a href="/pg-xsj/bug/pg16.14-bug17-merge-serializable.html" class="read-more">阅读全文 →</a>
+        </article>
+    </div>
+    {% else %}
+    <p class="empty-notice">暂无文章，敬请期待。</p>
+</section>
+
+<!-- 运维专栏 -->
+<section class="category-section" id="ops">
+    <h2 class="section-title">🔧 运维实战 <span class="count">(0)</span></h2>
+    <p class="section-desc">PostgreSQL 运维经验与实战技巧</p>
+    
 </section>
     </main>
 

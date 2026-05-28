@@ -5,20 +5,20 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 28 May 2026 11:09:27 +0800</lastBuildDate>
-    <item>
-      <title>Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</title>
-      <link>https://hellomlb.github.io/pg-xsj/posts/pg16.14-bug17-merge-serializable.html</link>
-      <description>PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</description>
-      <pubDate>2026-05-25</pubDate>
-      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/posts/pg16.14-bug17-merge-serializable.html</guid>
-    </item>
+    <lastBuildDate>Thu, 28 May 2026 11:16:03 +0800</lastBuildDate>
     <item>
       <title>CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</title>
-      <link>https://hellomlb.github.io/pg-xsj/posts/cve-2026-6473-int-overflow.html</link>
+      <link>https://hellomlb.github.io/pg-xsj/cve/cve-2026-6473-int-overflow.html</link>
       <description>PG 安全发布修复了一个 8.8 分整数溢出漏洞，影响 14~18 所有版本。本文通过 PG 16.11 vs 16.14 双版本实测验证：totallen 溢出直接导致服务端崩溃，numvar 溢出静默返回错误结果——两种均为可被未授权用户触发的真实安全威胁。</description>
       <pubDate>2026-05-25</pubDate>
-      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/posts/cve-2026-6473-int-overflow.html</guid>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/cve/cve-2026-6473-int-overflow.html</guid>
+    </item>
+    <item>
+      <title>Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</title>
+      <link>https://hellomlb.github.io/pg-xsj/bug/pg16.14-bug17-merge-serializable.html</link>
+      <description>PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</description>
+      <pubDate>2026-05-25</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/bug/pg16.14-bug17-merge-serializable.html</guid>
     </item>
   </channel>
 </rss>

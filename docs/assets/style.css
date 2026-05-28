@@ -46,6 +46,23 @@ body {
 .site-header h1 a { color: var(--text); text-decoration: none; }
 .site-header .subtitle { color: var(--text-light); font-size: 15px; margin-top: 6px; }
 
+/* Site Nav */
+.site-nav {
+    display: flex;
+    gap: 20px;
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+.site-nav a {
+    color: var(--text-light);
+    text-decoration: none;
+    font-size: 14px;
+    font-weight: 500;
+    transition: color 0.15s;
+}
+.site-nav a:hover { color: var(--accent); }
+
 /* Hero */
 .hero {
     background: linear-gradient(135deg, #f6f8fa 0%, #e8ecf1 100%);
@@ -56,6 +73,43 @@ body {
 }
 .hero h2 { font-size: 22px; margin-bottom: 8px; }
 .hero p { color: var(--text-light); font-size: 15px; }
+
+/* Category Sections */
+.category-section {
+    margin-bottom: 48px;
+    scroll-margin-top: 24px;
+}
+.section-title {
+    font-size: 22px;
+    margin-bottom: 4px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+}
+.section-title .count {
+    font-size: 16px;
+    color: var(--text-light);
+    font-weight: 400;
+}
+.section-desc {
+    color: var(--text-light);
+    font-size: 14px;
+    margin: 4px 0 20px;
+}
+.empty-notice {
+    color: var(--text-light);
+    font-size: 14px;
+    font-style: italic;
+    padding: 24px;
+    text-align: center;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    background: var(--code-bg);
+}
+.post-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
 
 /* Post List */
 .post-list { display: flex; flex-direction: column; gap: 24px; }
@@ -78,11 +132,9 @@ body {
 /* Post Meta */
 .post-meta { display: flex; align-items: center; gap: 12px; font-size: 14px; color: var(--text-light); flex-wrap: wrap; }
 .post-category { padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
-.post-category.bug-analysis { background: #ffeef0; color: var(--bug-color); }
-.post-category.cve-verify { background: #fff5eb; color: var(--cve-color); }
-.post-category.pg-internals { background: #f5f0ff; color: var(--internals-color); }
-.post-category.upgrade { background: #f0fff4; color: var(--upgrade-color); }
-.post-category.tooling { background: #f1f8ff; color: var(--tool-color); }
+.post-category.bug { background: #ffeef0; color: var(--bug-color); }
+.post-category.cve { background: #fff5eb; color: var(--cve-color); }
+.post-category.ops { background: #f0fff4; color: #22863a; }
 .post-tags { display: flex; gap: 6px; }
 .tag { background: var(--tag-bg); color: var(--tag-text); padding: 1px 8px; border-radius: 10px; font-size: 12px; }
 
