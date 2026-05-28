@@ -24,6 +24,15 @@
 
 <section class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/posts/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-05-25">2026-05-25</time>
+            
+        </div>
+        <p class="post-excerpt">PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</p>
+        <a href="/pg-xsj/posts/pg16.14-bug17-merge-serializable.html" class="read-more">阅读全文 →</a>
+    </article>
+<article class="post-card">
         <h3><a href="/pg-xsj/posts/cve-2026-6473-int-overflow.html">CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</a></h3>
         <div class="post-meta">
             <time datetime="2026-05-25">2026-05-25</time>

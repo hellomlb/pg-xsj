@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。">
+<meta property="og:title" content="Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性">
+<meta property="og:description" content="PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://hellomlb.github.io/pg-xsj/posts/pg16.14-bug17-merge-serializable.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="SQL 已在真实 PostgreSQL 环境中验证通过">✅ SQL 验证通过</span>
+            <time datetime="2026-05-25">2026-05-25</time>
+            <span class="post-category bug-analysis">
+                Bug 分析
+            </span>
+            <span class="post-tags">
+                
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>概述</h2>
+
+<p>PG 16.14 修复了一个后果严重却难以发现的 Bug：<strong>MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下，遇到并发更新时静默产生错误结果，不报序列化失败。</strong></p>
+
+<table>
+<tr>
+<th>版本</th>
+<th>行为</th>
+<th>后果</th>
+</tr>
+<tr>
+<td><strong>PG 16.11（有 Bug）</strong></td>
+<td>MERGE 静默成功</td>
+<td>违反隔离性保证，返回错误数据</td>
+</tr>
+<tr>
+<td><strong>PG 16.14（已修复）</strong></td>
+<td>抛出 <code>could not serialize access due to concurrent update</code></td>
+<td>正确报错，应用可重试</td>
+</tr>
+</table>
+
+<p><strong>受影响版本</strong>：PG 15.0~15.17、16.0~16.13、17.0~17.9、18.0~18.3 中所有 MERGE 语句在 RR/SERIALIZABLE 隔离级别下均有此问题。</p>
+
+<h2>现象</h2>
+
+<p>用两个并发 psql 窗口复现：</p>
+
+<pre><code>-- 建表（任意窗口）
+DROP TABLE IF EXISTS target;
+CREATE TABLE target (key int PRIMARY KEY, val text);
+INSERT INTO target VALUES (1, &#x27;before&#x27;);</code></pre>
+
+<table>
+<tr>
+<th>步骤</th>
+<th>窗口 A</th>
+<th>窗口 B</th>
+</tr>
+<tr>
+<td>1</td>
+<td><code>BEGIN;</code></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>UPDATE target SET val = 'a' WHERE key = 1;</code></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td></td>
+<td><code>BEGIN ISOLATION LEVEL REPEATABLE READ;</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td></td>
+<td><code>MERGE INTO target t USING (SELECT 1 AS key, 'b'::text AS val) s ON t.key = s.key WHEN MATCHED THEN UPDATE SET val = s.val;</code> ← <strong>阻塞</strong></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>COMMIT;</code></td>
+<td>← <strong>解除阻塞</strong></td>
+</tr>
+<tr>
+<td>6</td>
+<td></td>
+<td>16.11: <code>MERGE 0</code>（静默成功 ❌）/ 16.14: <code>ERROR: could not serialize access due to concurrent update</code> ✅</td>
+</tr>
+</table>
+
+<blockquote><strong>白话</strong>：窗口 B 在 REPEATABLE READ 下执行 MERGE，应该看到 <code>key=1, val='before'</code> 的快照。但窗口 A 先提交了 <code>val='a'</code>，窗口 B 的 MERGE 发现 tuple 被改过，<strong>16.11 选择假装没事，用新版本继续干活</strong>。16.14 正确抛出序列化错误，让应用知道"这个世界在我开始之后变了，你得重试"。</blockquote>
+
+<h2>根因分析（源码层面）</h2>
+
+<p>Bug 出在 <code>src/backend/executor/nodeModifyTable.c</code> 的 MERGE 执行路径。</p>
+
+<p>PG 的 <code>UPDATE</code>/<code>DELETE</code> 在 RR/SERIALIZABLE 下遇到并发修改的元组时，会调用 <code>IsolationUsesXactSnapshot()</code> 检查：如果是快照隔离，抛出序列化失败。</p>
+
+<p>但 <strong>MERGE 路径漏写了这个检查</strong>：</p>
+
+<pre><code>// nodeModifyTable.c — 修复前（PG 16.11）
+// EvalPlanQual (EPQ) 路径中：
+if (IsolationUsesXactSnapshot())  // ← MERGE 路径缺少这行！
+    ereport(ERROR,
+            (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+             errmsg(&quot;could not serialize access due to concurrent update&quot;)));
+
+// UPDATE/DELETE 路径有这行，MERGE 路径没有</code></pre>
+
+<p><strong>三层根因</strong>：</p>
+
+<table>
+<tr>
+<th>层次</th>
+<th>原因</th>
+</tr>
+<tr>
+<td><strong>直接原因</strong></td>
+<td>MERGE 漏写 <code>IsolationUsesXactSnapshot()</code> 守卫</td>
+</tr>
+<tr>
+<td><strong>深层原因</strong></td>
+<td>MERGE 的 EPQ 路径从 UPDATE/DELETE 复制代码时遗漏了隔离性检查</td>
+</tr>
+<tr>
+<td><strong>根本原因</strong></td>
+<td>MERGE 语义复杂（MATCHED / NOT MATCHED 多分支），EPQ 路径代码有 3 处不同入口，漏改其一</td>
+</tr>
+</table>
+
+<p>修复极简 — <strong>+6 行</strong>，在 MERGE 的 EPQ 入口补上检查：</p>
+
+<pre><code>// 修复后（PG 16.14）— commit 39b3d2b7d
++ if (IsolationUsesXactSnapshot())
++     ereport(ERROR,
++             (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
++              errmsg(&quot;could not serialize access due to concurrent update&quot;)));</code></pre>
+
+<h2>升级影响（重要！）</h2>
+
+<p>这是那种"修复后反而报错"的 Bug：</p>
+
+<table>
+<tr>
+<th>场景</th>
+<th>升级前（16.11）</th>
+<th>升级后（16.14）</th>
+</tr>
+<tr>
+<td>MERGE + RR + 无并发冲突</td>
+<td>正常</td>
+<td>正常 ✅</td>
+</tr>
+<tr>
+<td>MERGE + RR + 有并发冲突</td>
+<td><strong>静默成功（错误结果！）</strong></td>
+<td>报错 <code>serialization failure</code></td>
+</tr>
+</table>
+
+<p><strong>对应用层的影响</strong>：</p>
+<li>如果你的应用在 RR/SERIALIZABLE 下使用 MERGE，升级后<strong>可能突然开始报序列化错误</strong></li>
+<li><strong>这不是坏消息</strong> — 老版本在这些场景下静默返回了错误数据，16.14 才是正确的</li>
+<li><strong>处理方式</strong>：在应用代码中为 MERGE 加入重试逻辑（跟 SELECT FOR UPDATE / UPDATE 一样的模式）</li>
+
+<pre><code># 示例：Python 重试包装
+import psycopg2
+from psycopg2 import errors
+
+def merge_with_retry(conn, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(&quot;&quot;&quot;
+                    MERGE INTO target t
+                    USING (SELECT 1 AS key, &#x27;b&#x27;::text AS val) s
+                    ON t.key = s.key
+                    WHEN MATCHED THEN UPDATE SET val = s.val
+                &quot;&quot;&quot;)
+            conn.commit()
+            return
+        except errors.SerializationFailure:
+            conn.rollback()
+            if attempt == max_retries - 1:
+                raise</code></pre>
+
+<h2>影响评估</h2>
+
+<table>
+<tr>
+<th>维度</th>
+<th>评估</th>
+</tr>
+<tr>
+<td><strong>危害类型</strong></td>
+<td>静默数据错误（不报错、不警告、日志无异常）</td>
+</tr>
+<tr>
+<td><strong>触发条件</strong></td>
+<td>MERGE + RR/SERIALIZABLE 隔离级别 + 并发更新同一行</td>
+</tr>
+<tr>
+<td><strong>影响范围</strong></td>
+<td>PG 15~18 全部主版本中所有使用 MERGE 的应用</td>
+</tr>
+<tr>
+<td><strong>修复版本</strong></td>
+<td>16.14 / 15.18 / 17.10 / 18.4</td>
+</tr>
+<tr>
+<td><strong>升级风险</strong></td>
+<td>低 — 修复只增加错误抛出，正常路径不变</td>
+</tr>
+<tr>
+<td><strong>隐蔽性</strong></td>
+<td>⭐⭐⭐⭐⭐ 极高 — 结果看起来完全正常，只有对比数据才能发现错误</td>
+</tr>
+<tr>
+<td><strong>国产化迁移意义</strong></td>
+<td>从 Oracle MERGE 迁移到 PG MERGE 的应用需额外关注，Oracle 在 SERIALIZABLE 下的行为可能不同</td>
+</tr>
+</table>
+
+<h2>建议</h2>
+
+<li><strong>立即升级</strong>：所有使用 MERGE 的 PG 实例应升级到 16.14 / 15.18 / 17.10 / 18.4</li>
+<li><strong>审计应用</strong>：检查所有 MERGE 语句的隔离级别设置，确认是否有 RR/SERIALIZABLE</li>
+<li><strong>加重试逻辑</strong>：升级后在 MERGE 调用处加入 <code>SQLSTATE 40001</code>（serialization_failure）重试</li>
+<li><strong>监控</strong>：关注升级后 <code>serialization_failure</code> 错误率上升 — 这表示之前有静默数据错误被修复了</li>
+
+<h2>参考</h2>
+
+<li>修复 commit: <a href="https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=39b3d2b7d"><code>39b3d2b7d</code></a></li>
+<li><a href="https://www.postgresql.org/docs/16/sql-merge.html">PostgreSQL MERGE 文档</a></li>
+<li><a href="https://www.postgresql.org/docs/16/transaction-iso.html">PG 事务隔离级别</a></li>
+
+    </div>
+
+    <div class="post-meta-box">
+        
+        <p><strong>Bug:</strong> #17</p>
+        
+        <p><strong>PG 版本:</strong> 16.14</p>
+    </div>
+</article>
+
+<nav class="post-nav">
+    <a href="/pg-xsj/">← 返回首页</a>
+</nav>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
