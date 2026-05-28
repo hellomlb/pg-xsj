@@ -5,7 +5,7 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 28 May 2026 17:33:58 +0800</lastBuildDate>
+    <lastBuildDate>Thu, 28 May 2026 17:55:04 +0800</lastBuildDate>
     <item>
       <title>commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/commit-delay-wal-tuning.html</link>
