@@ -67,9 +67,21 @@
 
 <!-- 运维专栏 -->
 <section class="category-section" id="ops">
-    <h2 class="section-title">🔧 运维实战 <span class="count">(0)</span></h2>
+    <h2 class="section-title">🔧 运维实战 <span class="count">(1)</span></h2>
     <p class="section-desc">PostgreSQL 运维经验与实战技巧</p>
-    
+    <div class="post-grid">
+        <article class="post-card">
+            <h3><a href="/pg-xsj/ops/commit-delay-wal-tuning.html">commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</a></h3>
+            <div class="post-meta">
+                <time datetime="2026-05-28">2026-05-28</time>
+                <span class="post-category ops">运维实战</span>
+            </div>
+            <p class="post-excerpt">commit_delay 可能是 PG 中被误解最深的性能参数：九成人调了等于白调，设太高反而更慢。本文从 xlog.c 源码倒推出调优决策树，带你走完 pg_test_fsync → pg_stat_wal → 迭代测试的完整流程。</p>
+            <a href="/pg-xsj/ops/commit-delay-wal-tuning.html" class="read-more">阅读全文 →</a>
+        </article>
+    </div>
+    {% else %}
+    <p class="empty-notice">暂无文章，敬请期待。</p>
 </section>
     </main>
 

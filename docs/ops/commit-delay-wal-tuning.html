@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="commit_delay 可能是 PG 中被误解最深的性能参数：九成人调了等于白调，设太高反而更慢。本文从 xlog.c 源码倒推出调优决策树，带你走完 pg_test_fsync → pg_stat_wal → 迭代测试的完整流程。">
+<meta property="og:title" content="commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树">
+<meta property="og:description" content="commit_delay 可能是 PG 中被误解最深的性能参数：九成人调了等于白调，设太高反而更慢。本文从 xlog.c 源码倒推出调优决策树，带你走完 pg_test_fsync → pg_stat_wal → 迭代测试的完整流程。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/commit-delay-wal-tuning.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/#cve">🛡️ CVE 验证</a>
+                <a href="/pg-xsj/#bug">🐛 Bug 分析</a>
+                <a href="/pg-xsj/#ops">🔧 运维实战</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="SQL 已在真实 PostgreSQL 环境中验证通过">✅ SQL 验证通过</span>
+            <time datetime="2026-05-28">2026-05-28</time>
+            <span class="post-category ops">
+                运维实战
+            </span>
+            <span class="post-tags">
+                
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>概述</h2>
+
+<p>PostgreSQL 的 <code>commit_delay</code> 和 <code>commit_siblings</code> 是一对让人又爱又恨的参数。爱它，是因为调对了确实能提升高并发写入吞吐；恨它，是因为九成人调了等于白调——<strong>不先测 fsync 就是盲调，最终都会回到默认值</strong>。</p>
+
+<p>本文从源码出发，说清楚这两个参数到底在干什么、什么时候该调、怎么调才有效。</p>
+
+<h2>先回顾：PG 的组提交（Group Commit）</h2>
+
+<p>在讲 <code>commit_delay</code> 之前，需要理解 PG 已经有的<strong>组提交机制</strong>。即使你不设这两个参数，PG 也会自动把多个并发事务的 WAL 合并成一次 <code>fsync</code>：</p>
+
+<pre><code>事务 A 刷 WAL 时拿到 WALWriteLock
+  → 事务 B、C 排队等锁
+  → A 发现队列里有人等着
+  → A fsync 时一次性把所有排队的 WAL 记录都刷下去
+  → B、C 醒来发现自己的 WAL 已经刷好了，直接走人</code></pre>
+
+<p>这就是组提交的核心：<strong>一个事务的 fsync 顺带帮所有人刷了</strong>。不需要任何额外参数。</p>
+
+<p>那 <code>commit_delay</code> 做什么？它在组提交之上加了一层"再等等"。</p>
+
+<h2>源码级机制：它在哪、干什么</h2>
+
+<p>关键代码在 <code>src/backend/access/transam/xlog.c</code> 的 <code>XLogFlush()</code> 函数中。流程如下：</p>
+
+<pre><code>XLogFlush()
+  → 获取 WALWriteLock
+  → 如果三个条件同时满足，则 sleep(commit_delay) 微秒：
+      1. commit_delay &gt; 0
+      2. fsync = on
+      3. 当前活跃事务数 &gt;= commit_siblings
+  → issue_xlog_fsync()    ← 真正刷盘
+  → 释放 WALWriteLock</code></pre>
+
+<p>三个条件缺一不可：</p>
+
+<table>
+<tr>
+<th>条件</th>
+<th>含义</th>
+<th>不满足时</th>
+</tr>
+<tr>
+<td><code>commit_delay > 0</code></td>
+<td>你主动开启了延迟</td>
+<td>直接跳过，不 sleep</td>
+</tr>
+<tr>
+<td><code>fsync = on</code></td>
+<td>WAL 同步写盘</td>
+<td><code>fsync=off</code> 本来就不刷，sleep 无意义</td>
+</tr>
+<tr>
+<td>活跃事务 ≥ <code>commit_siblings</code></td>
+<td>有足够多的"同伴"值得等</td>
+<td>等半天没人来，白等</td>
+</tr>
+</table>
+
+<p><strong>关键洞察</strong>：sleep 发生在拿锁之后、fsync 之前。这意味着：</p>
+<li>你是 WAL 写入的"领头羊"（拿到了锁）</li>
+<li>你 delay 若干微秒，希望更多事务的 WAL 记录在这期间排队</li>
+<li>然后你一次性 fsync，帮所有人刷下去</li>
+
+<h2>什么时候该调</h2>
+
+<p>很多人上来就调，这是错的。先回答两个问题：</p>
+
+<h3>问题一：WAL 同步是你的瓶颈吗？</h3>
+
+<pre><code>-- PG 14+ 查看 WAL 同步统计
+SELECT wal_sync_time, wal_sync,
+       wal_sync_time / NULLIF(wal_sync, 0) AS avg_sync_us
+FROM pg_stat_wal;</code></pre>
+
+<p>如果 <code>avg_sync_us</code> 很小（比如 SSD 上几十微秒），那 <code>commit_delay</code> 的收益微乎其微——你 delay 的时间可能比 fsync 本身还长，得不偿失。</p>
+
+<h3>问题二：有真正的并发提交吗？</h3>
+
+<p>单个连接疯狂写入不需要 <code>commit_delay</code>。需要的是<strong>多个并发连接同时提交</strong>的场景：连接池、Web 应用、微服务批量写入。</p>
+
+<p>如果两个答案都是"是"，继续往下走。</p>
+
+<h2>调优决策树</h2>
+
+<pre><code>pg_test_fsync → 拿到 fsync 平均耗时
+    ↓
+查 pg_stat_wal.wal_sync_time → WAL 同步是瓶颈？
+    ↓ 否 → 放弃调优（调了也是安慰剂）
+    ↓ 是
+确认有真正并发提交（看 pg_stat_activity）
+    ↓
+commit_delay 初始值 = fsync 时间 / 2
+commit_siblings：NVMe → 提高门槛（如 10~20）
+               HDD  → 降低门槛（如 3~5）
+    ↓
+迭代测试（pgbench -c N -j N）
+    ↓
+设太高 → 延迟放大，适得其反</code></pre>
+
+<h3>第一步：测 fsync 速度</h3>
+
+<pre><code># 在数据库服务器上运行，不要在远程执行
+pg_test_fsync</code></pre>
+
+<p>输出示例（NVMe SSD）：</p>
+
+<pre><code>5 seconds per test
+Compare file sync methods using one 8kB write:
+        open_datasync                    22448.940 ops/sec      45 usecs/op
+        fdatasync                        22523.490 ops/sec      44 usecs/op
+        fsync                            16764.431 ops/sec      60 usecs/op</code></pre>
+
+<p>这里的 <code>usecs/op</code> 就是单次 fsync 的耗时。假设你的 <code>fsync</code> 方法是 60 微秒，那么 <code>commit_delay</code> 的初始值可以设为 30（微秒）。</p>
+
+<h3>第二步：确认当前配置</h3>
+
+<pre><code>SELECT name, setting, unit, context, short_desc
+FROM pg_settings
+WHERE name IN (&#x27;commit_delay&#x27;, &#x27;commit_siblings&#x27;, &#x27;fsync&#x27;, &#x27;wal_sync_method&#x27;);</code></pre>
+
+<p>默认值：<code>commit_delay = 0</code>（关闭），<code>commit_siblings = 5</code>。</p>
+
+<h3>第三步：设参 + 压测</h3>
+
+<pre><code>-- 假设 fsync 耗时 60us，初始设 30us
+ALTER SYSTEM SET commit_delay = 30;
+
+-- NVMe 环境，提高 siblings 门槛，避免单连接也被 delay
+ALTER SYSTEM SET commit_siblings = 10;
+
+-- 让参数生效（不需要重启）
+SELECT pg_reload_conf();</code></pre>
+
+<p>然后用 <code>pgbench</code> 压测对比：</p>
+
+<pre><code># 基准测试（默认值）
+pgbench -c 20 -j 4 -T 60 -M prepared bench_db
+
+# 调参后测试
+pgbench -c 20 -j 4 -T 60 -M prepared bench_db</code></pre>
+
+<p>对比指标：TPS、平均延迟、P99 延迟。</p>
+
+<h3>第四步：迭代</h3>
+
+<table>
+<tr>
+<th>观察</th>
+<th>行动</th>
+</tr>
+<tr>
+<td>TPS 提升 + 延迟可接受</td>
+<td>微调 commit_delay 继续测试</td>
+</tr>
+<tr>
+<td>TPS 下降</td>
+<td>commit_delay 设大了，减半再试</td>
+</tr>
+<tr>
+<td>P99 延迟暴涨</td>
+<td>同样说明设大了</td>
+</tr>
+<tr>
+<td>毫无变化</td>
+<td>你的瓶颈不在 WAL fsync，放弃调优</td>
+</tr>
+</table>
+
+<h2>常见误区</h2>
+
+<h3>误区一：不看 fsync 就调</h3>
+
+<p>没跑过 <code>pg_test_fsync</code> 就调 commit_delay，相当于不知道路况就开始踩油门。你的磁盘 fsync 只要 20 微秒，你设了个 10000 微秒的 delay，每次提交多等 500 倍时间——纯属自残。</p>
+
+<h3>误区二：在云环境照搬物理机参数</h3>
+
+<p>云盘（EBS、云 SSD）的 fsync 延迟波动远大于本地 NVMe。<code>pg_test_fsync</code> 的结果在不同时间段可能差几倍。<strong>在云上，commit_delay 通常不建议调</strong>，因为 fsync 延迟的不确定性会让你永远找不到合适的值。</p>
+
+<h3>误区三：commit_siblings 设太小</h3>
+
+<p><code>commit_siblings = 1</code> 意味着只要有任何其他活跃事务就 delay。但单个活跃事务不代表它会并发提交——它可能在跑一个大查询。设太小会让不相关的查询也被 delay。</p>
+
+<h3>误区四：把 commit_delay 当万能药</h3>
+
+<p>如果你的写入瓶颈是 CPU、锁竞争、或 SQL 执行本身慢，调 commit_delay 不会有任何效果。先用 <code>pg_stat_wal</code> 确认瓶颈在 WAL 同步：</p>
+
+<pre><code>-- 如果 wal_sync_time 占比很小，瓶颈不在 WAL
+SELECT
+  wal_write_time AS &quot;WAL 写入耗时(ms)&quot;,
+  wal_sync_time  AS &quot;WAL 同步耗时(ms)&quot;,
+  stats_reset
+FROM pg_stat_wal;</code></pre>
+
+<h2>实战 checklist</h2>
+
+<p>运维中需要调整 commit_delay 的典型场景：</p>
+
+<table>
+<tr>
+<th>场景</th>
+<th>建议</th>
+</tr>
+<tr>
+<td>裸金属 + NVMe + 高并发短事务</td>
+<td>值得测试，初始值 20~50us</td>
+</tr>
+<tr>
+<td>裸金属 + HDD + 高并发短事务</td>
+<td>值得测试，初始值 500~2000us</td>
+</tr>
+<tr>
+<td>云环境（EBS/云 SSD）</td>
+<td><strong>不建议调</strong>，fsync 延迟波动大</td>
+</tr>
+<tr>
+<td>fsync=off</td>
+<td>commit_delay 不生效，不用调</td>
+</tr>
+<tr>
+<td>单连接写入</td>
+<td>不生效，活跃事务数不够</td>
+</tr>
+<tr>
+<td>synchronous_commit=off</td>
+<td>commit_delay 仍然生效（fsync 还在）</td>
+</tr>
+</table>
+
+<h2>小结</h2>
+
+<p><code>commit_delay</code> 的本质是在 PG 已有组提交之上加一层"再等等"——leader 拿到 WALWriteLock 后、fsync 前 sleep 若干微秒，希望更多事务搭顺风车。调它的前提只有两个：<strong>WAL fsync 真的是瓶颈 + 真的有并发提交</strong>。不满足任何一个，调了就是安慰剂。</p>
+
+<p>记住金句：<strong>没跑 <code>pg_test_fsync</code> 就调 commit_delay = 盲调，最终都会回到默认值。</strong></p>
+
+    </div>
+
+    <div class="post-meta-box">
+        
+        
+        
+        <p><strong>PG 版本:</strong> 16.14</p>
+    </div>
+</article>
+
+<nav class="post-nav">
+    <a href="/pg-xsj/">← 返回首页</a>
+</nav>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
