@@ -5,7 +5,7 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 28 May 2026 10:32:37 +0800</lastBuildDate>
+    <lastBuildDate>Thu, 28 May 2026 10:39:15 +0800</lastBuildDate>
     <item>
       <title>CVE-2026-6473：全文搜索整数溢出导致服务端崩溃</title>
       <link>https://hellomlb.github.io/pg-xsj/posts/cve-2026-6473-int-overflow.html</link>

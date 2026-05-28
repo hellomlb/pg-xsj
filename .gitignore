@@ -8,9 +8,9 @@ __pycache__/
 generator.py
 config.py
 publish.py
-templates/
-posts/
-assets/
+/templates/
+/posts/
+/assets/
 
 # 旧 git 历史备份
 *.bak
