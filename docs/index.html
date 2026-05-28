@@ -14,9 +14,8 @@
             <h1><a href="/pg-xsj/">PG习思集</a></h1>
             <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
             <nav class="site-nav">
-                <a href="/pg-xsj/#cve">🛡️ CVE 验证</a>
-                <a href="/pg-xsj/#bug">🐛 Bug 分析</a>
-                <a href="/pg-xsj/#ops">🔧 运维实战</a>
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
             </nav>
         </div>
     </header>
@@ -27,131 +26,86 @@
     <p>老木（18年 PG 经验）+ 小木（AI 搭档），专注 PostgreSQL 内核研究、Bug 深度分析、CVE 漏洞验证。</p>
 </section>
 
-<section class="services-section">
-    <h2 class="section-title">🛠️ 咨询服务</h2>
-    <div class="services-grid">
-        <div class="service-card">
-            <span class="service-icon">🔍</span>
-            <span class="service-name">健康巡检</span>
-            <span class="service-desc">全方位健康检查，发现隐患并给出修复建议</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">⬆️</span>
-            <span class="service-name">版本升级</span>
-            <span class="service-desc">PG13→16 等大版本升级方案设计与执行</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">⚙️</span>
-            <span class="service-name">日常运维</span>
-            <span class="service-desc">监控、备份、归档、清理等运维托管</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">📊</span>
-            <span class="service-name">SQL 优化</span>
-            <span class="service-desc">慢 SQL 定位、执行计划分析、索引优化</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">🔬</span>
-            <span class="service-name">内核研究</span>
-            <span class="service-desc">PostgreSQL 内核源码分析、功能定制</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">🤖</span>
-            <span class="service-name">工具开发</span>
-            <span class="service-desc">自动化脚本、监控面板、运维工具链</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">🛡️</span>
-            <span class="service-name">CVE 验证</span>
-            <span class="service-desc">安全漏洞复现、影响评估、修复验证</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">✅</span>
-            <span class="service-name">SQL 审核</span>
-            <span class="service-desc">上线前 SQL 审核、规范检查、风险拦截</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">🔄</span>
-            <span class="service-name">容灾演练</span>
-            <span class="service-desc">流复制搭建、故障切换方案、恢复演练</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">☁️</span>
-            <span class="service-name">云成本优化</span>
-            <span class="service-desc">云上 PG 资源规格优化、成本治理</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">🔒</span>
-            <span class="service-name">安全加固</span>
-            <span class="service-desc">认证加密、权限审计、Oracle 迁 PG 安全评估</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">⚡</span>
-            <span class="service-name">基准测试</span>
-            <span class="service-desc">pgbench 性能基准、瓶颈定位、调优验证</span>
-        </div>
-<div class="service-card">
-            <span class="service-icon">🕸️</span>
-            <span class="service-name">图分析增强</span>
-            <span class="service-desc">Apache AGE 部署、Cypher 查询优化、知识图谱</span>
-        </div>
-    </div>
-</section>
-
-<div class="category-row">
-
-<!-- CVE 专栏 -->
-<section class="category-section" id="cve">
-    <h2 class="section-title">🛡️ CVE 验证 <span class="count">(1)</span></h2>
-    <p class="section-desc">PostgreSQL 安全漏洞复现与验证</p>
-    <div class="post-grid">
-        <article class="post-card">
-            <h3><a href="/pg-xsj/cve/cve-2026-6473-int-overflow.html">CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</a></h3>
-            <div class="post-meta">
-                <time datetime="2026-05-25">2026-05-25</time>
-                <span class="post-category cve">CVE 验证</span>
-            </div>
-            <p class="post-excerpt">PG 安全发布修复了一个 8.8 分整数溢出漏洞，影响 14~18 所有版本。本文通过 PG 16.11 vs 16.14 双版本实测验证：totallen 溢出直接导致服务端崩溃，numvar 溢出静默返回错误结果——两种均为可被未授权用户触发的真实安全威胁。</p>
-            <a href="/pg-xsj/cve/cve-2026-6473-int-overflow.html" class="read-more">阅读全文 →</a>
-        </article>
-    </div>
-</section>
-
-<!-- Bug 专栏 -->
-<section class="category-section" id="bug">
-    <h2 class="section-title">🐛 Bug 分析 <span class="count">(1)</span></h2>
-    <p class="section-desc">PostgreSQL Bug 深度分析与修复解读</p>
-    <div class="post-grid">
-        <article class="post-card">
-            <h3><a href="/pg-xsj/bug/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
-            <div class="post-meta">
-                <time datetime="2026-05-25">2026-05-25</time>
-                <span class="post-category bug">Bug 分析</span>
-            </div>
-            <p class="post-excerpt">PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</p>
-            <a href="/pg-xsj/bug/pg16.14-bug17-merge-serializable.html" class="read-more">阅读全文 →</a>
-        </article>
-    </div>
-</section>
-
-<!-- 运维专栏 -->
-<section class="category-section" id="ops">
-    <h2 class="section-title">🔧 运维实战 <span class="count">(1)</span></h2>
-    <p class="section-desc">PostgreSQL 运维经验与实战技巧</p>
-    <div class="post-grid">
-        <article class="post-card">
-            <h3><a href="/pg-xsj/ops/commit-delay-wal-tuning.html">commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</a></h3>
-            <div class="post-meta">
-                <time datetime="2026-05-28">2026-05-28</time>
-                <span class="post-category ops">运维实战</span>
-            </div>
-            <p class="post-excerpt">commit_delay 可能是 PG 中被误解最深的性能参数：九成人调了等于白调，设太高反而更慢。本文从 xlog.c 源码倒推出调优决策树，带你走完 pg_test_fsync → pg_stat_wal → 迭代测试的完整流程。</p>
-            <a href="/pg-xsj/ops/commit-delay-wal-tuning.html" class="read-more">阅读全文 →</a>
-        </article>
-    </div>
-</section>
-
-</div><!-- .category-row -->
+<div class="category-grid">
+    <a class="category-card" href="/pg-xsj/health-check/">
+        <span class="card-icon">🔍</span>
+        <span class="card-name">健康巡检</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">全方位健康检查，发现隐患并给出修复建议</span>
+    </a>
+<a class="category-card" href="/pg-xsj/upgrade/">
+        <span class="card-icon">⬆️</span>
+        <span class="card-name">版本升级</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">PG13→16 等大版本升级方案设计与执行</span>
+    </a>
+<a class="category-card" href="/pg-xsj/ops/">
+        <span class="card-icon">⚙️</span>
+        <span class="card-name">日常运维</span>
+        <span class="card-count">(1)</span>
+        <span class="card-latest">commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</span>
+    </a>
+<a class="category-card" href="/pg-xsj/sql-optimize/">
+        <span class="card-icon">📊</span>
+        <span class="card-name">SQL 优化</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">慢 SQL 定位、执行计划分析、索引优化</span>
+    </a>
+<a class="category-card" href="/pg-xsj/kernel/">
+        <span class="card-icon">🔬</span>
+        <span class="card-name">内核研究</span>
+        <span class="card-count">(1)</span>
+        <span class="card-latest">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</span>
+    </a>
+<a class="category-card" href="/pg-xsj/tools/">
+        <span class="card-icon">🤖</span>
+        <span class="card-name">工具开发</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">自动化脚本、监控面板、运维工具链</span>
+    </a>
+<a class="category-card" href="/pg-xsj/cve/">
+        <span class="card-icon">🛡️</span>
+        <span class="card-name">CVE 验证</span>
+        <span class="card-count">(1)</span>
+        <span class="card-latest">CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</span>
+    </a>
+<a class="category-card" href="/pg-xsj/sql-audit/">
+        <span class="card-icon">✅</span>
+        <span class="card-name">SQL 审核</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">上线前 SQL 审核、规范检查、风险拦截</span>
+    </a>
+<a class="category-card" href="/pg-xsj/ha-drill/">
+        <span class="card-icon">🔄</span>
+        <span class="card-name">容灾演练</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">流复制搭建、故障切换方案、恢复演练</span>
+    </a>
+<a class="category-card" href="/pg-xsj/cloud-cost/">
+        <span class="card-icon">☁️</span>
+        <span class="card-name">云成本优化</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">云上 PG 资源规格优化、成本治理</span>
+    </a>
+<a class="category-card" href="/pg-xsj/security/">
+        <span class="card-icon">🔒</span>
+        <span class="card-name">安全加固</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">认证加密、权限审计、Oracle 迁 PG 安全评估</span>
+    </a>
+<a class="category-card" href="/pg-xsj/benchmark/">
+        <span class="card-icon">⚡</span>
+        <span class="card-name">基准测试</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">pgbench 性能基准、瓶颈定位、调优验证</span>
+    </a>
+<a class="category-card" href="/pg-xsj/graph/">
+        <span class="card-icon">🕸️</span>
+        <span class="card-name">图分析增强</span>
+        <span class="card-count">(0)</span>
+        <span class="card-desc">Apache AGE 部署、Cypher 查询优化、知识图谱</span>
+    </a>
+</div>
     </main>
 
     <footer class="site-footer">

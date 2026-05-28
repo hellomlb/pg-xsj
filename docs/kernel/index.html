@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔬 内核研究 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PostgreSQL 内核源码分析、功能定制">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <header class="category-header">
+    <h1>🔬 内核研究</h1>
+    <p class="category-desc">PostgreSQL 内核源码分析、功能定制</p>
+    <p class="back-link"><a href="/pg-xsj/">← 返回首页</a></p>
+</header>
+
+<div class="post-list">
+    <article class="post-card">
+        <h3><a href="/pg-xsj/kernel/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-05-25">2026-05-25</time>
+            <span class="post-category kernel">内核研究</span>
+        </div>
+        <p class="post-excerpt">PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</p>
+        <a href="/pg-xsj/kernel/pg16.14-bug17-merge-serializable.html" class="read-more">阅读全文 →</a>
+    </article>
+</div>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🛡️ CVE 验证 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="安全漏洞复现、影响评估、修复验证">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <header class="category-header">
+    <h1>🛡️ CVE 验证</h1>
+    <p class="category-desc">安全漏洞复现、影响评估、修复验证</p>
+    <p class="back-link"><a href="/pg-xsj/">← 返回首页</a></p>
+</header>
+
+<div class="post-list">
+    <article class="post-card">
+        <h3><a href="/pg-xsj/cve/cve-2026-6473-int-overflow.html">CVE-2026-6473：lquery 整数溢出导致服务端崩溃与静默错误</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-05-25">2026-05-25</time>
+            <span class="post-category cve">CVE 验证</span>
+        </div>
+        <p class="post-excerpt">PG 安全发布修复了一个 8.8 分整数溢出漏洞，影响 14~18 所有版本。本文通过 PG 16.11 vs 16.14 双版本实测验证：totallen 溢出直接导致服务端崩溃，numvar 溢出静默返回错误结果——两种均为可被未授权用户触发的真实安全威胁。</p>
+        <a href="/pg-xsj/cve/cve-2026-6473-int-overflow.html" class="read-more">阅读全文 →</a>
+    </article>
+</div>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

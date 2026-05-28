@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚙️ 日常运维 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="监控、备份、归档、清理等运维托管">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <header class="category-header">
+    <h1>⚙️ 日常运维</h1>
+    <p class="category-desc">监控、备份、归档、清理等运维托管</p>
+    <p class="back-link"><a href="/pg-xsj/">← 返回首页</a></p>
+</header>
+
+<div class="post-list">
+    <article class="post-card">
+        <h3><a href="/pg-xsj/ops/commit-delay-wal-tuning.html">commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-05-28">2026-05-28</time>
+            <span class="post-category ops">日常运维</span>
+        </div>
+        <p class="post-excerpt">commit_delay 可能是 PG 中被误解最深的性能参数：九成人调了等于白调，设太高反而更慢。本文从 xlog.c 源码倒推出调优决策树，带你走完 pg_test_fsync → pg_stat_wal → 迭代测试的完整流程。</p>
+        <a href="/pg-xsj/ops/commit-delay-wal-tuning.html" class="read-more">阅读全文 →</a>
+    </article>
+</div>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
