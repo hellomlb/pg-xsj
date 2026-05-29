@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Fri, 29 May 2026 11:11:00 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 29 May 2026 14:50:00 +0800</lastBuildDate>
+    <item>
+      <title>DeepSeek RAG 本地知识库 — 安装部署文档</title>
+      <link>https://hellomlb.github.io/pg-xsj/ai/deepseek-rag-deploy.html</link>
+      <description>基于 fastembed（本地向量化）+ ChromaDB（向量存储）+ DeepSeek API（对话生成）的 RAG 本地知识库搭建方案。文档不上传云端，仅对话时发送检索片段，实测 MateBook 14 (i5-1155G7, 8GB) 运行流畅。</description>
+      <pubDate>2026-05-29</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ai/deepseek-rag-deploy.html</guid>
+    </item>
     <item>
       <title>pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html</link>

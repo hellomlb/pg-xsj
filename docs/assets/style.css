@@ -160,6 +160,7 @@ body {
 .post-category.bug { background: #ffeef0; color: var(--bug-color); }
 .post-category.cve { background: #fff5eb; color: var(--cve-color); }
 .post-category.ops { background: #f0fff4; color: #22863a; }
+.post-category.ai { background: #f3e8ff; color: #7c3aed; }
 .post-tags { display: flex; gap: 6px; }
 .tag { background: var(--tag-bg); color: var(--tag-text); padding: 1px 8px; border-radius: 10px; font-size: 12px; }
 
