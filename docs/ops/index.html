@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html">pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-05-29">2026-05-29</time>
+            <span class="post-category ops">日常运维</span>
+        </div>
+        <p class="post-excerpt">从 PG 15.2 源码出发，追踪 pg_stat_reset() → shared_stat_reset_contents() → pgstat_report_analyze() → autovacuum 判断逻辑的完整调用链，解析 n_live_tup &gt; n_tup_ins 的根因，并结合 PolarDB PG 16.11 实验验证。</p>
+        <a href="/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/ops/commit-delay-wal-tuning.html">commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</a></h3>
         <div class="post-meta">
             <time datetime="2026-05-28">2026-05-28</time>

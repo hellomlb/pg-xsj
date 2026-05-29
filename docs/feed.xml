@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 28 May 2026 18:05:54 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 29 May 2026 11:11:00 +0800</lastBuildDate>
+    <item>
+      <title>pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响</title>
+      <link>https://hellomlb.github.io/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html</link>
+      <description>从 PG 15.2 源码出发，追踪 pg_stat_reset() → shared_stat_reset_contents() → pgstat_report_analyze() → autovacuum 判断逻辑的完整调用链，解析 n_live_tup &gt; n_tup_ins 的根因，并结合 PolarDB PG 16.11 实验验证。</description>
+      <pubDate>2026-05-29</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html</guid>
+    </item>
     <item>
       <title>commit_delay / commit_siblings：WAL 组提交调优——从源码到决策树</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/commit-delay-wal-tuning.html</link>

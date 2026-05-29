@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="从 PG 15.2 源码出发，追踪 pg_stat_reset() 的完整调用链（shared_stat_reset_contents → pgstat_report_analyze → autovacuum 判断逻辑），分析其对 ANALYZE 和 AUTOVACUUM 计数器的影响，并结合 PolarDB PG 16.11 实验验证。">
+<meta property="og:title" content="pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响">
+<meta property="og:description" content="从 PG 15.2 源码出发，追踪 pg_stat_reset() 的完整调用链，分析其对 ANALYZE 和 AUTOVACUUM 计数器的影响，并结合 PolarDB PG 16.11 实验验证。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="已在 PolarDB PG 16.11 + PG 15.2 源码中验证">✅ 验证通过</span>
+            <time datetime="2026-05-29">2026-05-29</time>
+            <span class="post-category ops">
+                日常运维
+            </span>
+            <span class="post-tags">
+                <span class="tag">pg_stat_reset</span>
+<span class="tag">ANALYZE</span>
+<span class="tag">AUTOVACUUM</span>
+<span class="tag">源码分析</span>
+<span class="tag">pg_stat_all_tables</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>问题引出</h2>
+
+<p>在 PostgreSQL 中，偶尔会看到以下"反直觉"的现象：</p>
+
+<pre><code>-- pg_stat_all_tables 中
+n_live_tup = 10000
+n_tup_ins  = 0
+-- 活元组 &gt; 累计插入？！</code></pre>
+
+<p><code>n_tup_ins</code> 既然是"累计插入数"，怎么可能小于 <code>n_live_tup</code>？要回答这个问题，需要深入追踪 <code>pg_stat_reset()</code> 和 <code>ANALYZE</code> 的内部行为。</p>
+
+<hr>
+
+<h2>一、<code>pg_stat_reset()</code> 做了什么</h2>
+
+<p>从 <code>pg_stat_reset()</code> 开始追踪源码调用链（PG 15.2）：</p>
+
+<pre><code>pg_stat_reset()
+  → pgstat_reset_counters()
+    → pgstat_reset_matching_entries()
+      → shared_stat_reset_contents()</code></pre>
+
+<p>最终在 <code>pgstat_shmem.c:918-919</code> 执行：</p>
+
+<pre><code>memset(pgstat_get_entry_data(kind, header), 0,
+       pgstat_get_entry_len(kind));</code></pre>
+
+<p><strong>所有累计计数器被清零</strong>，关键字段包括：</p>
+
+<table>
+<tr><th>字段</th><th>含义</th><th>重置后</th></tr>
+<tr><td><code>tuples_inserted</code></td><td>累计插入数（<code>n_tup_ins</code>）</td><td>0</td></tr>
+<tr><td><code>tuples_updated</code></td><td>累计更新数（<code>n_tup_upd</code>）</td><td>0</td></tr>
+<tr><td><code>tuples_deleted</code></td><td>累计删除数（<code>n_tup_del</code>）</td><td>0</td></tr>
+<tr><td><code>n_live_tuples</code></td><td>当前活元组数（<code>n_live_tup</code>）</td><td>0</td></tr>
+<tr><td><code>n_dead_tuples</code></td><td>当前死元组数（<code>n_dead_tup</code>）</td><td>0</td></tr>
+<tr><td><code>inserts_since_vacuum</code></td><td>VACUUM 后的插入数</td><td>0</td></tr>
+<tr><td><code>changes_since_analyze</code></td><td>ANALYZE 后的变更数</td><td>0</td></tr>
+</table>
+
+<hr>
+
+<h2>二、ANALYZE 执行后如何更新统计</h2>
+
+<p>从 <code>pgstat_relation.c:269-343</code> 的 <code>pgstat_report_analyze()</code>：</p>
+
+<pre><code>void pgstat_report_analyze(Relation rel,
+                          PgStat_Counter livetuples, PgStat_Counter deadtuples,
+                          bool resetcounter)
+{
+    // 事务内修正（避免重复计数）
+    if (pgstat_should_count_relation(rel) &amp;&amp; ...)
+    {
+        for (trans = rel-&gt;pgstat_info-&gt;trans; trans; trans = trans-&gt;upper)
+        {
+            livetuples -= trans-&gt;tuples_inserted - trans-&gt;tuples_deleted;
+            deadtuples -= trans-&gt;tuples_updated + trans-&gt;tuples_deleted;
+        }
+    }
+
+    // 直接设置活/死元组数量（通过实际扫描表得到）
+    tabentry-&gt;n_live_tuples = livetuples;
+    tabentry-&gt;n_dead_tuples = deadtuples;
+
+    // 可选重置变更计数器（默认 true）
+    if (resetcounter)
+        tabentry-&gt;changes_since_analyze = 0;
+}</code></pre>
+
+<p><strong>关键发现</strong>：</p>
+<ul>
+<li>ANALYZE 会<strong>直接扫描表</strong>获取精确的 <code>n_live_tuples</code></li>
+<li>但<strong>不会重置</strong> <code>tuples_inserted</code>（累计插入计数器）</li>
+<li>这就是 <code>n_live_tup &gt; n_tup_ins</code> 的根因</li>
+</ul>
+
+<hr>
+
+<h2>三、解释 <code>n_live_tup &gt; n_tup_ins</code></h2>
+
+<p>执行顺序：</p>
+
+<pre><code>pg_stat_reset()  →  所有计数器归零，n_tup_ins=0, n_live_tup=0
+INSERT 43 行      →  n_tup_ins=43, n_live_tup≈43
+pg_stat_reset()  →  n_tup_ins=0, n_live_tup=0 (再次归零)
+INSERT 366 行     →  n_tup_ins=366, n_live_tup≈409 (43+366)
+ANALYZE 触发      →  n_live_tup=409 (扫描表得到)，但 n_tup_ins 不变！</code></pre>
+
+<p>所以现象是 <code>n_live_tup=409 &gt; n_tup_ins=366</code>。</p>
+
+<p>实际 PolarDB PG 16.11 验证结果：</p>
+
+<table>
+<tr><th>字段</th><th>值</th><th>说明</th></tr>
+<tr><td><code>n_tup_ins</code></td><td>366</td><td>只记录了 reset 后的插入</td></tr>
+<tr><td><code>n_live_tup</code></td><td>409</td><td>ANALYZE 扫描得到的实际值</td></tr>
+<tr><td><code>n_ins_since_vacuum</code></td><td>366</td><td>VACUUM 后的插入数</td></tr>
+<tr><td><code>last_autoanalyze</code></td><td>2026-05-29 09:56</td><td>reset 后触发了 autoanalyze</td></tr>
+</table>
+
+<p><strong>结论：完全正常，不是 bug。</strong> <code>n_tup_ins</code> 是累计计数器，<code>n_live_tup</code> 是由 ANALYZE/VACUUM 直接测量的快照值。</p>
+
+<hr>
+
+<h2>四、AUTOVACUUM 判断逻辑</h2>
+
+<p>从 <code>autovacuum.c:3080-3112</code> 的触发判断：</p>
+
+<pre><code>vactuples = tabentry-&gt;n_dead_tuples;          // 死元组数 → VACUUM 判断
+instuples = tabentry-&gt;inserts_since_vacuum;   // 插入数 → 冻结 VACUUM 判断
+anltuples = tabentry-&gt;changes_since_analyze;   // 变更数 → ANALYZE 判断
+
+vacthresh = vac_base_thresh + vac_scale_factor * reltuples;
+vacinsthresh = vac_ins_base_thresh + vac_ins_scale_factor * reltuples;
+anlthresh = anl_base_thresh + anl_scale_factor * reltuples;</code></pre>
+
+<h3>触发公式</h3>
+
+<table>
+<tr><th>操作</th><th>触发条件</th><th>默认阈值</th></tr>
+<tr><td><strong>VACUUM（死元组）</strong></td><td><code>n_dead_tuples &gt; 50 + 0.2 × reltuples</code></td><td>需要累积足够死元组</td></tr>
+<tr><td><strong>VACUUM（插入冻结）</strong></td><td><code>inserts_since_vacuum &gt; 1000 + 0.2 × reltuples</code></td><td>需要累积足够插入</td></tr>
+<tr><td><strong>ANALYZE</strong></td><td><code>changes_since_analyze &gt; 50 + 0.1 × reltuples</code></td><td>需要累积足够变更</td></tr>
+</table>
+
+<hr>
+
+<h2>五、<code>pg_stat_reset()</code> + <code>ANALYZE</code> 的影响评估</h2>
+
+<table>
+<tr><th>功能</th><th>影响</th><th>说明</th></tr>
+<tr><td>ANALYZE 本身</td><td>✅ 无影响</td><td>正常收集统计信息，正确更新 <code>pg_statistic</code></td></tr>
+<tr><td>查询优化器</td><td>✅ 无影响</td><td><code>pg_statistic</code> 表不受 <code>pg_stat_all_tables</code> 影响</td></tr>
+<tr><td>基于死元组的 VACUUM</td><td>✅ 正常</td><td><code>n_dead_tuples</code> 被 ANALYZE 正确设置</td></tr>
+<tr><td>基于插入的 VACUUM</td><td>⚠️ 可能延迟</td><td><code>inserts_since_vacuum=0</code>，需重新累积才能触发冻结 VACUUM</td></tr>
+<tr><td>基于变更的 ANALYZE</td><td>✅ 正常</td><td><code>changes_since_analyze=0</code>，从 0 开始累积</td></tr>
+</table>
+
+<h3>VACUUM 执行后的统计更新（<code>pgstat_report_vacuum</code>）</h3>
+
+<pre><code>tabentry-&gt;n_live_tuples = livetuples;        // 覆盖为实际值
+tabentry-&gt;n_dead_tuples = deadtuples;         // 覆盖为实际值
+tabentry-&gt;inserts_since_vacuum = 0;           // 重置插入计数器</code></pre>
+
+<p><code>VACUUM</code> 和 <code>ANALYZE</code> 的核心差异：</p>
+
+<table>
+<tr><th>操作</th><th>重置 <code>inserts_since_vacuum</code></th><th>重置 <code>changes_since_analyze</code></th></tr>
+<tr><td>VACUUM</td><td>✅ 是</td><td>❌ 否</td></tr>
+<tr><td>ANALYZE</td><td>❌ 否</td><td>✅ 是（默认）</td></tr>
+</table>
+
+<hr>
+
+<h2>六、<code>pg_stat_reset()</code> 后的最佳恢复策略</h2>
+
+<h3>✅ 推荐：<code>VACUUM ANALYZE</code></h3>
+
+<pre><code>VACUUM ANALYZE my_table;</code></pre>
+
+<p>执行后所有计数器恢复到准确状态：</p>
+
+<table>
+<tr><th>字段</th><th>值</th><th>状态</th></tr>
+<tr><td><code>n_live_tuples</code></td><td>实际活元组</td><td>✅ 准确</td></tr>
+<tr><td><code>n_dead_tuples</code></td><td>实际死元组</td><td>✅ 准确</td></tr>
+<tr><td><code>inserts_since_vacuum</code></td><td>0</td><td>✅ 已重置</td></tr>
+<tr><td><code>changes_since_analyze</code></td><td>0</td><td>✅ 已重置</td></tr>
+</table>
+
+<h3>⚠️ 不推荐：仅 <code>ANALYZE</code></h3>
+
+<p><code>inserts_since_vacuum</code> 不会被重置，基于插入的冻结 VACUUM 可能延迟。</p>
+
+<hr>
+
+<h2>七、v16 vs v15 的关键差异</h2>
+
+<p>以上分析基于 PG 15.2 源码。PG 16+ 的变更：</p>
+
+<ol>
+<li><strong><code>pg_stat_io</code> 新增</strong>：I/O 统计独立到 <code>pg_stat_io</code> 视图</li>
+<li><strong><code>pg_stat_reset_shared('io')</code></strong>：可单独重置 I/O 统计</li>
+<li><strong><code>last_seq_scan</code> / <code>last_idx_scan</code></strong>：新增最后扫描时间戳</li>
+</ol>
+
+<p>但 <code>pg_stat_reset()</code> 对表级统计的<strong>清零行为不变</strong>，本文结论在 PG 16+ 同样适用。</p>
+
+<hr>
+
+<h2>八、巡检建议</h2>
+
+<p>在生产巡检中，以下信号值得关注：</p>
+
+<table>
+<tr><th>巡检项</th><th>SQL</th><th>阈值</th><th>级别</th></tr>
+<tr><td>统计异常表</td><td><code>n_live_tup &gt; n_tup_ins</code></td><td>&gt; 10 张表</td><td>WARNING</td></tr>
+<tr><td>从未维护的表</td><td><code>vacuum_count=0 AND analyze_count=0</code></td><td>&gt; 5 张表</td><td>WARNING</td></tr>
+<tr><td>autoanalyze 超期</td><td><code>last_autoanalyze &lt; now() - 7 days</code></td><td>&gt; 10 张表</td><td>WARNING</td></tr>
+<tr><td>Unlogged 表风险</td><td><code>relpersistence='u'</code></td><td>&gt; 0</td><td>INFO（崩溃后统计归零）</td></tr>
+</table>
+
+<hr>
+
+<h2>九、总结</h2>
+
+<ol>
+<li><strong><code>pg_stat_reset()</code> 清零所有累计计数器</strong>，包括 <code>n_tup_ins</code>、<code>n_live_tup</code>、<code>inserts_since_vacuum</code> 等</li>
+<li><strong>ANALYZE 扫描表获取精确值</strong>，设置 <code>n_live_tup</code>/<code>n_dead_tuples</code>，但<strong>不恢复累计计数器</strong></li>
+<li><strong><code>n_live_tup &gt; n_tup_ins</code> 是正常现象</strong>，说明统计刚被重置或在重置后执行了 ANALYZE</li>
+<li><strong>推荐重置后执行 <code>VACUUM ANALYZE</code></strong>，确保所有计数器恢复到准确状态</li>
+<li><strong>避免频繁调用 <code>pg_stat_reset()</code></strong>，除非有明确的监控重置需求</li>
+</ol>
+
+<hr>
+
+<p><em>验证环境：PolarDB PG 16.11 + PG 15.2 源码分析</em><br>
+<em>已集成到木木 PG 健康巡检（<code>check_db_stat_health</code>）</em></p>
+
+    </div>
+
+    <div class="post-meta-box">
+        
+        
+        
+        <p><strong>PG 版本:</strong> 15.2（源码）+ 16.11（验证）</p>
+    </div>
+</article>
+
+<nav class="post-nav">
+    <a href="/pg-xsj/">← 返回首页</a>
+</nav>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
