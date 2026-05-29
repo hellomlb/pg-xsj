@@ -6,9 +6,9 @@
     <title>pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="从 PG 15.2 源码出发，追踪 pg_stat_reset() 的完整调用链（shared_stat_reset_contents → pgstat_report_analyze → autovacuum 判断逻辑），分析其对 ANALYZE 和 AUTOVACUUM 计数器的影响，并结合 PolarDB PG 16.11 实验验证。">
+    <meta name="description" content="从 PG 15.2 源码出发，追踪 pg_stat_reset() 的完整调用链（shared_stat_reset_contents → pgstat_report_analyze → autovacuum 判断逻辑），分析其对 ANALYZE 和 AUTOVACUUM 计数器的影响，并结合 PG 16.11 实验验证。">
 <meta property="og:title" content="pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响">
-<meta property="og:description" content="从 PG 15.2 源码出发，追踪 pg_stat_reset() 的完整调用链，分析其对 ANALYZE 和 AUTOVACUUM 计数器的影响，并结合 PolarDB PG 16.11 实验验证。">
+<meta property="og:description" content="从 PG 15.2 源码出发，追踪 pg_stat_reset() 的完整调用链，分析其对 ANALYZE 和 AUTOVACUUM 计数器的影响，并结合 PG 16.11 实验验证。">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/pg-stat-reset-analyze-autovacuum.html">
 </head>
@@ -29,7 +29,7 @@
     <header class="post-header">
         <h1>pg_stat_reset() 后执行 ANALYZE 对 AUTOANALYZE 和 AUTOVACUUM 的影响</h1>
         <div class="post-meta">
-            <span class="badge badge-verified" title="已在 PolarDB PG 16.11 + PG 15.2 源码中验证">✅ 验证通过</span>
+            <span class="badge badge-verified" title="已在 PG 16.11 + PG 15.2 源码中验证">✅ 验证通过</span>
             <time datetime="2026-05-29">2026-05-29</time>
             <span class="post-category ops">
                 日常运维
@@ -135,7 +135,7 @@ ANALYZE 触发      →  n_live_tup=409 (扫描表得到)，但 n_tup_ins 不变
 
 <p>所以现象是 <code>n_live_tup=409 &gt; n_tup_ins=366</code>。</p>
 
-<p>实际 PolarDB PG 16.11 验证结果：</p>
+<p>实际 PG 16.11 验证结果：</p>
 
 <table>
 <tr><th>字段</th><th>值</th><th>说明</th></tr>
@@ -261,8 +261,8 @@ tabentry-&gt;inserts_since_vacuum = 0;           // 重置插入计数器</code>
 
 <hr>
 
-<p><em>验证环境：PolarDB PG 16.11 + PG 15.2 源码分析</em><br>
-<em>已集成到木木 PG 健康巡检（<code>check_db_stat_health</code>）</em></p>
+<p><em>验证环境：PG 16.11 + PG 15.2 源码分析</em><br>
+</p>
 
     </div>
 
