@@ -6,9 +6,9 @@
     <title>扩展统计信息表达式空指针崩溃：当 typanalyze 说"我做不到" - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="PG 16.14 修复了一个隐藏了 12 个版本的 Bug：对扩展类型的表达式创建扩展统计信息时，如果 typanalyze 回调表示无法分析，pg 会因空指针解引用而崩溃。本文从两个缺陷、编译验证到修复方案，完整还原。">
+    <meta name="description" content="PG 16.14 修复了一个隐藏了 12 个版本的 Bug：对扩展类型的表达式创建扩展统计信息时，如果 typanalyze 回调因无法分析而返回空，pg 会因空指针解引用而崩溃。本文从复现、源码分析到修复方案，完整还原。">
 <meta property="og:title" content="扩展统计信息表达式空指针崩溃：当 typanalyze 说"我做不到"">
-<meta property="og:description" content="PG 16.14 修复了一个隐藏了 12 个版本的 Bug：对扩展类型的表达式创建扩展统计信息时，如果 typanalyze 回调表示无法分析，pg 会因空指针解引用而崩溃。本文从两个缺陷、编译验证到修复方案，完整还原。">
+<meta property="og:description" content="PG 16.14 修复了一个隐藏了 12 个版本的 Bug：对扩展类型的表达式创建扩展统计信息时，如果 typanalyze 回调因无法分析而返回空，pg 会因空指针解引用而崩溃。本文从复现、源码分析到修复方案，完整还原。">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/extended-stats-expr-null-crash.html">
 </head>
@@ -40,6 +40,7 @@
 <span class="tag">typanalyze</span>
 <span class="tag">空指针</span>
 <span class="tag">ANALYZE</span>
+<span class="tag">CREATE STATISTICS</span>
 <span class="tag">PG 16.14</span>
             </span>
         </div>
@@ -48,161 +49,183 @@
     <div class="post-content">
         <h2>概述</h2>
 
-<p>PG 16.14 修复了一个隐蔽的空指针崩溃 Bug：<strong>当扩展统计信息作用于自定义数据类型的表达式，且该类型的 typanalyze 回调无法生成有效统计信息时，PostgreSQL 服务端崩溃。</strong></p>
+<p>PG 16.14 修复了一个隐藏了 12 个版本的 Bug：<strong>对扩展类型的表达式创建扩展统计信息时，如果该类型的 typanalyze 回调无法生成有效统计信息，PostgreSQL 服务端会因空指针解引用而崩溃。</strong></p>
 
-<p>这个 Bug 自 PG 14（2021 年）引入表达式扩展统计信息功能起就已存在，直到 2026 年才被 Michael Paquier 修复。</p>
+<table>
+<tr>
+<th>版本</th>
+<th>行为</th>
+<th>后果</th>
+</tr>
+<tr>
+<td><strong>PG 16.11（有 Bug）</strong></td>
+<td>执行 ANALYZE 时崩溃</td>
+<td>服务端 PANIC，连接断开</td>
+</tr>
+<tr>
+<td><strong>PG 16.14（已修复）</strong></td>
+<td>输出 WARNING 后跳过</td>
+<td>正常，统计信息标记为不可用</td>
+</tr>
+</table>
+
+<p><strong>受影响版本</strong>：PG 14~18 全部主版本。自 PG 14（2021 年）引入表达式扩展统计信息起，到 2026 年 16.14 修复，已有 12 个 major 版本。</p>
+
+<h2>现象</h2>
+
+<p>先安装测试扩展 <code>test_custom_types</code>（定义了一个 <code>int_custom</code> 类型 + 两个有问题的 typanalyze 回调），然后执行以下 SQL：</p>
+
+<pre><code>-- 建表并写入 10000 行
+CREATE EXTENSION test_custom_types;
+CREATE TABLE test_table (id int, data int_custom);
+INSERT INTO test_table SELECT i, i::text::int_custom
+FROM generate_series(1, 10000) i;
+
+-- 场景 1：typanalyze 返回 false
+ALTER TYPE int_custom SET (ANALYZE = int_custom_typanalyze_false);
+CREATE STATISTICS test_stats ON func_int_custom(data), (id) FROM test_table;
+ANALYZE test_table;
+-- 16.11 → PANIC（服务崩溃）
+-- 16.14 → WARNING: statistics object could not be computed
+
+-- 场景 2：typanalyze 返回 true 但 stats_valid=false
+ALTER TYPE int_custom SET (ANALYZE = int_custom_typanalyze_invalid);
+CREATE STATISTICS test_stats ON func_int_custom(data), (id) FROM test_table;
+ANALYZE test_table;
+-- 16.11 → PANIC（服务崩溃）
+-- 16.14 → 正常</code></pre>
+
+<h2>根因分析（源码层面）</h2>
+
+<p>Bug 出在 <code>src/backend/statistics/extended_stats.c</code> 和 <code>src/backend/utils/adt/selfuncs.c</code>，共<strong>两处缺陷 + 一处连带修复</strong>。</p>
+
+<h3>缺陷 1：lookup_var_attr_stats() 未检查 NULL 返回值</h3>
+
+<p>当 ANALYZE 为扩展统计对象中的表达式构建统计信息时，会调用 <code>examine_attribute()</code>。如果自定义类型的 <code>typanalyze</code> 回调无法分析（返回 false 或 stats_valid=false），该函数返回 NULL。但调用方直接使用返回值，不做检查：</p>
+
+<pre><code>// extended_stats.c — 修复前（PG 16.11）
+stats[i] = examine_attribute(expr);
+// 后续代码直接用 stats[i] → 空指针解引用 → 崩溃
+
+// 修复后（PG 16.14）— commit 530b6b02
+stats[i] = examine_attribute(expr);
+if (stats[i] == NULL)
+{
+    pfree(stats);
+    return NULL;  // 分析不了就放弃，不崩溃
+}</code></pre>
+
+<h3>缺陷 2：statext_expressions_load() 未处理 NULL 数组条目</h3>
+
+<p>当从 <code>pg_statistic</code> 系统表加载已存储的表达式统计信息时，如果某个表达式的统计信息为空（NULL 条目），代码直接尝试从 NULL 数据构建 HeapTuple：</p>
+
+<pre><code>// extended_stats.c — 修复前
+td = DatumGetHeapTupleHeader(eah->dvalues[idx]);  // dvalues[idx] 可能是 NULL
+
+// 修复后
+if (eah->dnulls && eah->dnulls[idx])
+{
+    ReleaseSysCache(htup);
+    return NULL;
+}</code></pre>
+
+<h3>连带修复：examine_variable()</h3>
+
+<p>在 <code>selfuncs.c</code> 中，<code>statext_expressions_load()</code> 返回 NULL 后，<code>examine_variable()</code> 无条件设置了 <code>freefunc = ReleaseDummy</code>，这在 statsTuple 为 NULL 时会导致问题。修复后加了一层判断：</p>
+
+<pre><code>// selfuncs.c — 修复前
+vardata->freefunc = ReleaseDummy;  // 即使 statsTuple 是 NULL 也设
+
+// 修复后
+if (vardata->statsTuple != NULL)
+{
+    vardata->freefunc = ReleaseDummy;
+}</code></pre>
+
+<p><strong>三层根因</strong>：</p>
+
+<table>
+<tr>
+<th>层次</th>
+<th>原因</th>
+</tr>
+<tr>
+<td><strong>直接原因</strong></td>
+<td>examine_attribute() 返回 NULL 时未检查，导致空指针解引用</td>
+</tr>
+<tr>
+<td><strong>深层原因</strong></td>
+<td>pg_statistic 数组中的 NULL 条目未被 statext_expressions_load() 处理</td>
+</tr>
+<tr>
+<td><strong>根本原因</strong></td>
+<td>PG 14 引入表达式扩展统计信息时（commit <code>a4d75c86bf15</code>），未对 typanalyze 回调的所有返回值路径做 NULL 检查。假设所有 typanalyze 都会返回有效数据，但扩展类型的回调可能不遵守这个契约</td>
+</tr>
+</table>
+
+<h2>为什么 12 个版本都没发现</h2>
+
+<p>核心原因：<strong>没有 in-core 的 typanalyze 回调会触发这组缺陷</strong>。</p>
+
+<p>PostgreSQL 自带的所有数据类型（int4、text、jsonb 等）的 typanalyze 实现都正确返回了有效统计信息。只有<strong>第三方扩展定义的自定义类型</strong>，如果其 typanalyze 实现有问题，才会走进这条空指针路径。这也暴露了 core 代码对扩展行为的一个隐藏假设。</p>
+
+<h2>影响评估</h2>
 
 <table>
 <tr>
 <th>维度</th>
-<th>内容</th>
+<th>评估</th>
 </tr>
 <tr>
-<td><strong>现象</strong></td>
-<td>ANALYZE 在处理扩展统计信息时因空指针解引用而崩溃</td>
+<td><strong>危害类型</strong></td>
+<td>服务崩溃（PANIC）</td>
 </tr>
 <tr>
 <td><strong>触发条件</strong></td>
-<td>自定义类型 + typanalyze 返回 false 或 stats_valid=false + CREATE STATISTICS ON expr + ANALYZE</td>
+<td>自定义数据类型 + typanalyze 返回 false/stats_valid=false + CREATE STATISTICS + ANALYZE</td>
 </tr>
 <tr>
 <td><strong>影响范围</strong></td>
-<td>PG 14~18 全部主版本（需自定义扩展类型触发，in-core 类型不受影响）</td>
+<td>PG 14~18 全部主版本（需自定义扩展类型触发）</td>
 </tr>
 <tr>
 <td><strong>修复版本</strong></td>
 <td>16.14 / 15.18 / 17.10 / 18.4</td>
 </tr>
 <tr>
+<td><strong>升级风险</strong></td>
+<td>无 — 修复只增加 NULL 检查，正常路径不变</td>
+</tr>
+<tr>
 <td><strong>隐蔽性</strong></td>
-<td>⭐⭐⭐ — 生产环境几乎不会触发（没有 in-core 类型会走到这条路径），但扩展开发者可能踩到</td>
+<td>⭐⭐⭐ — 生产环境几乎不会触发（无 in-core 类型会走到此路径），但扩展开发者可能踩到</td>
+</tr>
+<tr>
+<td><strong>扩展生态意义</strong></td>
+<td>core 代码对扩展类型的 typanalyze 行为缺乏防御性编程，此修复对第三方扩展开发者释放了一个长期隐藏的坑</td>
 </tr>
 </table>
 
-<h2>一、问题定位</h2>
+<h2>建议</h2>
 
-<p>Michael Paquier 在分析中发现了<strong>两个独立的缺陷</strong>，都在表达式扩展统计信息的边界条件上。</p>
-
-<h3>缺陷 1：构建统计信息时未检查 NULL 返回</h3>
-
-<p>当 ANALYZE 为扩展统计对象中的表达式构建统计信息时，会调用 <code>examine_attribute()</code> 来获取表达式列的分析信息。如果自定义类型的 <code>typanalyze</code> 回调返回了 <code>false</code>（或虽然返回 true 但未设置有效统计信息），<code>examine_attribute()</code> 会返回 NULL。</p>
-
-<p>但 <code>lookup_var_attr_stats()</code> 中直接使用这个返回值构建 MCV、ndistinct 和 dependencies 统计信息，<strong>没有做 NULL 检查</strong>：</p>
-
-<pre><code>// 有 Bug：直接使用 examine_attribute() 的返回值
-stats[i] = examine_attribute(expr);
-// 后续代码未经检查就用 stats[i] 构建统计信息 → 空指针解引用</code></pre>
-
-<p>修复很简单——加一行 NULL 检查：</p>
-
-<pre><code>stats[i] = examine_attribute(expr);
-if (stats[i] == NULL)
-{
-    pfree(stats);
-    return NULL;  // 无法分析，及早放弃
-}</code></pre>
-
-<h3>缺陷 2：加载统计信息时未处理 NULL 条目</h3>
-
-<p>当从系统表加载已存储的扩展统计信息时，<code>statext_expressions_load()</code> 从 <code>pg_statistic</code> 数组中读取表达式统计信息。如果某个表达式的统计信息因为收集失败而在数组中是 NULL 条目，代码会尝试从 NULL 数据中构建 HeapTuple，导致错误或崩溃。</p>
-
-<pre><code>// 修复前：未检查 NULL 条目
-td = DatumGetHeapTupleHeader(eah->dvalues[idx]);
-
-// 修复后：先检查再使用
-if (eah->dnulls && eah->dnulls[idx])
-{
-    ReleaseSysCache(htup);
-    return NULL;  // 无统计数据，告知调用方
-}</code></pre>
-
-<p>连带修复了 <code>examine_variable()</code>——只有在 <code>statsTuple != NULL</code> 时才设置 <code>freefunc</code>。</p>
-
-<h2>二、为什么 12 个版本都没发现</h2>
-
-<p>核心原因：<strong>没有 in-core 的 typanalyze 回调会触发这组缺陷</strong>。</p>
-
-<p>PostgreSQL 自带的所有数据类型（int4、text、jsonb 等）的 typanalyze 实现都正确返回了有效统计信息。只有<strong>第三方扩展定义的自定义类型</strong>，如果其 typanalyze 实现有问题，才会走进这条空指针路径。</p>
-
-<p>这也是扩展生态的安全隐患——core 代码假设所有 typanalyze 都会返回有效数据，但扩展类型不一定遵守这个契约。</p>
-
-<h2>三、验证方式：编译测试扩展 + 双版本运行</h2>
-
-<p>由于没有 in-core 类型能触发，验证需要<strong>编写一个自定义 C 扩展</strong>，定义一个有"问题"的 typanalyze 回调。</p>
-
-<p>从邮件列表 Patch 中提取的 <code>test_custom_types</code> 扩展定义了 <code>int_custom</code> 类型，提供两个 buggy 回调：</p>
-
-<table>
-<tr>
-<th>回调</th>
-<th>行为</th>
-<th>模拟场景</th>
-</tr>
-<tr>
-<td><code>int_custom_typanalyze_false</code></td>
-<td>直接返回 false</td>
-<td>类型完全拒绝被分析</td>
-</tr>
-<tr>
-<td><code>int_custom_typanalyze_invalid</code></td>
-<td>返回 true 但设置 stats_valid=false</td>
-<td>假装分析成功但实际无效</td>
-</tr>
-</table>
-
-<p>在两个版本上分别编译安装该扩展，创建测试表并 ANALYZE：</p>
-
-<table>
-<tr>
-<th>场景</th>
-<th>PG 16.11（修复前）</th>
-<th>PG 16.14（修复后）</th>
-</tr>
-<tr>
-<td>typanalyze 返回 false</td>
-<td>❌ 服务崩溃</td>
-<td>✅ WARNING + 正常</td>
-</tr>
-<tr>
-<td>typanalyze 返回无效数据</td>
-<td>❌ 服务崩溃</td>
-<td>✅ 正常</td>
-</tr>
-</table>
-
-<h2>四、费曼解释</h2>
-
-<p>想象你让一个质检员检查一批零件。质检员有一个登记表，上面列了每个零件的检查结果。</p>
-
-<p><strong>原来的代码</strong>：质检员在登记表上为每个零件预留位置。但遇到一个"无法检查"的零件时，他不在登记表上做任何标记，而是直接在空的格子位置上盖章、签字、写分析报告——实际上他是在对着一张<strong>白纸</strong>操作。下一步工序看到这份"检查报告"，以为零件已经分析过了，直接用这个假数据做决策，整个流程就崩溃了。</p>
-
-<p><strong>修复后的代码</strong>：质检员看到"无法检查"的零件，直接在登记表上写<strong>"此零件无法分析，跳过"</strong>。后续工序知道这条记录无效，安全地跳过它。</p>
-
-<p><strong>一句话总结</strong>：调用函数拿到 NULL 却不检查，等于默认"所有数据类型都老老实实告诉我统计信息"——扩展类型可不一定。</p>
-
-<h2>五、影响与建议</h2>
-
-<ul>
-<li><strong>普通用户</strong>：不受影响。标准 PostgreSQL 类型的 typanalyze 行为正确，不会触发此 Bug。</li>
-<li><strong>扩展开发者</strong>：需要注意 typanalyze 回调的返回值契约——返回 false 或 stats_valid=false 时，core 代码已安全处理（升级到修复版本后）。</li>
-<li><strong>建议升级</strong>：虽然生产环境几乎不会触发，但这是潜在的安全隐患，建议随版本升级一并修复。</li>
-</ul>
+<li><strong>普通用户</strong>：不受影响，标准类型的 typanalyze 行为正确</li>
+<li><strong>扩展开发者</strong>：注意 typanalyze 回调的返回值契约——返回 false 或 stats_valid=false 是合法行为，core 代码现在能正确处理</li>
+<li><strong>建议升级</strong>：虽然生产环境几乎不会触发，但这是潜在的安全隐患，建议随版本升级一并修复</li>
 
 <h2>参考</h2>
 
-<ul>
 <li>修复 commit: <a href="https://github.com/postgres/postgres/commit/530b6b02f891db45ff9416a0f3307e87b9c03b45"><code>530b6b02</code></a></li>
 <li>邮件列表: <a href="https://postgr.es/m/aaDrJsE1I5mrE-QF@paquier.xyz">Defects with invalid stats data for expressions in extended stats</a></li>
 <li><a href="https://www.postgresql.org/docs/16/sql-createstatistics.html">CREATE STATISTICS 文档</a></li>
 <li><a href="https://www.postgresql.org/docs/16/release-16-14.html">PG 16.14 Release Notes</a></li>
-</ul>
 
     </div>
 
     <div class="post-meta-box">
-        <p><strong>修复 Commit:</strong> 530b6b02</p>
+        
+        <p><strong>Commit:</strong> 530b6b02</p>
+        
         <p><strong>PG 版本:</strong> 16.14</p>
-        <p><strong>验证方式:</strong> 编译 test_custom_types 扩展，双版本实际运行</p>
     </div>
 </article>
 
