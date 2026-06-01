@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/kernel/extended-stats-expr-null-crash.html">扩展统计信息表达式空指针崩溃：当 typanalyze 说"我做不到"</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-06-01">2026-06-01</time>
+            <span class="post-category kernel">内核研究</span>
+        </div>
+        <p class="post-excerpt">PG 16.14 修复了扩展统计信息处理自定义类型时的空指针崩溃：examine_attribute() 在 typanalyze 回调缺失时返回 NULL，但调用方未检查。通过自定义扩展构造 test_custom_types 类型验证，16.11 崩溃 → 16.14 安全。</p>
+        <a href="/pg-xsj/kernel/extended-stats-expr-null-crash.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/kernel/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
         <div class="post-meta">
             <time datetime="2026-05-25">2026-05-25</time>
