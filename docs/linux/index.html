@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🔬 内核研究 - PG习思集</title>
+    <title>🐧 Linux 运维 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="PostgreSQL 内核源码分析、功能定制">
+    <meta name="description" content="Linux 内核安全漏洞分析、性能调优、容器运维实战">
 </head>
 <body>
     <header class="site-header">
@@ -22,20 +22,20 @@
 
     <main class="container">
         <header class="category-header">
-    <h1>🔬 内核研究</h1>
-    <p class="category-desc">PostgreSQL 内核源码分析、功能定制</p>
+    <h1>🐧 Linux 运维</h1>
+    <p class="category-desc">Linux 内核安全漏洞分析、性能调优、容器运维实战</p>
     <p class="back-link"><a href="/pg-xsj/">← 返回首页</a></p>
 </header>
 
 <div class="post-list">
     <article class="post-card">
-        <h3><a href="/pg-xsj/kernel/pg16.14-bug17-merge-serializable.html">Bug #17：MERGE 在 RR/SERIALIZABLE 下静默违反隔离性</a></h3>
+        <h3><a href="/pg-xsj/linux/cve-2026-31431-copyfail.html">CopyFail (CVE-2026-31431)：潜伏 9 年、732 字节 Python 提权、能容器逃逸的史诗级漏洞</a></h3>
         <div class="post-meta">
-            <time datetime="2026-05-25">2026-05-25</time>
-            <span class="post-category kernel">内核研究</span>
+            <time datetime="2026-06-02">2026-06-02</time>
+            <span class="post-category ops">Linux 运维</span>
         </div>
-        <p class="post-excerpt">PG 16.14 修复了一个隐蔽的并发 Bug：MERGE 在 REPEATABLE READ / SERIALIZABLE 隔离级别下遇到并发更新时，静默使用新版本元组继续操作，不报序列化失败。16.11 就此漏过，应用层根本不知道数据已经错了。</p>
-        <a href="/pg-xsj/kernel/pg16.14-bug17-merge-serializable.html" class="read-more">阅读全文 →</a>
+        <p class="post-excerpt">三个看似无害的内核补丁叠加 9 年，造就了 Linux 历史上最"优雅"的本地提权漏洞：AF_ALG 加密接口 + splice() 零拷贝 + authencesn in-place 解密，让 732 字节 Python 脚本即可 100% 成功地从普通用户获得 root 权限，还能跨容器逃逸接管 Kubernetes 节点。本文从根因到攻击链路到修复方案到 PG 运维实战，全面拆解。</p>
+        <a href="/pg-xsj/linux/cve-2026-31431-copyfail.html" class="read-more">阅读全文 →</a>
     </article>
 </div>
     </main>
