@@ -5,7 +5,21 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Fri, 29 May 2026 14:50:00 +0800</lastBuildDate>
+    <lastBuildDate>Wed, 03 Jun 2026 11:15:00 +0800</lastBuildDate>
+    <item>
+      <title>CopyFail 修复完全指南：从检测到上线、一行不漏的操作手册</title>
+      <link>https://hellomlb.github.io/pg-xsj/linux/cve-2026-31431-copyfail-fix.html</link>
+      <description>续上篇 CopyFail 深度分析，聚焦怎么修：各发行版精确修复内核版本对照表、Ubuntu Live Patch (LSN-120-1) 不停机修复、AF_ALG 三步临时缓解、增强版检测脚本、容器 seccomp 加固、PG 运维完整行动计划 + 修复后验证清单。覆盖全部操作场景。</description>
+      <pubDate>2026-06-03</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/linux/cve-2026-31431-copyfail-fix.html</guid>
+    </item>
+    <item>
+      <title>CopyFail (CVE-2026-31431)：潜伏 9 年、732 字节 Python 提权、能容器逃逸的史诗级漏洞</title>
+      <link>https://hellomlb.github.io/pg-xsj/linux/cve-2026-31431-copyfail.html</link>
+      <description>三个看似无害的内核补丁叠加 9 年，造就了 Linux 历史上最"优雅"的本地提权漏洞：AF_ALG 加密接口 + splice() 零拷贝 + authencesn in-place 解密，让 732 字节 Python 脚本即可 100% 成功地从普通用户获得 root 权限，还能跨容器逃逸接管 Kubernetes 节点。本文从根因到攻击链路到修复方案到 PG 运维实战，全面拆解。</description>
+      <pubDate>2026-06-02</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/linux/cve-2026-31431-copyfail.html</guid>
+    </item>
     <item>
       <title>DeepSeek RAG 本地知识库 — 安装部署文档</title>
       <link>https://hellomlb.github.io/pg-xsj/ai/deepseek-rag-deploy.html</link>
