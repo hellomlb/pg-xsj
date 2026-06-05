@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Wed, 03 Jun 2026 11:15:00 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 05 Jun 2026 16:56:00 +0800</lastBuildDate>
+    <item>
+      <title>PG 被冤枉的两次：THP 和 fsyncgate —— OS 层故障如何伪装成数据库问题</title>
+      <link>https://hellomlb.github.io/pg-xsj/ops/os-failures-thp-fsyncgate.html</link>
+      <description>两个 Linux 层故障——THP 透明大页和 fsyncgate——症状 100% 模仿 PG 问题：p99 延迟随机飙升却查不出任何慢 SQL，已提交事务在崩溃后凭空消失。本文从根因到症状到修复，给出一刀斩方案。</description>
+      <pubDate>2026-06-05</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/os-failures-thp-fsyncgate.html</guid>
+    </item>
     <item>
       <title>CopyFail 修复完全指南：从检测到上线、一行不漏的操作手册</title>
       <link>https://hellomlb.github.io/pg-xsj/linux/cve-2026-31431-copyfail-fix.html</link>

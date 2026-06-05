@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PG 被冤枉的两次：THP 和 fsyncgate —— OS 层故障如何伪装成数据库问题 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="两个 Linux 层故障——THP 透明大页和 fsyncgate——症状 100% 模仿 PG 问题：p99 延迟随机飙升、已提交事务数据静默丢失。本文从根因到症状到修复，给出一刀斩方案。">
+    <meta property="og:title" content="PG 被冤枉的两次：THP 和 fsyncgate —— OS 层故障如何伪装成数据库问题">
+    <meta property="og:description" content="两个 Linux 层故障，症状 100% 模仿 PG 问题：p99 延迟随机飙升、已提交事务数据静默丢失。本文从根因到症状到修复，给出一刀斩方案。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/os-failures-thp-fsyncgate.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>PG 被冤枉的两次：THP 和 fsyncgate —— OS 层故障如何伪装成数据库问题</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-05">2026-06-05</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">THP</span>
+                <span class="tag">透明大页</span>
+                <span class="tag">fsync</span>
+                <span class="tag">data_sync_retry</span>
+                <span class="tag">OS层</span>
+                <span class="tag">故障诊断</span>
+                <span class="tag">p99延迟</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>有两个 Linux 层故障，<strong>故障点完全不在 PG 代码内，但症状 100% 表现为 PG 问题</strong>——一个让你的 p99 延迟随机飙到几百毫秒却查不出任何慢 SQL，另一个让你的已提交事务在崩溃重启后凭空消失。它们加起来可能是 PG 运维中最容易被误诊的一对陷阱。</p>
+
+        <p>本文不是科普，是<strong>武器</strong>——每个故障给一个一刀斩方案，读完就能用。</p>
+
+        <hr>
+
+        <h2>故障① THP 透明大页 —— 「p99 延迟随机飙升，但查不出任何慢 SQL」</h2>
+
+        <h3>典型场景</h3>
+
+        <p>你接到告警：某个核心接口 P99 延迟突然飙到 800ms。你打开 pg_stat_statements，发现该查询 <code>mean_time</code> 只有 0.3ms。打开 pg_stat_activity，没有锁等待、没有 I/O 等待。CPU 正常，内存正常，没有 swap。</p>
+
+        <p>一切 PG 层面的监控都告诉你<strong>「没有问题」</strong>，但用户说<strong>「就是慢」</strong>。</p>
+
+        <p>这时候你很可能遇到了 THP。</p>
+
+        <h3>根因：khugepaged 的"好心办坏事"</h3>
+
+        <p>Linux 内核有一个后台线程叫 <code>khugepaged</code>，它的工作是扫描进程内存，把连续的 512 个 4KB 小页合并成一个 2MB 大页——目的是减少 TLB miss，提高内存访问效率。</p>
+
+        <p>问题在于<strong>合并过程本身</strong>：</p>
+
+        <pre><code>khugepaged 遍历进程页表
+  → 找到 2MB 对齐的 512 个连续小页
+  → 锁住这些页（❗）
+  → 把内容拷贝到新的大页
+  → 更新页表指针
+  → 释放旧小页
+  → 解锁
+
+合并期间，PG 后端进程访问被锁定的页
+  → 在内核态挂起等待
+  → 挂起时间：几十到几百毫秒
+  → PG 进程对此毫不知情——无日志、无 wait_event</code></pre>
+
+        <p><strong>为什么 PG 特别敏感？</strong></p>
+
+        <ul>
+            <li>PG 是多进程模型，每个连接一个独立进程——<strong>所有后端进程都可能被同时挂起</strong></li>
+            <li>THP 的 <code>defrag</code> 模式加剧问题：<code>always</code> 模式下只要有连续页就尝试合并，PG 的排序/哈希操作大量分配临时内存，恰好满足合并条件</li>
+            <li>PG 的 shared_buffers 已经自己管理大块内存，THP 完全没有正面收益</li>
+        </ul>
+
+        <h3>一刀斩</h3>
+
+        <pre><code># 即时生效
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+
+# 持久化（二选一）
+
+# 方法 1：grub 内核参数
+# /etc/default/grub
+GRUB_CMDLINE_LINUX="... transparent_hugepage=never"
+grub2-mkconfig -o /boot/grub2/grub.cfg
+
+# 方法 2：systemd service（不影响 grub）
+cat > /etc/systemd/system/disable-thp.service << 'EOF'
+[Unit]
+Description=Disable Transparent Huge Pages
+After=sysinit.target local-fs.target
+Before=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable disable-thp.service</code></pre>
+
+        <h3>验证</h3>
+
+        <pre><code>cat /sys/kernel/mm/transparent_hugepage/enabled
+# 应输出: always madvise [never]  ← 看方括号位置
+
+cat /sys/kernel/mm/transparent_hugepage/defrag
+# 应输出: always madvise [never]
+
+# 确认 khugepaged 不在运行
+ps aux | grep '[k]hugepaged'
+# 无输出 = 安全</code></pre>
+
+        <hr>
+
+        <h2>故障② fsyncgate —— 「事务 COMMIT 了，但数据没写进磁盘」</h2>
+
+        <h3>典型场景</h3>
+
+        <p>数据库正常运行，一切监控指标绿色。某天服务器意外重启（或 SAN 网络抖动、磁盘坏道触发底层错误），重启后发现：<strong>部分已提交的事务凭空消失，数据对不上</strong>。</p>
+
+        <p>你查 WAL 日志——提交记录都在。查 PG 日志——无任何错误。数据就这么没了。</p>
+
+        <p>这就是 fsyncgate。</p>
+
+        <h3>根因：Linux 内核在写入错误后"遗忘"了错误</h3>
+
+        <p>整个过程只有 <strong>5 步</strong>：</p>
+
+        <pre><code>① PG 执行 INSERT，数据写入 OS 页缓存 → write() 返回成功
+② PG 调用 fsync()，要求将脏页刷到磁盘
+③ 磁盘驱动层写入失败（SAN 抖动/坏道/NFS 超时）
+④ Linux 内核块设备层检测到错误，但——
+   ❌ 内核的错误处理逻辑清除了错误标志
+   ✅ 后续 fsync() 看到"干净"标志，返回 0（成功）
+⑤ PG 收到 fsync() = 成功 → 认为数据已安全落盘 → 提交完成
+
+结果：事务提交成功，但磁盘上什么都没有。</code></pre>
+
+        <p>这个 Bug 不是 PG 的。受影响的内核版本横跨多年，触发条件苛刻：<strong>必须底层存储返回写入错误 + 内核恰好清除错误状态</strong>。SAN/NFS 网络抖动是最常见触发场景，普通本地磁盘也可能因坏道触发。</p>
+
+        <h3>PG 的应对：宁可崩溃，绝不丢数据</h3>
+
+        <table>
+            <tr>
+                <th>版本</th>
+                <th>data_sync_retry</th>
+                <th>行为</th>
+            </tr>
+            <tr>
+                <td>PG 9.4 ~ 10</td>
+                <td>不支持</td>
+                <td>无条件信任 fsync 返回值 → <strong>可能丢数据</strong></td>
+            </tr>
+            <tr>
+                <td>PG 11 ~ 18</td>
+                <td><code>on</code>（默认）</td>
+                <td>fsync 失败 → 重试 → 与旧版同风险 → <strong>可能丢数据</strong></td>
+            </tr>
+            <tr>
+                <td>PG 11 ~ 18</td>
+                <td><code>off</code> ✅</td>
+                <td>fsync 失败 → 立即 PANIC → 崩溃恢复 → WAL replay 重新写入 → <strong>安全</strong></td>
+            </tr>
+        </table>
+
+        <p><code>data_sync_retry = off</code> 的逻辑很简单：<strong>既然不能信任 fsync 的返回值，那就不要信任——失败了就崩溃，用 WAL 日志在恢复时重新写。</strong></p>
+
+        <h3>一刀斩</h3>
+
+        <pre><code>-- 检查当前值
+SHOW data_sync_retry;
+
+-- 如果不是 off：
+ALTER SYSTEM SET data_sync_retry = off;
+SELECT pg_reload_conf();
+
+-- 再次确认
+SHOW data_sync_retry;  -- 应为 off</code></pre>
+
+        <p><strong>⚠️ 注意：PG 9.4 ~ 10 不支持此参数，升级是唯一的修复路径。</strong>如果还在用这些版本，fsyncgate 的风险是实打实存在的。</p>
+
+        <h3>不可选的替代方案</h3>
+
+        <table>
+            <tr>
+                <th>方案</th>
+                <th>行得通？</th>
+                <th>为什么</th>
+            </tr>
+            <tr>
+                <td>信任硬件 RAID 卡</td>
+                <td>❌</td>
+                <td>RAID 卡也会返回假成功</td>
+            </tr>
+            <tr>
+                <td>用 ZFS/Btrfs</td>
+                <td>✅</td>
+                <td>文件系统层 checksum 可以检测</td>
+            </tr>
+            <tr>
+                <td>PG data_checksums</td>
+                <td>部分</td>
+                <td>能发现已损坏，不能防止丢失</td>
+            </tr>
+        </table>
+
+        <hr>
+
+        <h2>两个故障的共性</h2>
+
+        <table>
+            <tr>
+                <th>维度</th>
+                <th>THP</th>
+                <th>fsyncgate</th>
+            </tr>
+            <tr>
+                <td><strong>故障层</strong></td>
+                <td>Linux 内存管理</td>
+                <td>Linux 块设备层</td>
+            </tr>
+            <tr>
+                <td><strong>PG 表现</strong></td>
+                <td>p99 延迟随机飙升</td>
+                <td>已提交数据静默丢失</td>
+            </tr>
+            <tr>
+                <td><strong>PG 日志</strong></td>
+                <td>完全正常</td>
+                <td>完全正常</td>
+            </tr>
+            <tr>
+                <td><strong>修复位置</strong></td>
+                <td>OS 参数（一行 echo）</td>
+                <td>PG 参数（一行 ALTER SYSTEM）</td>
+            </tr>
+            <tr>
+                <td><strong>影响面</strong></td>
+                <td>所有 PG 版本</td>
+                <td>PG 9.4~10（无修复）；PG 11+（未设 off 时）</td>
+            </tr>
+            <tr>
+                <td><strong>误诊率</strong></td>
+                <td>极高（症状完美模仿 PG 慢查询）</td>
+                <td>极高（症状完美模仿 PG 数据损坏）</td>
+            </tr>
+        </table>
+
+        <p>两者的共同特征：<strong>故障点不在 PG 代码内，但症状 100% 表现为 PG 故障。</strong>这是它们容易被误诊的根本原因——出问题时，所有人的第一反应都是"PG 怎么了？"</p>
+
+        <hr>
+
+        <h2>集成到巡检</h2>
+
+        <p>两个故障都可以通过脚本自动化检测，已集成到木木 PG 健康巡检 v2.1：</p>
+
+        <pre><code># THP 检测
+cat /sys/kernel/mm/transparent_hugepage/enabled  # [never] = 安全
+cat /sys/kernel/mm/transparent_hugepage/defrag    # [never] = 安全
+
+# fsyncgate 检测
+psql -c "SHOW data_sync_retry;"  # off = 安全
+
+# 检测结果自动入报告，FATAL 级别标红</code></pre>
+
+        <hr>
+
+        <h2>老木白话</h2>
+
+        <blockquote>
+            <p><strong>THP 是 Linux 内核在"好心办坏事"——想帮你减少 TLB miss，结果把 PG 进程挂了几百毫秒。关了就行，反正 PG 自己管 shared_buffers，根本不需要大页。</strong></p>
+            <p><strong>fsyncgate 是 Linux 内核在"报喜不报忧"——磁盘写入失败了内核不说，fsync 还返回成功。PG 只能自救：设 data_sync_retry = off，告诉内核"搞不定就让我崩，我自己从 WAL 恢复"。</strong></p>
+            <p>这两个问题的本质是一样的：<strong>不要默认 OS 层是完美的</strong>。数据库运维不只是看 PG 参数，OS 层的坑踩一个就是一个事故。</p>
+        </blockquote>
+
+        <h2>参考来源</h2>
+
+        <ul>
+            <li>Payal Singh, <em>Postgres Outages That Aren't Postgres Bugs</em>, Postgres Weekly #651 (2026-06-03)</li>
+            <li>PostgreSQL Documentation, <em>Write Ahead Log — data_sync_retry</em>, postgresql.org/docs/current/runtime-config-wal.html</li>
+            <li>Linux Kernel Documentation, <em>Transparent Hugepage Support</em>, kernel.org/doc/Documentation/vm/transhuge.txt</li>
+            <li>PostgreSQL Wiki, <em>fsyncgate</em>, wiki.postgresql.org/wiki/Fsync_Errors</li>
+        </ul>
+    </div>
+
+    <div class="post-meta-box">
+        <p><strong>PG 版本:</strong> 全版本（THP 影响所有版本；fsyncgate PG 11+ 可修复）</p>
+        <p><strong>验证方式:</strong> 内核源码分析 + 故障场景逻辑还原 + 巡检脚本自动化检测</p>
+    </div>
+</article>
+
+<nav class="post-nav">
+    <a href="/pg-xsj/ops/">← 返回日常运维</a>
+</nav>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
