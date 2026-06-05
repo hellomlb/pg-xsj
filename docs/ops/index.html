@@ -38,6 +38,15 @@
         <a href="/pg-xsj/ops/os-failures-thp-fsyncgate.html" class="read-more">阅读全文 →</a>
     </article>
     <article class="post-card">
+        <h3><a href="/pg-xsj/ops/file-descriptors-exhaustion.html">文件描述符耗尽：让 PostgreSQL 宕机的 OS 级限制 —— 三招诊断，一套修复</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-06-05">2026-06-05</time>
+            <span class="post-category ops">日常运维</span>
+        </div>
+        <p class="post-excerpt">文件描述符耗尽总被误诊为 PG 问题：症状是 PG 报 Too many open files，根因却在 OS 层。本文给出三步诊断法（日志→/proc/PID/fd→ulimit）和一套完整修复方案（limits.conf + sysctl + PgBouncer），覆盖裸金属和 K8s 环境。</p>
+        <a href="/pg-xsj/ops/file-descriptors-exhaustion.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/ops/cursor-tuple-fraction-jdbc-trap.html">cursor_tuple_fraction JDBC 陷阱：流式读取 ≠ 服务端游标</a></h3>
         <div class="post-meta">
             <time datetime="2026-06-04">2026-06-04</time>
