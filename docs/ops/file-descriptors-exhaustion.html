@@ -105,7 +105,8 @@ sysctl fs.file-max
 
 # 已分配 FD / 上限 / 峰值
 cat /proc/sys/fs/file-nr
-# 输出格式: &lt;已分配&gt; &lt;总上限无关&gt; &lt;系统级上限&gt;
+# 输出三列: &lt;全系统已分配FD数&gt; &lt;空闲FD数&gt; &lt;系统级上限(fs.file-max)&gt;
+# 注意: 第1列的"已分配"是所有进程之和，不是单个进程
 
 # 当前进程的软/硬限制
 ulimit -n       # soft limit
@@ -114,6 +115,16 @@ ulimit -Hn      # hard limit
 # PG 进程的实际限制（替换为实际 PID）
 cat /proc/$(pgrep -f "postgres.*checkpointer" | head -1)/limits | grep "Max open files"</code></pre>
 
+        <p><strong>三个层级的 FD 限制，别搞混：</strong></p>
+        <table>
+            <thead><tr><th>参数</th><th>层级</th><th>含义</th></tr></thead>
+            <tbody>
+                <tr><td><code>fs.file-max</code></td><td>内核/系统级</td><td><strong>全系统所有进程 FD 之和的上限</strong></td></tr>
+                <tr><td><code>/proc/sys/fs/file-nr</code> 第1列</td><td>实时状态</td><td>当前全系统已分配的 FD 总数</td></tr>
+                <tr><td><code>ulimit -n</code> / limits.conf nofile</td><td>进程级</td><td><strong>单个进程</strong>能打开的 FD 数</td></tr>
+            </tbody>
+        </table>
+        <br/>
         <table>
             <thead><tr><th>检查项</th><th>危险值</th><th>推荐值</th></tr></thead>
             <tbody>
