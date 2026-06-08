@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Fri, 05 Jun 2026 17:10:00 +0800</lastBuildDate>
+    <lastBuildDate>Mon, 08 Jun 2026 09:48:00 +0800</lastBuildDate>
+    <item>
+      <title>pg_plan_advice + pg_stash_advice：PostgreSQL 15 年之争的终点</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/pg-plan-advice-query-hints.html</link>
+      <description>PostgreSQL 社区争论了 15 年的 Query Hints，终于在 PG19 以 Plan Advice 的形式落地了。规划器现在会告诉你它在做什么，你也可以约束它——但不是替代它，而是和它协商。本文从 2010 年的那场邮件列表战役讲起，深度解析设计哲学、Plan Advice DSL 语法和生产级 pg_stash_advice 用法。</description>
+      <pubDate>Mon, 08 Jun 2026 09:48:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/pg-plan-advice-query-hints.html</guid>
+    </item>
     <item>
       <title>PG 被冤枉的两次：THP 和 fsyncgate —— OS 层故障如何伪装成数据库问题</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/os-failures-thp-fsyncgate.html</link>
