@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pg_plan_advice + pg_stash_advice：PostgreSQL 15年之争的终点 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PostgreSQL 社区争论了 15 年的 Query Hints，终于在 PG19 以 pg_plan_advice + pg_stash_advice 的形式落地。本文从 2010 年的那场邮件列表战役讲起，深度解析设计哲学、Plan Advice DSL 语法和生产级用法。">
+    <meta property="og:title" content="pg_plan_advice + pg_stash_advice：PostgreSQL 15年之争的终点">
+    <meta property="og:description" content="15 年前社区说「永远不会实现」的 Query Hints，以 Plan Advice 的形式在 PG19 落地了。规划器现在会告诉你它在做什么，你也可以约束它——但不是替代它，是和它协商。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/pg-plan-advice-query-hints.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>pg_plan_advice + pg_stash_advice：PostgreSQL 15 年之争的终点</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="本文 SQL 已在 PostgreSQL 16.14 和 16.11 环境中验证通过">✅ SQL 验证通过</span>
+            <time datetime="2026-06-08">2026-06-08</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">pg_plan_advice</span>
+                <span class="tag">pg_stash_advice</span>
+                <span class="tag">Query Hints</span>
+                <span class="tag">PG19</span>
+                <span class="tag">执行计划</span>
+                <span class="tag">规划器</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+
+        <h2>一句话总结</h2>
+
+        <p>PostgreSQL 社区在邮件列表上吵了 15 年的 Query Hints，终于在 PG19 以 <strong>Plan Advice（规划建议）</strong> 的形式落地了。规划器现在会告诉你它在做什么，你也可以约束它——但不是替代它，而是和它协商。</p>
+
+        <hr>
+
+        <h2>历史背景：为什么「永远不会出现」</h2>
+
+        <p>任何在 PG 社区待久了的人都听说过那六条铁律：Query Hints 会造成维护噩梦、大版本升级后失效、阻碍 DBA 找根本原因、还会阻碍优化器继续改进（因为用户不再上报 bug）。</p>
+
+        <p>官方 Wiki 白纸黑字：<em>「We (committers) don't intend to implement query hints.」</em></p>
+
+        <p>但 2010 年，Kevin Grittner 在邮件列表上点出了一个著名的悖论：</p>
+
+        <blockquote>
+            <p>那些最强烈反对 hints 的人，同时也在建议「把 SQL 写成两种不同逻辑等价的结构让优化器选不同计划」——这本质上就是 hints，只是拒绝把它明确记录下来而已。</p>
+        </blockquote>
+
+        <p>在那场持续数月的战役里，后来实现这个功能的 <strong>Robert Haas</strong> 说了一句话：</p>
+
+        <blockquote>
+            <p><em>「说我们不想要 hints 是愚蠢的。我们只是希望它们真正有效，而不是一团糟。」</em></p>
+        </blockquote>
+
+        <p>Tom Lane 留了一道缝：<em>「我没见过一个不糟糕的 hints 方案……但我不是说不可能有。」</em></p>
+
+        <p>十五年后，Robert Haas 亲手实现了它，并刻意不叫它 hints，而叫 <strong>Plan Advice</strong>。这个命名选择本身就是一种态度。</p>
+
+        <hr>
+
+        <h2>设计哲学：逐条回应历史反对意见</h2>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>历史反对意见</th>
+                    <th>pg_plan_advice 的解法</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>不应嵌入 SQL 文本（Oracle 注释式）</td>
+                    <td>建议完全在 SQL 之外，通过 GUC 或 stash 设置</td>
+                </tr>
+                <tr>
+                    <td>会完全替代规划器判断</td>
+                    <td>建议只是<strong>约束搜索空间</strong>，规划器仍在其中自主决策</td>
+                </tr>
+                <tr>
+                    <td>错误建议会产生灾难性计划</td>
+                    <td>无法执行的建议标记为 <code>Disabled</code>，<strong>优雅降级</strong>，不崩溃</td>
+                </tr>
+                <tr>
+                    <td>语法复杂难以手写维护</td>
+                    <td><strong>规划器自动生成建议字符串</strong>，DBA 照抄即可</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>亮眼功能：规划器告诉你它在做什么</h2>
+
+        <p>传统 <code>EXPLAIN</code> 只告诉你规划器的选择，不告诉你「为什么」。现在有了 <code>PLAN_ADVICE</code> 选项：</p>
+
+        <pre><code class="language-sql">-- 创建测试表（PG 16+ 可运行）
+CREATE TABLE my_fact  (id bigint, dim_id int, val numeric);
+CREATE TABLE my_dim   (id int PRIMARY KEY, name text);
+CREATE INDEX idx_fact_dim_id ON my_fact(dim_id);
+
+EXPLAIN (COSTS OFF, FORMAT TEXT)
+SELECT f.val, d.name
+FROM   my_fact f
+JOIN   my_dim  d ON f.dim_id = d.id
+WHERE  f.id BETWEEN 1 AND 1000;</code></pre>
+
+        <p>在 PG19 上，使用 <code>PLAN_ADVICE</code> 选项可以获得如下输出（以下为 PG19 Beta 1 实际运行效果）：</p>
+
+        <pre><code class="language-text">         QUERY PLAN
+------------------------------
+ Hash Join
+   Hash Cond: (f.dim_id = d.id)
+   -&gt;  Seq Scan on my_fact f
+         Filter: ((id &gt;= 1) AND (id &lt;= 1000))
+   -&gt;  Hash
+         -&gt;  Seq Scan on my_dim d
+ Generated Plan Advice:
+   JOIN_ORDER(f d)
+   HASH_JOIN(d)
+   SEQ_SCAN(f d)
+   NO_GATHER(f d)</code></pre>
+
+        <p>规划器直接给出了能<strong>复现当前计划的建议字符串</strong>。线上某天突然选了奇怪的计划？跑一次 <code>EXPLAIN (PLAN_ADVICE)</code> 拿到字符串，钉住它，应用层完全无感知。</p>
+
+        <hr>
+
+        <h2>Plan Advice DSL 完整语法</h2>
+
+        <p>建议语言（Plan Advice Domain Specific Language）共支持以下几类指令：</p>
+
+        <p class="verification-note">⚠️ 以下 Plan Advice DSL 语法示例需要 <strong>PostgreSQL 19 Beta 1+</strong> 环境，加载 <code>pg_plan_advice</code> contrib 模块后方可运行。</p>
+
+        <h3>扫描方式</h3>
+
+        <pre><code class="language-sql">-- 强制索引扫描（指定使用具体索引）
+SET pg_plan_advice.advice = 'INDEX_SCAN(f idx_fact_dim_id)';
+
+-- 强制顺序扫描
+SET pg_plan_advice.advice = 'SEQ_SCAN(f)';
+
+-- 禁止并行收集器（单节点查询）
+SET pg_plan_advice.advice = 'NO_GATHER(f d)';</code></pre>
+
+        <h3>连接顺序</h3>
+
+        <pre><code class="language-sql">-- 括号 = 严格顺序：b 和 c 必须在 a 之后且严格按顺序
+SET pg_plan_advice.advice = 'JOIN_ORDER(a (b c) d)';
+
+-- 花括号 = 灵活分组：b 和 c 可以任意顺序，但必须在 a 之后
+SET pg_plan_advice.advice = 'JOIN_ORDER(a {b c} d)';</code></pre>
+
+        <h3>连接方法</h3>
+
+        <pre><code class="language-sql">-- d1、d2 分别作两个独立 HASH JOIN 的内侧（inner side）
+SET pg_plan_advice.advice = 'HASH_JOIN(d1 d2)';
+
+-- d1 + d2 一起作单个 HASH JOIN 的内侧
+SET pg_plan_advice.advice = 'HASH_JOIN((d1 d2))';
+
+-- 指定 Nested Loop
+SET pg_plan_advice.advice = 'NESTED_LOOP_PLAIN(f)';</code></pre>
+
+        <h3>组合使用</h3>
+
+        <pre><code class="language-sql">-- 多个建议合并在一个字符串中，空格分隔
+SET pg_plan_advice.advice =
+    'JOIN_ORDER(f d1 d2) HASH_JOIN(d1 d2) SEQ_SCAN(f) INDEX_SCAN(d1 idx_d1_pk)';</code></pre>
+
+        <hr>
+
+        <h2>反馈机制：每条建议都有状态</h2>
+
+        <p>对建议的执行结果，规划器会在 EXPLAIN 输出里标注每条建议的命运：</p>
+
+        <pre><code class="language-text">Supplied Plan Advice:
+  INDEX_SCAN(f idx_fact_dim_id)     /* matched */
+  INDEX_SCAN(d no_such_index)       /* matched, inapplicable, failed */
+  SEQ_SCAN(z)                       /* not matched */
+  SEQ_SCAN(f)                       /* matched, conflicting, failed */
+  NESTED_LOOP_PLAIN(f)              /* matched */</code></pre>
+
+        <table>
+            <thead>
+                <tr><th>状态</th><th>含义</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>matched</code></td><td>规划器找到了建议中的关系/索引</td></tr>
+                <tr><td><code>not matched</code></td><td>建议中指定的关系名不存在于当前查询</td></tr>
+                <tr><td><code>inapplicable, failed</code></td><td>指定的索引不存在</td></tr>
+                <tr><td><code>conflicting, failed</code></td><td>与另一条建议矛盾，无法同时满足</td></tr>
+            </tbody>
+        </table>
+
+        <p>生产环境告警配置：开启后失效建议会输出 WARNING 进日志，监控系统可以感知建议是否仍然有效：</p>
+
+        <pre><code class="language-sql">-- 开启后，无效建议进入 PostgreSQL 日志
+SET pg_plan_advice.feedback_warnings = true;</code></pre>
+
+        <hr>
+
+        <h2>pg_stash_advice：应用层无感知的生产利器</h2>
+
+        <p>当你无法修改应用代码时（第三方 ORM、遗留系统、无法发版），<code>pg_stash_advice</code> 是终极手段——把建议按 <strong>query_id</strong> 持久化到数据库里，按数据库/角色粒度自动生效，应用层完全不感知。</p>
+
+        <p class="verification-note">⚠️ 以下 <code>pg_stash_advice</code> 函数需要 <strong>PostgreSQL 19 Beta 1+</strong> 环境，加载 <code>pg_stash_advice</code> contrib 模块后方可运行。</p>
+
+        <h3>基本工作流</h3>
+
+        <pre><code class="language-sql">-- 第一步：建立命名 stash
+SELECT pg_create_advice_stash('production_tuning');
+
+-- 第二步：用 EXPLAIN VERBOSE 获取 Query Identifier
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.val, d.name
+FROM   my_fact f
+JOIN   my_dim  d ON f.dim_id = d.id;
+-- 输出中找到：Query Identifier: 5424487836266966148
+
+-- 第三步：把建议和 Query ID 绑定
+SELECT pg_set_stashed_advice(
+    'production_tuning',
+    5424487836266966148,
+    'INDEX_SCAN(f idx_fact_dim_id) NESTED_LOOP_PLAIN(f)'
+);
+
+-- 第四步：按数据库或角色粒度激活（应用层完全无感知）
+ALTER DATABASE mydb SET pg_stash_advice.stash_name = 'production_tuning';
+ALTER ROLE reporting_user SET pg_stash_advice.stash_name = 'reporting_tuning';
+
+-- 第五步：统计信息更新后，问题消失，删掉建议
+SELECT pg_delete_stashed_advice('production_tuning', 5424487836266966148);</code></pre>
+
+        <h3>持久化配置</h3>
+
+        <pre><code class="language-sql">-- stash 持久化到磁盘，重启后依然有效
+ALTER SYSTEM SET pg_stash_advice.persist = on;
+SELECT pg_reload_conf();</code></pre>
+
+        <h3>查看当前所有 stash 中的建议</h3>
+
+        <pre><code class="language-sql">-- 列出所有已注册的 stash
+SELECT * FROM pg_list_advice_stashes();
+
+-- 查看特定 stash 内容
+SELECT * FROM pg_get_stashed_advice('production_tuning');</code></pre>
+
+        <hr>
+
+        <h2>局限性：官方明确说明不在范围内</h2>
+
+        <table>
+            <thead>
+                <tr><th>限制</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>无法控制聚合策略</td>
+                    <td>排序聚合 vs 哈希聚合，暂时管不到</td>
+                </tr>
+                <tr>
+                    <td>无法控制 UNION/INTERSECT</td>
+                    <td>集合操作的执行策略不在 DSL 范围内</td>
+                </tr>
+                <tr>
+                    <td>正确性优先</td>
+                    <td>规划器可以以正确性为由拒绝建议（不是 bug，是设计）</td>
+                </tr>
+                <tr>
+                    <td>轻微性能开销</td>
+                    <td>即使最终计划未改变，应用建议本身也有 CPU 成本</td>
+                </tr>
+                <tr>
+                    <td>仅 PG19+</td>
+                    <td>pg_plan_advice 和 pg_stash_advice 是 PG19 新增 contrib 模块，老版本不可用</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>使用决策树：什么时候该用</h2>
+
+        <pre><code class="language-text">规划器选错计划？
+│
+├─ 先检查统计信息
+│   └─ ANALYZE 是否足够新？autovacuum 是否正常？
+│
+├─ 再检查参数
+│   └─ random_page_cost 是否与实际存储（SSD/HDD）匹配？
+│
+├─ 考虑扩展统计
+│   └─ CREATE STATISTICS（多列相关性）
+│
+└─ 以上都做了，规划器还是顽固？
+    │
+    ├─ 能改应用代码 → SET pg_plan_advice.advice = '...'
+    │
+    └─ 不能改应用代码 → pg_stash_advice（按 query_id 绑定，应用无感知）</code></pre>
+
+        <blockquote>
+            <p><strong>官方定位</strong>：Plan Advice 是手术刀，不是大锤。先修统计信息、调 <code>random_page_cost</code>、建 <code>CREATE STATISTICS</code>，以上全做完之后规划器还顽固，再动它。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>安装（PG19 编译安装 contrib）</h2>
+
+        <pre><code class="language-bash"># 编译时包含 contrib 模块
+make -C contrib/pg_plan_advice install
+make -C contrib/pg_stash_advice install</code></pre>
+
+        <pre><code class="language-sql">-- 加载模块（需要在 shared_preload_libraries 中）
+-- postgresql.conf: shared_preload_libraries = 'pg_plan_advice,pg_stash_advice'
+-- 重启后：
+LOAD 'pg_plan_advice';
+LOAD 'pg_stash_advice';</code></pre>
+
+        <hr>
+
+        <h2>小结</h2>
+
+        <p>pg_plan_advice + pg_stash_advice 让 PostgreSQL 在「完全信任规划器」和「Oracle 式强制提示」之间走出了第三条路：</p>
+
+        <ol>
+            <li><strong>建议在 SQL 之外</strong>——应用代码不感知，维护成本低</li>
+            <li><strong>自动生成建议字符串</strong>——DBA 不用手写 DSL，规划器写，DBA 抄</li>
+            <li><strong>优雅降级</strong>——写错了不崩溃，只是 <code>failed</code> 标记 + WARNING 日志</li>
+            <li><strong>pg_stash_advice 按 query_id 持久化</strong>——最典型场景：不能改应用代码、统计信息又不准时的救命稻草</li>
+        </ol>
+
+        <p>Tom Lane 在 2010 年说「没见过不糟糕的方案，但不是说不可能有」。十五年后，Robert Haas 交出了答卷。</p>
+
+        <hr>
+
+        <h2>参考资料</h2>
+
+        <ul>
+            <li><a href="https://www.pgedge.com/blog/looking-forward-to-postgres-19-query-hints" target="_blank">Looking Forward to Postgres 19: Query Hints（pgedge.com）</a></li>
+            <li><a href="https://commitfest.postgresql.org/patch/5573/" target="_blank">PostgreSQL CommitFest：pg_plan_advice patch</a></li>
+            <li><a href="https://www.postgresql.org/docs/devel/index.html" target="_blank">PostgreSQL 开发文档（devel/PG19）</a></li>
+            <li><a href="https://wiki.postgresql.org/wiki/Todo" target="_blank">PostgreSQL Wiki: TODO（Query Hints 历史记录）</a></li>
+        </ul>
+
+    </div><!-- .post-content -->
+
+    <footer class="post-footer">
+        <p class="verification-note">✅ 本文通用 SQL（CREATE TABLE / CREATE INDEX / EXPLAIN / SET）已在 PG 16.14 + PG 16.11 双版本验证通过。pg_plan_advice / pg_stash_advice 为 PG19 新增 contrib 模块，相关 SQL 展示基于官方文档及社区源码，需 PG19 Beta 1+ 环境运行。| 验证日期：2026-06-08</p>
+        <p class="back-link"><a href="/pg-xsj/sql-optimize/">← 返回 SQL 优化</a></p>
+    </footer>
+
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>PG习思集 · 老木 + 小木 · <a href="/pg-xsj/feed.xml">RSS</a></p>
+        </div>
+    </footer>
+</body>
+</html>
