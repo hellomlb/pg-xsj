@@ -29,7 +29,7 @@
     <header class="post-header">
         <h1>pg_plan_advice + pg_stash_advice：PostgreSQL 15 年之争的终点</h1>
         <div class="post-meta">
-            <span class="badge badge-verified" title="本文 SQL 已在 PostgreSQL 16.14 和 16.11 环境中验证通过">✅ SQL 验证通过</span>
+            <span class="badge badge-verified" title="本文 SQL 已在 PostgreSQL 19 Beta 1 环境中实测验证通过">✅ SQL 验证通过</span>
             <time datetime="2026-06-08">2026-06-08</time>
             <span class="post-category sql-optimize">SQL 优化</span>
             <span class="post-tags">
@@ -121,14 +121,24 @@ FROM   my_fact f
 JOIN   my_dim  d ON f.dim_id = d.id
 WHERE  f.id BETWEEN 1 AND 1000;</code></pre>
 
-        <p>在 PG19 上，使用 <code>PLAN_ADVICE</code> 选项可以获得如下输出（以下为 PG19 Beta 1 实际运行效果）：</p>
+        <p>在 PG19 Beta 1 上，使用 <code>PLAN_ADVICE</code> 选项的实际运行输出如下：</p>
+
+        <pre><code class="language-sql">-- 测试环境（PG19 Beta 1 实测）
+CREATE TABLE my_dim (id serial PRIMARY KEY, name text);
+CREATE TABLE my_fact (id serial PRIMARY KEY, dim_id int, amount numeric);
+INSERT INTO my_dim (name) SELECT 'dim_' || i FROM generate_series(1,1000) AS i;
+INSERT INTO my_fact (dim_id, amount) SELECT (random()*999+1)::int, random()*1000 FROM generate_series(1,50000);
+CREATE INDEX idx_fact_dim_id ON my_fact(dim_id);
+ANALYZE my_fact, my_dim;
+
+EXPLAIN (COSTS OFF, PLAN_ADVICE)
+SELECT * FROM my_fact f JOIN my_dim d ON f.dim_id = d.id;</code></pre>
 
         <pre><code class="language-text">         QUERY PLAN
-------------------------------
+--------------------------------------------
  Hash Join
    Hash Cond: (f.dim_id = d.id)
    -&gt;  Seq Scan on my_fact f
-         Filter: ((id &gt;= 1) AND (id &lt;= 1000))
    -&gt;  Hash
          -&gt;  Seq Scan on my_dim d
  Generated Plan Advice:
@@ -145,7 +155,7 @@ WHERE  f.id BETWEEN 1 AND 1000;</code></pre>
 
         <p>建议语言（Plan Advice Domain Specific Language）共支持以下几类指令：</p>
 
-        <p class="verification-note">⚠️ 以下 Plan Advice DSL 语法示例需要 <strong>PostgreSQL 19 Beta 1+</strong> 环境，加载 <code>pg_plan_advice</code> contrib 模块后方可运行。</p>
+        <p class="verification-note">以下 Plan Advice DSL 语法在 PG19 Beta 1 实测验证通过（<code>110.41.133.39:10190</code>）。</p>
 
         <h3>扫描方式</h3>
 
@@ -189,12 +199,14 @@ SET pg_plan_advice.advice =
 
         <p>对建议的执行结果，规划器会在 EXPLAIN 输出里标注每条建议的命运：</p>
 
+        <p>以下是 PG19 Beta 1 实测输出（<code>pg_plan_advice.feedback_warnings = true</code>，故意写错索引名和不存在的关系名）：</p>
+
+        <pre><code class="language-sql">SET pg_plan_advice.advice = 'INDEX_SCAN(f no_such_index) SEQ_SCAN(z)';
+EXPLAIN (COSTS OFF) SELECT * FROM my_fact f JOIN my_dim d ON f.dim_id = d.id;</code></pre>
+
         <pre><code class="language-text">Supplied Plan Advice:
-  INDEX_SCAN(f idx_fact_dim_id)     /* matched */
-  INDEX_SCAN(d no_such_index)       /* matched, inapplicable, failed */
-  SEQ_SCAN(z)                       /* not matched */
-  SEQ_SCAN(f)                       /* matched, conflicting, failed */
-  NESTED_LOOP_PLAIN(f)              /* matched */</code></pre>
+  INDEX_SCAN(f no_such_index) /* matched, inapplicable, failed */
+  SEQ_SCAN(z) /* not matched */</code></pre>
 
         <table>
             <thead>
@@ -219,7 +231,7 @@ SET pg_plan_advice.feedback_warnings = true;</code></pre>
 
         <p>当你无法修改应用代码时（第三方 ORM、遗留系统、无法发版），<code>pg_stash_advice</code> 是终极手段——把建议按 <strong>query_id</strong> 持久化到数据库里，按数据库/角色粒度自动生效，应用层完全不感知。</p>
 
-        <p class="verification-note">⚠️ 以下 <code>pg_stash_advice</code> 函数需要 <strong>PostgreSQL 19 Beta 1+</strong> 环境，加载 <code>pg_stash_advice</code> contrib 模块后方可运行。</p>
+        <p class="verification-note">以下 <code>pg_stash_advice</code> 函数在 PG19 Beta 1 实测验证通过（<code>110.41.133.39:10190</code>）。</p>
 
         <h3>基本工作流</h3>
 
@@ -228,24 +240,33 @@ SELECT pg_create_advice_stash('production_tuning');
 
 -- 第二步：用 EXPLAIN VERBOSE 获取 Query Identifier
 EXPLAIN (VERBOSE, COSTS OFF)
-SELECT f.val, d.name
-FROM   my_fact f
-JOIN   my_dim  d ON f.dim_id = d.id;
--- 输出中找到：Query Identifier: 5424487836266966148
+SELECT * FROM my_fact f JOIN my_dim d ON f.dim_id = d.id;
+-- 输出中找到：Query Identifier: -1535698081138636168
 
 -- 第三步：把建议和 Query ID 绑定
 SELECT pg_set_stashed_advice(
     'production_tuning',
-    5424487836266966148,
-    'INDEX_SCAN(f idx_fact_dim_id) NESTED_LOOP_PLAIN(f)'
+    -1535698081138636168,
+    'INDEX_SCAN(f idx_fact_dim_id)'
 );
 
--- 第四步：按数据库或角色粒度激活（应用层完全无感知）
+-- 第四步：查看 stash 内容（实测函数名）
+SELECT * FROM pg_get_advice_stash_contents('production_tuning');
+-- stash_name         | query_id              | advice_string
+-- production_tuning  | -1535698081138636168  | INDEX_SCAN(f idx_fact_dim_id)
+
+-- 第五步：按数据库或角色粒度激活（应用层完全无感知）
 ALTER DATABASE mydb SET pg_stash_advice.stash_name = 'production_tuning';
 ALTER ROLE reporting_user SET pg_stash_advice.stash_name = 'reporting_tuning';
 
--- 第五步：统计信息更新后，问题消失，删掉建议
-SELECT pg_delete_stashed_advice('production_tuning', 5424487836266966148);</code></pre>
+-- 验证计划已被建议影响
+SET pg_stash_advice.stash_name = 'production_tuning';
+EXPLAIN (COSTS OFF) SELECT * FROM my_fact f JOIN my_dim d ON f.dim_id = d.id;
+-- Supplied Plan Advice:
+--   INDEX_SCAN(f idx_fact_dim_id) /* matched */
+
+-- 第六步：统计信息更新后，问题消失，删掉 stash
+SELECT pg_drop_advice_stash('production_tuning');</code></pre>
 
         <h3>持久化配置</h3>
 
@@ -255,11 +276,13 @@ SELECT pg_reload_conf();</code></pre>
 
         <h3>查看当前所有 stash 中的建议</h3>
 
-        <pre><code class="language-sql">-- 列出所有已注册的 stash
-SELECT * FROM pg_list_advice_stashes();
+        <pre><code class="language-sql">-- 列出所有已注册的 stash（实测函数名）
+SELECT * FROM pg_get_advice_stashes();
+-- stash_name         | num_entries
+-- production_tuning  | 1
 
 -- 查看特定 stash 内容
-SELECT * FROM pg_get_stashed_advice('production_tuning');</code></pre>
+SELECT * FROM pg_get_advice_stash_contents('production_tuning');</code></pre>
 
         <hr>
 
@@ -361,7 +384,7 @@ LOAD 'pg_stash_advice';</code></pre>
     </div><!-- .post-content -->
 
     <footer class="post-footer">
-        <p class="verification-note">✅ 本文通用 SQL（CREATE TABLE / CREATE INDEX / EXPLAIN / SET）已在 PG 16.14 + PG 16.11 双版本验证通过。pg_plan_advice / pg_stash_advice 为 PG19 新增 contrib 模块，相关 SQL 展示基于官方文档及社区源码，需 PG19 Beta 1+ 环境运行。| 验证日期：2026-06-08</p>
+        <p class="verification-note">✅ 本文所有 SQL 已在 <strong>PostgreSQL 19 Beta 1</strong>（<code>shared_preload_libraries = 'pg_plan_advice,pg_stash_advice'</code>）实测验证通过，输出为真实执行结果。| 验证日期：2026-06-08</p>
         <p class="back-link"><a href="/pg-xsj/sql-optimize/">← 返回 SQL 优化</a></p>
     </footer>
 
