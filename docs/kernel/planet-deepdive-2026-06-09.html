@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PG 社区深度复盘：pg_background 2.0 重构 / 7 大数据库统计哲学 / fsyncgate 技术拆解 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="Planet PostgreSQL 本周三篇亮点文章深度分析：pg_background 2.0 自治事务扩展全面重构、7 大数据库优化器统计哲学横向对比、data_sync_retry fsyncgate 遗产深度拆解。">
+    <meta property="og:title" content="PG 社区深度复盘：pg_background 2.0 重构 / 7 大数据库统计哲学 / fsyncgate 技术拆解">
+    <meta property="og:description" content="Planet PostgreSQL 本周三篇亮点文章深度分析：pg_background 2.0 自治事务扩展全面重构、7 大数据库优化器统计哲学横向对比、data_sync_retry fsyncgate 遗产深度拆解。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/planet-deepdive-2026-06-09.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>PG 社区深度复盘：pg_background 2.0 重构 / 7 大数据库统计哲学 / fsyncgate 技术拆解</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-09">2026-06-09</time>
+            <span class="post-category kernel">内核研究</span>
+            <span class="post-tags">
+                <span class="tag">pg_background</span>
+                <span class="tag">自治事务</span>
+                <span class="tag">优化器统计</span>
+                <span class="tag">data_sync_retry</span>
+                <span class="tag">fsyncgate</span>
+                <span class="tag">PlanetPG</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <p class="lead">本周 Planet PostgreSQL 有三篇文章值得深入拆解：pg_background 2.0 自治事务扩展的全面重构、7 大数据库优化器统计哲学的横向对比、以及 data_sync_retry（fsyncgate 遗产）的技术深度解析。三篇文章共同指向一个哲学命题：<strong>PostgreSQL 倾向于让你知道问题存在，而不是静默掩盖它</strong>。</p>
+
+        <hr>
+
+        <h2>一、pg_background 2.0：自治事务扩展的全面重构</h2>
+
+        <p><strong>原文：</strong> Vibhor Kumar | 2026-06-08</p>
+
+        <p>pg_background 通过后台工作者进程实现自治事务（Autonomous Transaction），是社区最常用的解决方案之一。2.0 是该扩展发布以来最大的一次重构。</p>
+
+        <h3>API 变更全景</h3>
+
+        <p><strong>核心逻辑：<code>_v2</code> 后缀退役，成为弃用别名（3.0 移除）。</strong></p>
+
+        <table>
+            <thead>
+                <tr><th>1.x 旧名</th><th>2.0 正式名</th><th>破坏性</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>pg_background_launch_v2(...)</code></td><td><code>pg_background_launch(...)</code></td><td>低（别名保留）</td></tr>
+                <tr><td><code>pg_background_result_v2(...)</code></td><td><code>pg_background_result(...)</code></td><td>低</td></tr>
+                <tr><td><code>pg_background_wait_v2(...)</code></td><td><code>pg_background_wait(...)</code></td><td>低</td></tr>
+                <tr><td><code>pg_background_cancel_v2(...)</code></td><td><code>pg_background_cancel(...)</code></td><td>低</td></tr>
+                <tr><td><code>pg_background_detach_v2(...)</code></td><td><code>pg_background_detach(...)</code></td><td>低</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>硬重命名（无别名，立即失效）：</strong></p>
+        <ul>
+            <li><code>pg_background_progress(pct, msg)</code> → <code>pg_background_report_progress(pct, msg)</code></li>
+            <li>类型 <code>pg_background_progress</code> → <code>pg_background_progress_info</code></li>
+            <li><code>pg_background_grant_privileges_v2(...)</code> → <code>pg_background_grant_privileges(...)</code></li>
+        </ul>
+
+        <p><strong>V1 API 彻底删除</strong>：返回裸 <code>int4</code> PID 的旧函数不再存在，必须使用 cookie 保护的 handle 版本。</p>
+
+        <h3>⚠️ 最危险的语义变更</h3>
+
+        <p><strong><code>timeout_ms = 0</code> 的含义彻底改变：</strong></p>
+        <ul>
+            <li><strong>1.x</strong>：<code>timeout_ms = 0</code> → 等待默认时长</li>
+            <li><strong>2.0</strong>：<code>timeout_ms = 0</code> → <strong>无限阻塞</strong>（匹配旧版无参数版本的默认行为）</li>
+        </ul>
+
+        <p>这是升级中最容易被忽略的陷阱。1.x 代码中 <code>timeout_ms => 0</code> 有实际超时行为，升级后变为永不超时。非阻塞检查应使用 <code>timeout_ms => 1</code>。</p>
+
+        <p><strong>同时</strong>：<code>pg_background_wait</code> 返回类型从 <code>void</code> 变更为 <code>bool</code>（true=完成，false=超时）。</p>
+
+        <h3>新增 Tier A 便捷函数</h3>
+
+        <table>
+            <thead>
+                <tr><th>函数</th><th>用途</th><th>典型场景</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>run_query(sql, queue_size, timeout_ms, label, col_def)</code></td><td>同步 launch→wait→result→detach，返回数据行</td><td>最常用入口，替代手动四步</td></tr>
+                <tr><td><code>drain(handles, timeout_ms)</code></td><td>批量等待所有 handle 完成</td><td>批量异步任务收集</td></tr>
+                <tr><td><code>wait_any(handles, timeout_ms)</code></td><td>返回第一个完成的 handle</td><td>事件驱动模式</td></tr>
+                <tr><td><code>cancel_by_label(pattern, grace_ms)</code></td><td>按 SQL LIKE 模式匹配标签取消</td><td>批量运维取消</td></tr>
+                <tr><td><code>purge()</code></td><td>仅 detach 已停止的 worker</td><td>清理泄漏 worker</td></tr>
+            </tbody>
+        </table>
+
+        <h3>安全模型变化</h3>
+
+        <ul>
+            <li><strong>PUBLIC 默认无访问</strong>：升级后必须显式 <code>GRANT pgbackground_role TO app_role;</code></li>
+            <li><strong>SECURITY DEFINER 函数</strong>：固定 <code>search_path = pg_catalog</code>，防搜索路径劫持</li>
+        </ul>
+
+        <h3>复合类型新增字段</h3>
+
+        <ul>
+            <li><code>pg_background_stats</code>：新增 <code>workers_timed_out</code>（超时取消计数）</li>
+            <li><code>pg_background_result_info</code>：新增 <code>started_at</code>、<code>finished_at</code>（执行时间范围）</li>
+            <li><code>pg_background_error</code>：新增 <code>schema_name/table_name/column_name/constraint_name</code>（错误上下文细化）</li>
+        </ul>
+
+        <h3>内部实现改进</h3>
+
+        <ul>
+            <li><strong>C 端错误处理修复</strong>：<code>EmitErrorReport → AbortCurrentTransaction → FlushErrorState</code> 重排序，防止 abort 在空错误栈上触发</li>
+            <li><strong>SQLSTATE 传播修正</strong>：<code>08006</code> 仅保留给基础设施级故障，正常 SQL 错误通过真实 SQLSTATE 传播</li>
+            <li><strong>并发 cancel 已知问题</strong>：<code>cancel_by_label</code> 匹配 ≥2 个 worker 且 <code>grace_ms > 0</code> 时偶发 SIGSEGV，源于 PG 上游 bgworker 启动路径。缓解方案：用 <code>cancel(pid, cookie, 0)</code> 立即 SIGTERM，或逐个取消</li>
+        </ul>
+
+        <h3>升级风险矩阵</h3>
+
+        <table>
+            <thead>
+                <tr><th>风险等级</th><th>项目</th><th>影响</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>🔴 高</td><td><code>timeout_ms=0</code> 语义变更</td><td>可能导致永久阻塞</td></tr>
+                <tr><td>🔴 高</td><td>4 个硬重命名标识符</td><td>代码编译失败</td></tr>
+                <tr><td>🟡 中</td><td><code>wait</code> 返回类型 void→bool</td><td>依赖返回值的代码异常</td></tr>
+                <tr><td>🟡 中</td><td>V1 API 删除</td><td>使用裸 PID 的代码失效</td></tr>
+                <tr><td>🟢 低</td><td><code>_v2</code> 后缀弃用</td><td>2.x 仍可用，3.0 移除</td></tr>
+            </tbody>
+        </table>
+
+        <h3>白话总结</h3>
+
+        <blockquote>
+            <p>pg_background 2.0 就像是给"后台跑 SQL"这个功能做了一次大扫除：把以前乱起的名字（_v2 后缀）统一了，把危险的旧门（V1 API）锁了，加了几扇新窗户（drain/wait_any/purge），还贴了个告示牌提醒你"timeout_ms=0 现在是无限等了别搞混"。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>二、跨数据库优化器统计对比：7 大数据库横向拆解</h2>
+
+        <p><strong>原文：</strong> Christophe Pettus | 2026-06-08</p>
+
+        <p>所有基于成本的优化器解决同一个问题：估计查询的基数。差异在三个维度：</p>
+        <ol>
+            <li><strong>统计数据的来源</strong>（采样/扫描/存储自带）</li>
+            <li><strong>统计数据允许的陈旧程度</strong>（实时/15分钟/手动）</li>
+            <li><strong>可供选择的计划形态</strong>（NL/Merge/Hash）</li>
+        </ol>
+
+        <h3>各系统统计哲学</h3>
+
+        <p><strong>Oracle —— 极繁主义者：</strong></p>
+        <p>"凡论文中出现过的统计想法，Oracle 都发布过某个版本。" AutoTask 夜间 + 15 分钟高频自动收集，HyperLogLog 草图估算 NDV，Extended Statistics 多列统计，SQL Plan Directives 跨语句持久注释。<code>OPTIMIZER_ADAPTIVE_STATISTICS</code> 默认 FALSE——更多统计 ≠ 更好的计划。</p>
+
+        <p><strong>Db2 —— 会编造数字的优化器：</strong></p>
+        <p>独有武器 <code>AUTO_STMT_STATS</code>：编译查询时当场采样，用新数据做计划——PG 没有对应物。查询优化深度旋钮 0-9（PG 对应 <code>geqo_threshold</code>）。统计视图（Statistical Views）在连接或过滤子集上定义，PG 也没有对应物。</p>
+
+        <p><strong>MySQL —— 被拖着前进的极简主义者：</strong></p>
+        <p>统计沿索引边界分裂为两部分：InnoDB 索引统计（采样 20 页，10% 行变化自动重算）+ 列直方图（<strong>永远手动</strong>）。两个致命限制：直方图不会自动维护，优化器基本忽略有索引列上的直方图。</p>
+
+        <p><strong>SQLite —— ANALYZE，手动执行：</strong></p>
+        <p>与 PG 关键字相同，但背后几乎一切不匹配。最独特的做法：在开发期用代表性数据运行 ANALYZE，将 <code>sqlite_stat1</code> 行作为 INSERT 语句<strong>硬编码进应用程序二进制</strong>。这是任何其他数据库都不会以这种方式表述的问题。</p>
+
+        <p><strong>DuckDB —— 统计作为存储的副产品：</strong></p>
+        <p>Row group 元数据在写入时自动记录 min/max + null 计数 + 近似 NDV。最聪明的部分：知道 <code>t1.a ∈ [25, 50]</code>，join <code>t1.a = t2.a</code> → 合成 <code>t2.a >= 25 AND t2.a <= 50</code> 并下推到扫描，跳过不可能匹配的 row group。</p>
+
+        <p><strong>Snowflake —— 没有 ANALYZE：</strong></p>
+        <p>"统计信息永不过时，原因与照片相对于拍摄时刻永不过时相同——存储即统计。" 微分区 50-500MB 不可变列式文件，写入时自动记录元数据。剪枝才是核心——比 join 算法选择更重要。</p>
+
+        <h3>核心对比表</h3>
+
+        <table>
+            <thead>
+                <tr><th>维度</th><th>Oracle</th><th>Db2</th><th>MySQL</th><th>SQLite</th><th>DuckDB</th><th>Snowflake</th><th><strong>PG</strong></th></tr>
+            </thead>
+            <tbody>
+                <tr><td>直方图</td><td>4种自动选</td><td>频率+quantile</td><td>2种/手动</td><td>STAT4可选</td><td>zone maps</td><td>微分区元数据</td><td>等深度+MCV</td></tr>
+                <tr><td>多列统计</td><td>✅自动建议</td><td>✅+统计视图</td><td>❌</td><td>❌</td><td>✅自动推导</td><td>✅自动发现</td><td><strong>✅手动创建</strong></td></tr>
+                <tr><td>自动收集</td><td>✅15分钟</td><td>✅同步+异步</td><td>✅仅索引</td><td>❌</td><td>✅写入时</td><td>✅写入时</td><td>✅autoanalyze</td></tr>
+                <tr><td>无数据兜底</td><td>动态采样</td><td><strong>编造数字</strong></td><td>猜测</td><td>烘焙二进制</td><td>不存在</td><td>不存在</td><td><strong>过时数字</strong></td></tr>
+                <tr><td>运行时自适应</td><td>✅(默认关)</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
+            </tbody>
+        </table>
+
+        <h3>PostgreSQL 定位：保守中间地带</h3>
+
+        <p>采样收集 + autoanalyze + MCV/直方图，但<strong>不会自动检测多列相关性</strong>。</p>
+
+        <p><strong>排查优先级（Pettus 原话）：</strong></p>
+        <ol>
+            <li>统计过期 → <code>ANALYZE</code> 或调紧 <code>autovacuum_analyze_scale_factor</code></li>
+            <li>列独立性假设失效 → <code>CREATE STATISTICS stats_name ON (col1, col2) FROM table_name</code></li>
+        </ol>
+
+        <blockquote>
+            <p>PostgreSQL 不会自动收集多列统计，也不会在无数据时编造行数。但它会精确执行你告诉它做的事——长期来看，可控性是保值最好的特性。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>三、data_sync_retry：fsyncgate 的遗产</h2>
+
+        <p><strong>原文：</strong> Christophe Pettus | 2026-06-08</p>
+
+        <h3>PostgreSQL 原以为的契约</h3>
+        <ul>
+            <li><code>fsync()</code> 返回成功 → 数据已落盘，WAL 可回收</li>
+            <li><code>fsync()</code> 返回失败 → 脏页仍在缓存中，<strong>可重试</strong></li>
+        </ul>
+
+        <h3>Linux 内核实际行为</h3>
+        <p>写入失败 → 脏页标记为 clean → 记录错误 → 下次 <code>fsync()</code> 报告（仅一次）→ 错误被遗忘 → 页面被回收重用</p>
+        <p>内核的逻辑：永远无法回收的脏页 = 无界内存泄漏 → 不可接受 → 丢弃是唯一选择。</p>
+
+        <h3>完整的灾难场景</h3>
+        <ol>
+            <li>检查点运行 → 写回错误发生</li>
+            <li>错误被报告给错误的文件描述符 → 被遗忘</li>
+            <li>脏页被标记为 clean → 被回收重用</li>
+            <li>checkpointer 调用 <code>fsync()</code> → 返回"成功"</li>
+            <li>检查点被认为完成 → WAL 段被回收</li>
+            <li><strong>数据"从已知宇宙中消失"</strong>（Andrew Gierth）</li>
+        </ol>
+
+        <h3>时间线</h3>
+        <ul>
+            <li><strong>2018 年初</strong>：Craig Ringer 将问题带到 pgsql-hackers</li>
+            <li><strong>PgCon 2018</strong>：Linux 内核开发者 Matthew Wilcox 演讲（座无虚席）。英国式致歉："我们为此带来的不便致歉"引发全场哄笑</li>
+            <li><strong>2018年11月</strong>（Thomas Munro）：引入 <code>data_sync_retry</code>，默认 <code>off</code> → PANIC</li>
+            <li>反向移植到所有受支持版本</li>
+            <li><strong>PG 12</strong>：额外改进，持续持有脏数据文件的 fd，但未反向移植</li>
+        </ul>
+
+        <h3><code>data_sync_retry</code> 参数</h3>
+
+        <table>
+            <thead>
+                <tr><th>值</th><th>行为</th><th>安全性</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>off</code>（默认）</td><td>fsync() 失败 → PANIC → WAL 重放恢复</td><td>✅ 安全</td></tr>
+                <tr><td><code>on</code></td><td>fsync() 失败 → 重试 → 继续运行</td><td>🔴 Linux 上=静默丢数据</td></tr>
+            </tbody>
+        </table>
+
+        <p>官方文档原话：在 Linux 上开启此选项 = "请静默地丢失我的数据，而不是大张旗鼓地丢失"。</p>
+
+        <h3>残留风险窗口</h3>
+
+        <p>即使 <code>data_sync_retry = off</code>，仍有窄窗口：文件被关闭→重新打开前→inode 被逐出→错误记录消失。</p>
+
+        <p><strong>PG12 缓解</strong>：持续持有 fd + 传递给 checkpointer → 避免"关闭→重打开"窗口。</p>
+
+        <p><strong>Linux 4.13 <code>errseq_t</code> 修补的局限性</strong>：</p>
+        <ol>
+            <li>数据回不来——可靠报告的错误仍是丢失数据的错误</li>
+            <li>inode 逐出时错误记录仍然丢失</li>
+            <li>这是报告层修补，不是语义层修补</li>
+        </ol>
+
+        <h3>终极方案：Direct I/O</h3>
+
+        <p>对主数据路径使用 Direct I/O，绕过页面缓存，让数据库自己掌控写回和错误处理。Andres Freund 评价："a metric ton of work"。截至 2026 年<strong>仍未完全落地</strong>。</p>
+
+        <h3>共享文件系统特殊风险</h3>
+
+        <p>NFS/CIFS 上：客户端报告 fsync 成功，但服务端未持久化。多层错误报告路径更易丢。PANIC 是重要信号——文件系统在"说谎"。</p>
+
+        <h3>白话总结</h3>
+
+        <blockquote>
+            <p>想象你给银行存了一箱金条，银行说"帮你锁进金库"（fsync 成功）。结果金库门坏了，金条被搬到了走廊（脏页标记为 clean），银行还给你发了张"已安全存入"的收据（重试 fsync 返回成功）。你拿着收据走了，但金条其实已经被别人搬走了（页面被回收）。data_sync_retry=off 就是：金库门一坏就拉警报（PANIC），把所有人叫回来从账本（WAL）重新对账。虽然麻烦，但至少不会让你以为金条还在但其实已经没了。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>三篇文章的哲学关联</h2>
+
+        <table>
+            <thead>
+                <tr><th>文章</th><th>核心哲学</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>pg_background 2.0</td><td><strong>宁可让你看到问题，也不静默掩盖</strong>：V1 裸 PID 设计隐藏风险 → 2.0 强制 cookie + 撤销 PUBLIC</td></tr>
+                <tr><td>跨数据库统计</td><td><strong>保守但可控</strong>：不会自作主张收集多列统计，也不会编造数字。说多少，做多少。</td></tr>
+                <tr><td>data_sync_retry</td><td><strong>PANIC 是安全网，不是 Bug</strong>：知道数据丢了比假装没丢强一万倍。</td></tr>
+            </tbody>
+        </table>
+
+        <p>三条线汇聚到一个设计哲学：<strong>PostgreSQL 倾向于让你知道问题存在（PANIC/手动统计/显式API），而不是静默地掩盖它</strong>。这种"宁可信其有"的设计哲学，是 PG 作为严肃数据库系统的核心价值。</p>
+
+        <hr>
+
+        <h2>参考来源</h2>
+        <ul>
+            <li>Vibhor Kumar — <em>pg_background 2.0: Autonomous Transactions, Supercharged</em> | Planet PostgreSQL 2026-06-08</li>
+            <li>Christophe Pettus — <em>How the Other Half Counts: Database Optimizer Statistics</em> | Planet PostgreSQL 2026-06-08</li>
+            <li>Christophe Pettus — <em>All Your GUCs in a Row: data_sync_retry</em> | Planet PostgreSQL 2026-06-08</li>
+        </ul>
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
