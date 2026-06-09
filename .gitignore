@@ -1,16 +1,3 @@
-# 源码文件 —— 不公开
-__pycache__/
-*.pyc
-*.pyo
-.env
-
-# 博客源码（本地构建用，不进 GitHub）
-generator.py
-config.py
-publish.py
-/templates/
-/posts/
-/assets/
-
-# 旧 git 历史备份
-*.bak
+tech_news/
+.workbuddy/
+.pgdata/
