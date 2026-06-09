@@ -7,11 +7,11 @@
     <language>zh-CN</language>
     <lastBuildDate>Tue, 09 Jun 2026 10:50:00 +0800</lastBuildDate>
     <item>
-      <title>PG 社区深度复盘：pg_background 2.0 重构 / 7 大数据库统计哲学 / fsyncgate 技术拆解</title>
-      <link>https://hellomlb.github.io/pg-xsj/kernel/planet-deepdive-2026-06-09.html</link>
-      <description>Planet PostgreSQL 本周三篇亮点文章深度分析：pg_background 2.0 自治事务扩展全面重构（API 规范化+安全收紧+timeout_ms=0语义变更）、7 大数据库优化器统计哲学横向对比（Oracle/Db2/MySQL/SQLite/DuckDB/Snowflake/PG）、data_sync_retry fsyncgate 遗产深度拆解（从fsyncgate起源到PANIC安全机制到Direct I/O未落地）。</description>
+      <title>data_sync_retry：fsyncgate 的遗产 —— PostgreSQL 持久化最深的教训</title>
+      <link>https://hellomlb.github.io/pg-xsj/ops/data-sync-retry-fsyncgate.html</link>
+      <description>深度拆解 data_sync_retry 参数：fsyncgate 事件始末、Linux 内核脏页处理逻辑、为何 PANIC 是安全响应而重试是灾难、PG12 持有 fd 缓解措施、errseq_t 修补的局限性、Direct I/O 进展。</description>
       <pubDate>Tue, 09 Jun 2026 10:50:00 +0800</pubDate>
-      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/planet-deepdive-2026-06-09.html</guid>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/data-sync-retry-fsyncgate.html</guid>
     </item>
     <item>
       <title>pg_plan_advice + pg_stash_advice：PostgreSQL 15 年之争的终点</title>

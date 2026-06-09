@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>data_sync_retry：fsyncgate 的遗产 —— PostgreSQL 持久化最深的教训 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="深度拆解 data_sync_retry 参数：fsyncgate 事件始末、Linux 内核脏页处理逻辑、为何 PANIC 是安全响应而重试是灾难、PG12 持有 fd 缓解措施、errseq_t 修补的局限性、Direct I/O 进展。">
+    <meta property="og:title" content="data_sync_retry：fsyncgate 的遗产 —— PostgreSQL 持久化最深的教训">
+    <meta property="og:description" content="深度拆解 data_sync_retry 参数：fsyncgate 事件始末、Linux 内核脏页处理逻辑、为何 PANIC 是安全响应而重试是灾难、PG12 持有 fd 缓解措施、errseq_t 修补的局限性、Direct I/O 进展。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/data-sync-retry-fsyncgate.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>data_sync_retry：fsyncgate 的遗产 —— PostgreSQL 持久化最深的教训</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-09">2026-06-09</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">fsyncgate</span>
+                <span class="tag">data_sync_retry</span>
+                <span class="tag">持久化</span>
+                <span class="tag">Linux内核</span>
+                <span class="tag">检查点</span>
+                <span class="tag">DirectIO</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>data_sync_retry</code> 是 PostgreSQL 持久化历史上最深刻的一次教训——fsyncgate 事件的"疤痕组织"。它的默认值 <code>off</code>（fsync 失败 → PANIC）</code> 不是保守，而是安全的；Linux 上开启 <code>on</code> 的唯一诚实描述是"请静默地丢失我的数据，而不是大张旗鼓地丢失"。</p>
+
+        <p>本文不是参数调优指南，而是对 <strong>fsyncgate 事件的完整技术拆解</strong>——从内核行为到 PG 对策到残留风险到终极方案。</p>
+
+        <hr>
+
+        <h2>fsyncgate 事件始末</h2>
+
+        <h3>PostgreSQL 原以为的契约</h3>
+
+        <p>PostgreSQL 写入磁盘分两步：</p>
+        <ul>
+            <li><strong><code>write()</code></strong>：将脏页复制到内核的页面缓存（page cache），速度快但不持久</li>
+            <li><strong><code>fsync()</code></strong>（在检查点时调用）：强制将文件的所有未刷脏页写入持久化存储</li>
+        </ul>
+
+        <p>数十年来的共识契约很简单：</p>
+        <ul>
+            <li><code>fsync()</code> 返回<strong>成功</strong> → 数据已落盘，WAL 可以回收</li>
+            <li><code>fsync()</code> 返回<strong>失败</strong> → 写入未完成，脏页仍在缓存中，<strong>可以重试</strong></li>
+        </ul>
+
+        <p>PostgreSQL 的检查点逻辑完全建立在第二条之上——</p>
+
+        <h3>内核实际做了什么</h3>
+
+        <p>当 Linux 内核尝试将脏页写回设备但写入失败时（坏扇区、精简配置卷空间耗尽、SAN 短暂消失等），内核面临抉择：将永远无法回收的脏页一直保留？这构成无界内存泄漏，内核无法允许。</p>
+
+        <p>因此 Linux 采取了实用主义做法：</p>
+        <ul>
+            <li>将页面标记为 <strong>clean（干净）</strong></li>
+            <li>记录发生了一个错误</li>
+            <li>在<strong>下一次</strong>对该文件的 <code>fsync()</code> 调用时报告该错误——<strong>仅此一次</strong></li>
+            <li>之后该错误被遗忘，页面可像其他干净页一样被回收重用</li>
+        </ul>
+
+        <p>更糟糕的是：当时的内核中，错误被传递给<strong>第一个调用 <code>fsync()</code> 的文件描述符</strong>，且仅该描述符收到。PostgreSQL 的 checkpointer 进程通常<strong>重新打开文件</strong>而非一直持有描述符——因此错误可能被其他后端进程消费并丢弃，然后 checkpointer 的后续 <code>fsync()</code> 会返回<strong>干净的成功</strong>。</p>
+
+        <h3>完整的灾难场景</h3>
+
+        <ol>
+            <li>检查点运行，写回错误发生</li>
+            <li>错误被报告给<strong>错误的文件描述符</strong>，然后被遗忘</li>
+            <li>脏页被标记为 clean，被<strong>回收重用</strong></li>
+            <li>checkpointer 调用 <code>fsync()</code>，获得<strong>成功</strong></li>
+            <li>检查点被认为已完成，WAL 段被<strong>回收</strong></li>
+            <li><strong>数据从未写入磁盘，页面缓存中的副本已消失，WAL 中的副本也已消失</strong></li>
+        </ol>
+
+        <p>正如 Andrew Gierth 在原讨论中所说：数据此时"<strong>从已知宇宙中消失</strong>"——任何地方都没有它的副本，重试无法恢复已不存在的东西。</p>
+
+        <h3>时间线</h3>
+
+        <table>
+            <thead>
+                <tr><th>时间</th><th>事件</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>2018 年初</td><td>Craig Ringer 将问题带到 <a href="https://www.postgresql.org/message-id/flat/CAMsr%2BYHh%2B5Oq4xziwwoEfhoTZgr07vdGG%2Bhu%3D1adXx59aTeaoQ%40mail.gmail.com">pgsql-hackers 邮件列表</a></td></tr>
+                <tr><td>PgCon 2018</td><td>Linux 内核开发者 Matthew Wilcox 演讲（座无虚席）。英国式致歉："我们为此带来的不便致歉"引发全场哄笑</td></tr>
+                <tr><td>2018年11月</td><td>Thomas Munro 提交补丁，引入 <code>data_sync_retry</code>，默认 <code>off</code></td></tr>
+                <tr><td>反向移植</td><td>补丁被反向移植到所有受支持版本</td></tr>
+                <tr><td>PG 12</td><td>额外改进：持续持有脏数据文件的文件描述符（过于侵入性，未反向移植）</td></tr>
+            </tbody>
+        </table>
+
+        <p>事件被命名为 <strong>fsyncgate</strong>，获得了 LWN 的专题报道。因为 write-then-fsync 模式是通用的，同样的陷阱也存在于 MySQL、MongoDB 以及几乎所有使用缓冲 I/O 的数据库中。</p>
+
+        <hr>
+
+        <h2>data_sync_retry 参数深度解析</h2>
+
+        <table>
+            <thead>
+                <tr><th>值</th><th>行为</th><th>安全性</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>off</code>（默认）</td><td>fsync() 失败 → <strong>PANIC</strong></td><td>✅ 安全——WAL 重放可恢复</td></tr>
+                <tr><td><code>on</code></td><td>fsync() 失败 → <strong>重试并继续</strong></td><td>🔴 Linux 上 = 静默丢数据</td></tr>
+            </tbody>
+        </table>
+
+        <h3>为什么 PANIC 是安全的</h3>
+
+        <ol>
+            <li>PANIC → 服务器立即崩溃</li>
+            <li>崩溃恢复启动，从最后一个已完成的检查点开始重放 WAL</li>
+            <li>因为失败的检查点<strong>从未完成</strong>，WAL 日志<strong>未被回收</strong></li>
+            <li>WAL 仍包含那些丢失写入的描述</li>
+            <li>重放 WAL → 精确重建丢失的数据</li>
+        </ol>
+
+        <p><strong>反直觉但正确的真相</strong>：在此之前，PostgreSQL 对 <strong>WAL 文件</strong>一直采用这种 PANIC 策略；2018 年的变更只是将其扩展到普通数据文件。PANIC 是<strong>安全</strong>的响应。</p>
+
+        <h3>为什么重试是灾难</h3>
+
+        <ol>
+            <li><code>fsync()</code> 失败 → 重试</li>
+            <li>脏页已被内核标记为 clean 并回收</li>
+            <li>重试的 <code>fsync()</code> 可能返回<strong>成功</strong>（因为页面已不存在，没什么可报告的了）</li>
+            <li>PostgreSQL 认为检查点成功，回收 WAL</li>
+            <li><strong>数据实际已丢失，但数据库静默地继续运行</strong></li>
+        </ol>
+
+        <p>官方文档极其罕见地直言：在 Linux 上开启此选项的唯一诚实描述就是"<strong>请静默地丢失我的数据，而不是大张旗鼓地丢失</strong>"。</p>
+
+        <h3>版本演变</h3>
+
+        <table>
+            <thead>
+                <tr><th>版本</th><th>策略</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>2018.11 之前</td><td>fsync 失败 → 重试</td><td>假设脏页仍在，Linux 上不安全</td></tr>
+                <tr><td>2018.11（Thomas Munro）</td><td>引入 <code>data_sync_retry</code>, 默认 off → PANIC</td><td>反向移植到所有受支持版本</td></tr>
+                <tr><td>PG 12</td><td>额外改进：持续持有脏数据文件的 fd</td><td>太侵入性，未反向移植</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>残留风险窗口</h2>
+
+        <h3>即使 <code>data_sync_retry = off</code>，仍有窄窗口</h3>
+
+        <div class="highlight"><pre><code>文件被关闭 → 重新打开前 → inode 因内存压力被逐出 → errseq_t 错误记录随 inode 消失</code></pre></div>
+
+        <h3>PG12 的缓解</h3>
+
+        <p>PostgreSQL 12 引入机制：<strong>保持有脏数据的文件持续打开</strong>，并将其文件描述符<strong>直接传递给 checkpointer</strong>。这避免了"关闭→重新打开"过程中的错误丢失窗口。</p>
+
+        <p>但此变更被判定为<strong>过于侵入性</strong>，不适合反向移植到旧版本。</p>
+
+        <h3>Linux 4.13 <code>errseq_t</code> 修补的局限性</h3>
+
+        <p>Jeff Layton 在 Linux 4.13 引入 <code>errseq_t</code>，为每个 inode 的 <code>address_space</code> 附加一个 32 位的错误+序列值，使写回错误对<strong>之后所有调用 <code>fsync()</code> 的描述符都可见</strong>，而不仅仅是第一个。</p>
+
+        <p>但有三个关键局限：</p>
+        <ol>
+            <li><strong>数据回不来</strong>：可靠报告的错误仍是丢失数据的错误——数据丢了就是丢了</li>
+            <li><strong>inode 逐出时错误仍然丢失</strong>：如果在重新打开文件之前，inode 因内存压力被逐出，记录的错误随 inode 一起消失</li>
+            <li><strong>这是报告层修补，不是语义层修补</strong>：<code>fsync()</code> 的契约问题在更根本的层面</li>
+        </ol>
+
+        <hr>
+
+        <h2>终极方案：Direct I/O</h2>
+
+        <p>Dave Chinner、Ted Ts'o 以及 PostgreSQL 开发者们一致认为：真正完整的修复是<strong>对主数据路径使用 Direct I/O</strong>，完全绕过页面缓存，让数据库自己掌控写回和错误处理。</p>
+
+        <table>
+            <thead>
+                <tr><th>属性</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>方案</td><td>对主数据路径使用 Direct I/O，绕过页面缓存</td></tr>
+                <tr><td>优势</td><td>数据库自己掌控写回和错误处理，彻底消除 fsyncgate 类问题</td></tr>
+                <tr><td>进展</td><td>Andres Freund 评价："a metric ton of work"（巨量工作）</td></tr>
+                <tr><td>状态</td><td><strong>截至 2026 年，仍未完全落地</strong></td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>共享文件系统的特殊风险</h2>
+
+        <p>NFS/CIFS 等共享文件系统在 <code>data_sync_retry</code> 场景下有多层额外风险：</p>
+
+        <ol>
+            <li><strong>fsync() 语义不可靠</strong>：客户端层面报告成功，但服务端并未真正持久化</li>
+            <li><strong>错误报告路径更长</strong>：客户端内核 → 网络 → 服务端 → 服务端存储，任何一层都可能丢失错误</li>
+            <li><strong>PANIC 是重要信号</strong>：如果运行在 NFS/CIFS 上，检查点时 fsync PANIC 很可能意味着文件系统在"说谎"</li>
+        </ol>
+
+        <hr>
+
+        <h2>运维实操</h2>
+
+        <table>
+            <thead>
+                <tr><th>场景</th><th>正确做法</th><th>错误做法</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>日志出现 PANIC</td><td>排查硬件/存储层</td><td>开启 <code>data_sync_retry</code></td></tr>
+                <tr><td>运行在 NFS/CIFS</td><td>确认存储真正尊重 fsync 语义</td><td>调优 GUC 参数</td></tr>
+                <tr><td>想改 <code>data_sync_retry</code></td><td><strong>不要改</strong></td><td>改了就是静默丢数据</td></tr>
+            </tbody>
+        </table>
+
+        <pre><code>-- 检查当前值
+SHOW data_sync_retry;
+
+-- 如果发现不是 off（几乎不可能，但确认一下）：
+ALTER SYSTEM SET data_sync_retry = off;
+SELECT pg_reload_conf();
+
+-- 再次确认
+SHOW data_sync_retry;  -- 应为 off</code></pre>
+
+        <p><code>data_sync_retry</code> 不是调优参数——它是 PostgreSQL 社区对持久化假设最不安的一次发现留下的"疤痕组织"。<strong>PANIC 是症状，不是疾病。去治你的存储。</strong></p>
+
+        <hr>
+
+        <h2>参考来源</h2>
+        <ul>
+            <li>Christophe Pettus — <a href="https://thebuild.com/blog/all-your-gucs-in-a-row-datasyncretry/"><em>All Your GUCs in a Row: data_sync_retry</em></a> | Planet PostgreSQL, 2026-06-08</li>
+            <li>Craig Ringer — <a href="https://www.postgresql.org/message-id/flat/CAMsr%2BYHh%2B5Oq4xziwwoEfhoTZgr07vdGG%2Bhu%3D1adXx59aTeaoQ%40mail.gmail.com">pgsql-hackers 原始讨论</a> | 2018</li>
+            <li>木木 — <a href="/pg-xsj/ops/os-failures-thp-fsyncgate.html">PG 被冤枉的两次：THP 和 fsyncgate</a> | PG习思集, 2026-06-05</li>
+        </ul>
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
