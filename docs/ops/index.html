@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/ops/deadlock-timeout-detection-vs-tolerance.html">deadlock_timeout：名字骗了你 —— 它不是"容忍死锁的时间"</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-06-10">2026-06-10</time>
+            <span class="post-category ops">日常运维</span>
+        </div>
+        <p class="post-excerpt">deadlock_timeout 的名字是一个"小小的谎言"——它控制的是检测频率，不是容忍时长。更意外的是：有些潜在死锁被静默地通过队列重排化解，你永远不会知道。本文拆解硬边 vs 软边机制、默认值 1s 的理由、以及用 100ms + log_lock_waits 诊断隐性锁竞争的实战技巧。</p>
+        <a href="/pg-xsj/ops/deadlock-timeout-detection-vs-tolerance.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/ops/data-sync-retry-fsyncgate.html">data_sync_retry：fsyncgate 的遗产 —— PostgreSQL 持久化最深的教训</a></h3>
         <div class="post-meta">
             <time datetime="2026-06-09">2026-06-09</time>

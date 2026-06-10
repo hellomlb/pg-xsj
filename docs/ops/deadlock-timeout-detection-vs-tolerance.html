@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>deadlock_timeout：名字骗了你 —— 它不是"容忍死锁的时间" - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="深度拆解 deadlock_timeout 参数：命名误区（检测频率 vs 容忍时长）、硬边与软边机制、队列重排静默化解死锁、默认值保持 1s 的理由、log_lock_waits 诊断锁竞争的实战技巧。">
+    <meta property="og:title" content="deadlock_timeout：名字骗了你 —— 它不是"容忍死锁的时间"">
+    <meta property="og:description" content="深度拆解 deadlock_timeout：命名误区、硬边与软边、队列重排静默化解、诊断锁竞争实战技巧。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/deadlock-timeout-detection-vs-tolerance.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>deadlock_timeout：名字骗了你 —— 它不是"容忍死锁的时间"</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="SQL 已在真实 PostgreSQL 环境中验证">✅ SQL 验证通过</span>
+            <time datetime="2026-06-10">2026-06-10</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">deadlock_timeout</span>
+                <span class="tag">死锁检测</span>
+                <span class="tag">锁竞争</span>
+                <span class="tag">GUC</span>
+                <span class="tag">log_lock_waits</span>
+                <span class="tag">等待图</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>deadlock_timeout</code> 的名字是一个"小小的谎言"——它<strong>不是</strong>死锁被容忍的时长，而是锁等待多久之后才<strong>触发死锁检测</strong>。死锁一旦发现，立刻打破，零容忍。</p>
+
+        <p>更令人意外的是：并非所有潜在死锁都以 <code>ERROR: deadlock detected</code> 告终——有些被<strong>静默地通过队列重排化解</strong>，你永远不会知道。</p>
+
+        <hr>
+
+        <h2>命名误区：检测频率 ≠ 容忍时长</h2>
+
+        <table>
+            <thead>
+                <tr><th>常见误解</th><th>实际行为</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>deadlock_timeout = 1s</code> = 容忍死锁 1 秒</td><td>等待锁 1 秒后<strong>才去检查有没有死锁</strong></td></tr>
+                <tr><td>发现死锁后等待 timeout 才打破</td><td>发现死锁<strong>立刻打破</strong>，零延迟</td></tr>
+                <tr><td>值越大 = 越能"忍受"死锁</td><td>值越大 = 检测越迟 = 真实死锁暴露越慢</td></tr>
+            </tbody>
+        </table>
+
+        <p>Christophe Pettus 在原文中直截了当地说："The name is a small lie."</p>
+
+        <h3>为什么延迟检测？</h3>
+
+        <p>死锁检测需要构建<strong>等待图（wait-for graph）</strong>并搜索其中的环——这个操作<strong>不便宜</strong>。而绝大多数锁等待并非死锁，只是短暂等待另一个事务提交。</p>
+
+        <p>如果每次锁等待都运行完整检测 = 大量 CPU 周期花在反复证明"没有死循环"上。</p>
+
+        <p>PostgreSQL 选择了<strong>乐观策略</strong>：</p>
+
+        <ol>
+            <li>进程开始等待冲突锁 → 设置 <code>deadlock_timeout</code> 定时器 → 休眠</li>
+            <li><strong>常规情况</strong>：定时器触发前锁释放 → 进程继续，<strong>检测从未运行</strong></li>
+            <li><strong>触发检测</strong>：定时器触发时仍阻塞 → 运行 <code>CheckDeadLock()</code> 构建等待图</li>
+        </ol>
+
+        <hr>
+
+        <h2>硬边 vs 软边：死锁检测的精妙之处</h2>
+
+        <p>等待图中每条边表示"此进程正在等待彼进程"，但边有两种根本不同的性质：</p>
+
+        <table>
+            <thead>
+                <tr><th>边类型</th><th>来源</th><th>性质</th><th>能否改变</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>硬边（Hard Edge）</strong></td><td>等待某人<strong>已经持有</strong>的锁</td><td>事实：A 要 B 手里的锁，B 不放 A 就走不了</td><td>❌ 不可改变</td></tr>
+                <tr><td><strong>软边（Soft Edge）</strong></td><td>等待队列的<strong>排队顺序</strong></td><td>约定：A 排在 B 后面，仅因为 B 先到</td><td>✅ 可以重排</td></tr>
+            </tbody>
+        </table>
+
+        <h3>硬边示例</h3>
+
+        <pre><code>-- 会话 A：持有 accounts 表的行锁
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+-- 会话 B：持有 orders 表的行锁
+BEGIN;
+UPDATE orders SET status = 'paid' WHERE id = 1;
+
+-- 会话 A：现在要 orders 的锁（硬边 A→B）
+UPDATE orders SET status = 'processing' WHERE id = 1;  -- 阻塞
+
+-- 会话 B：现在要 accounts 的锁（硬边 B→A）
+UPDATE accounts SET balance = balance + 100 WHERE id = 1;  -- 阻塞
+-- 等待图：A→B（硬边）+ B→A（硬边）= 纯硬边环 = 真正死锁</code></pre>
+
+        <p>纯硬边环 = <strong>真正的死锁</strong>，检测器选择触发检测的那个后端进程作为<strong>受害者</strong>，中止其事务并抛出：</p>
+
+        <pre><code>ERROR:  deadlock detected
+SQLSTATE: 40P01</code></pre>
+
+        <h3>软边示例与静默化解</h3>
+
+        <pre><code>-- 会话 A：等待锁 X，排在队列第 3 位
+-- 会话 B：等待锁 X，排在队列第 1 位
+-- A 排在 B 后面 → 软边 A→B
+
+-- 如果此时 B 也在等待某个 A 关联的资源 → 形成环
+-- 但环中包含软边 → 可以通过重排队列化解
+-- 无人牺牲，无人报错</code></pre>
+
+        <p><strong>关键洞察</strong>：软边只是当前队列排序的产物。改变唤醒顺序，有时可以在<strong>不中止任何事务</strong>的情况下化解死锁。</p>
+
+        <div class="highlight">
+            <p>💡 <strong>你可能从未注意过</strong>：PostgreSQL 已经静默地通过队列重排化解了不少潜在死锁。这些"差点死锁"从不出现在日志里，也不会产生 <code>ERROR: deadlock detected</code>——它们被无感地消化了。</p>
+        </div>
+
+        <hr>
+
+        <h2>默认值 1s：为什么不调也不该调</h2>
+
+        <pre><code>-- 查看当前值
+SHOW deadlock_timeout;
+
+ deadlock_timeout
+------------------
+ 1s
+(1 row)</code></pre>
+
+        <table>
+            <thead>
+                <tr><th>场景</th><th>建议</th><th>理由</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>日常运行</td><td>保持默认 <strong>1s</strong></td><td>文档指出这是实践中的最小合理值</td></tr>
+                <tr><td>高负载短事务</td><td>可适当<strong>调高</strong></td><td>用略延迟真实死锁报告换取更少无效检测开销</td></tr>
+                <tr><td>想调低以"更快发现死锁"</td><td>❌ <strong>不建议</strong></td><td>大多数锁等待 &lt; 1s 自行解决，调低 = 大量无意义的检测运行</td></tr>
+            </tbody>
+        </table>
+
+        <p>调优原则：<strong>保持该值高于你的典型事务执行时间</strong>，以便普通锁等待能在检测白白运行之前自行解决。</p>
+
+        <hr>
+
+        <h2>实战技巧：用 deadlock_timeout + log_lock_waits 诊断锁竞争</h2>
+
+        <p>这是 <code>deadlock_timeout</code> 最有实战价值的用法——<strong>不是调优参数，而是诊断绊线</strong>。</p>
+
+        <p><code>deadlock_timeout</code> 同时控制 <code>log_lock_waits</code> 的行为：当 <code>log_lock_waits = on</code> 时，任何超过 <code>deadlock_timeout</code> 时间的锁等待都会被记录到日志。</p>
+
+        <h3>标准诊断流程</h3>
+
+        <pre><code>-- Step 1：开启锁等待日志
+SET log_lock_waits = on;
+
+-- Step 2：临时降低检测阈值（绊线从 1s 降到 100ms）
+SET deadlock_timeout = '100ms';
+
+-- Step 3：正常运行业务，观察日志
+-- PostgreSQL 日志中出现类似：
+--   LOG: process 12345 still waiting for ShareLock on transaction 67890 after 100.123 ms
+
+-- Step 4：排查完毕后恢复
+SET deadlock_timeout = '1s';
+-- log_lock_waits 可保持 on（生产环境建议长期开启）</code></pre>
+
+        <h3>为什么 100ms 而不是 1s？</h3>
+
+        <p>那些<strong>真正损害吞吐量的锁等待</strong>，通常是那些"在即将被判定为死锁的半秒前就已经自行解决"的等待——它们不会触发 <code>ERROR: deadlock detected</code>，却在 200-800ms 的时间窗口里持续阻塞其他事务。</p>
+
+        <p>把 <code>deadlock_timeout</code> 降到 100ms，这些"隐性的锁竞争"就被完整暴露在日志中。</p>
+
+        <h3>用 ALTER SYSTEM 持久化诊断配置</h3>
+
+        <pre><code>-- 持久化 log_lock_waits（推荐生产环境长期开启）
+ALTER SYSTEM SET log_lock_waits = on;
+SELECT pg_reload_conf();
+
+-- 确认生效
+SHOW log_lock_waits;
+-- 应为 on
+
+-- 注意：deadlock_timeout 是 superuser 参数
+-- 临时诊断时用 SET，排查完毕恢复 1s
+-- 不要用 ALTER SYSTEM 把 100ms 持久化！</code></pre>
+
+        <div class="highlight">
+            <p>⚠️ <strong>重要提醒</strong>：<code>deadlock_timeout</code> 是 <code>superuser</code> 级别参数，普通用户无法修改。<code>SET deadlock_timeout</code> 需要超级用户权限。诊断时用 <code>SET</code>（会话级），排查完自然失效，不要用 <code>ALTER SYSTEM</code> 把 100ms 持久化到生产环境。</p>
+        </div>
+
+        <hr>
+
+        <h2>完整检测流程图</h2>
+
+        <pre><code>进程 P 请求锁 L
+    │
+    ├─ L 无冲突 → 直接获取 ✅
+    │
+    └─ L 有冲突（被其他事务持有）
+         │
+         ├─ 设置 deadlock_timeout 定时器
+         │
+         ├─ 定时器触发前锁释放
+         │   └─ 获取锁 ✅（检测从未运行）
+         │
+         └─ 定时器触发仍阻塞
+              │
+              ├─ 调用 CheckDeadLock()
+              │   └─ 构建等待图，搜索环
+              │
+              ├─ 无环 → 继续休眠等待
+              │
+              ├─ 环含软边
+              │   ├─ 重排队列化解 → 无人牺牲 ✅（静默）
+              │   └─ 无法化解 → 降级为硬边处理
+              │
+              └─ 纯硬边环
+                  └─ 选择受害者 → ERROR: deadlock detected 🔴</code></pre>
+
+        <hr>
+
+        <h2>与 PG19 pg_stat_lock 视图的联动</h2>
+
+        <p>PG19 新增 <code>pg_stat_lock</code> 系统视图，含 <code>waits</code> 计数和 <code>wait_time</code>，可直接 SQL 查询锁详情。这为 <code>deadlock_timeout</code> 的诊断提供了更精确的量化支撑：</p>
+
+        <table>
+            <thead>
+                <tr><th>工具</th><th>用途</th><th>PG 版本</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>deadlock_timeout</code> + <code>log_lock_waits</code></td><td>日志级诊断绊线</td><td>全部</td></tr>
+                <tr><td><code>pg_stat_lock</code>（PG19）</td><td>SQL 级锁等待量化统计</td><td>19+</td></tr>
+                <tr><td><code>pg_stat_activity</code></td><td>当前等待锁的会话</td><td>全部</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>运维决策树</h2>
+
+        <table>
+            <thead>
+                <tr><th>现象</th><th>正确做法</th><th>错误做法</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>偶尔 <code>deadlock detected</code></td><td>检查应用事务顺序，确保按一致顺序访问资源</td><td>调高 deadlock_timeout 隐藏问题</td></tr>
+                <tr><td>频繁 <code>deadlock detected</code></td><td>从根本上修正应用锁获取顺序</td><td>靠调参"减少死锁"</td></tr>
+                <tr><td>吞吐量下降但无死锁报错</td><td>临时 100ms + log_lock_waits 诊断隐性锁竞争</td><td>猜问题盲目调参</td></tr>
+                <tr><td>想改 <code>deadlock_timeout</code></td><td>99% 场景保持 1s 默认值</td><td>为了"更快发现死锁"调低</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>参考来源</h2>
+        <ul>
+            <li>Christophe Pettus — <a href="https://thebuild.com/blog/all-your-gucs-in-a-row-deadlocktimeout/"><em>All Your GUCs in a Row: deadlock_timeout</em></a> | The Build, 2026-06-10</li>
+            <li>PostgreSQL 官方文档 — <a href="https://www.postgresql.org/docs/current/runtime-config-locks.html">Lock Management</a></li>
+        </ul>
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
