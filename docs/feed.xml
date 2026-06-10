@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Tue, 09 Jun 2026 10:50:00 +0800</lastBuildDate>
+    <lastBuildDate>Wed, 10 Jun 2026 10:30:00 +0800</lastBuildDate>
+    <item>
+      <title>deadlock_timeout：名字骗了你 —— 它不是"容忍死锁的时间"</title>
+      <link>https://hellomlb.github.io/pg-xsj/ops/deadlock-timeout-detection-vs-tolerance.html</link>
+      <description>deadlock_timeout 的名字是一个"小小的谎言"——它控制的是检测频率，不是容忍时长。更意外的是：有些潜在死锁被静默地通过队列重排化解，你永远不会知道。本文拆解硬边 vs 软边机制、默认值 1s 的理由、以及用 100ms + log_lock_waits 诊断隐性锁竞争的实战技巧。</description>
+      <pubDate>Wed, 10 Jun 2026 10:30:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/deadlock-timeout-detection-vs-tolerance.html</guid>
+    </item>
     <item>
       <title>data_sync_retry：fsyncgate 的遗产 —— PostgreSQL 持久化最深的教训</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/data-sync-retry-fsyncgate.html</link>
