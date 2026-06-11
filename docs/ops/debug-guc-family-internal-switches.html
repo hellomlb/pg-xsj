@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PG19 Beta1 实测验证 PostgreSQL 全部 14 个 debug_ 前缀 GUC 参数，发现 Christophe Pettus 原文遗漏 2 个（debug_exec_backend、debug_print_raw_parse），逐项验证 debug_io_direct 5 种合法值、debug_parallel_query 3 个枚举、debug_discard_caches 整数 0-5、force_parallel_mode 彻底移除。白话分类：3 个能看、4 个偶尔调试、1 个未来方向、6 个酷刑测试。">
+    <meta property="og:title" content="debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏">
+    <meta property="og:description" content="PG19 实测 14 个 debug_ GUC，发现原文遗漏 2 个，验证 debug_io_direct/debug_parallel_query 等全部参数行为。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/debug-guc-family-internal-switches.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="SQL 已在 PG19 Beta1 真实环境中验证">✅ PG19 Beta1 验证通过</span>
+            <time datetime="2026-06-11">2026-06-11</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">debug_*</span>
+                <span class="tag">GUC</span>
+                <span class="tag">debug_io_direct</span>
+                <span class="tag">Direct I/O</span>
+                <span class="tag">debug_parallel_query</span>
+                <span class="tag">PG19</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>PostgreSQL 有 14 个以 <code>debug_</code> 开头的 GUC 参数，Christophe Pettus 在其 GUC 系列第 10 篇中梳理了其中 12 个——<strong>实测 PG19 Beta1 发现原文遗漏了 2 个</strong>。这 14 个参数绝大多数是 PG 自身的开发/QA 工具，<strong>永远不应在生产环境触碰</strong>。唯一值得持续关注的是 <code>debug_io_direct</code>——它披着 debug_ 前缀，却承载着 Direct I/O 的未来。</p>
+
+        <hr>
+
+        <h2>原文遗漏 2 个参数</h2>
+
+        <p>Christophe Pettus 原文声称 12 个 <code>debug_</code> 参数，但 PG19 Beta1 实测有 14 个：</p>
+
+        <table>
+            <thead>
+                <tr><th>遗漏参数</th><th>默认值</th><th>上下文</th><th>说明</th><th>推测遗漏原因</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>debug_exec_backend</code></td><td>off</td><td>internal（只读）</td><td>显示是否以 EXEC_BACKEND 模式编译（Windows / EXEC_BACKEND 构建）</td><td>极冷门，仅特定构建模式相关</td></tr>
+                <tr><td><code>debug_print_raw_parse</code></td><td>off</td><td>user</td><td>输出原始解析树（比 <code>debug_print_parse</code> 更早阶段）</td><td>可能是 PG19 新增参数</td></tr>
+            </tbody>
+        </table>
+
+        <div class="highlight">
+            <p>🔍 <strong>排查方法</strong>：永远不要仅凭文档或博客写参数清单——直接查数据库：</p>
+        </div>
+
+        <pre><code>-- 查看你的 PG 版本有多少个 debug_ 参数
+SELECT name, setting, context, vartype, short_desc
+FROM pg_settings
+WHERE name LIKE 'debug_%'
+ORDER BY name;</code></pre>
+
+        <p>PG19 Beta1 实测输出 14 行，V1 验证通过 ✅</p>
+
+        <hr>
+
+        <h2>14 个参数完整分类</h2>
+
+        <h3>第一类：只读检测（2 个）—— 能看不能动</h3>
+
+        <p>这两个参数 <code>context = internal</code>，只能 <code>SHOW</code>，不能 <code>SET</code>。</p>
+
+        <table>
+            <thead>
+                <tr><th>参数</th><th>默认值</th><th>类型</th><th>含义</th><th>实测验证</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>debug_assertions</code></td><td>on（调试构建）/ off（正式）</td><td>bool</td><td>是否以 <code>--enable-cassert</code> 编译</td><td>SET 被拒绝 ✅</td></tr>
+                <tr><td><code>debug_exec_backend</code> 🆕</td><td>off</td><td>bool</td><td>是否以 EXEC_BACKEND 模式编译</td><td>SET 被拒绝 ✅</td></tr>
+            </tbody>
+        </table>
+
+        <pre><code>-- 检查你的 PG 是什么构建类型
+SHOW debug_assertions;
+-- 如果是 on → 这是调试构建，不要用于生产
+
+SHOW debug_exec_backend;
+-- 如果是 on → EXEC_BACKEND 模式（通常是 Windows 或特殊构建）</code></pre>
+
+        <div class="highlight">
+            <p>💡 <strong>实用技巧</strong>：如果你接手一个 PG 实例，先 <code>SHOW debug_assertions</code>——如果是 <code>on</code>，说明这个实例是用调试构建跑的，性能会比正式构建差。这不是参数设置问题，是编译选项决定的。</p>
+        </div>
+
+        <h3>第二类：解析树/计划树输出（5 个）—— 偶尔调试用</h3>
+
+        <p>这是唯一可能对非核心开发者有用的 <code>debug_</code> 参数。<code>EXPLAIN</code> 和 <code>auto_explain</code> 已在绝大多数场景取代它们，但当你需要查看<strong>字面节点结构</strong>（<code>Var</code>、<code>RangeTblEntry</code> 等）时，这些参数提供独一无二的视角。</p>
+
+        <table>
+            <thead>
+                <tr><th>参数</th><th>默认值</th><th>输出内容</th><th>阶段</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>debug_print_raw_parse</code> 🆕</td><td>off</td><td>原始解析树</td><td>最早——词法/语法刚完成</td></tr>
+                <tr><td><code>debug_print_parse</code></td><td>off</td><td>分析后解析树</td><td>语义分析完成</td></tr>
+                <tr><td><code>debug_print_rewritten</code></td><td>off</td><td>重写后解析树</td><td>规则系统改写后</td></tr>
+                <tr><td><code>debug_print_plan</code></td><td>off</td><td>最终执行计划树</td><td>规划器输出</td></tr>
+                <tr><td><code>debug_pretty_print</code></td><td>on</td><td>格式化上述输出</td><td>控制缩进/换行</td></tr>
+            </tbody>
+        </table>
+
+        <pre><code>-- 临时开启（会话级，用完自动失效）
+SET debug_print_plan = on;
+SET debug_pretty_print = on;
+
+-- 执行一条查询（输出进服务器日志，不在客户端显示）
+SELECT 1 AS test_col;
+
+-- 用完即关
+SET debug_print_plan = off;</code></pre>
+
+        <div class="highlight">
+            <p>⚠️ <strong>注意</strong>：<code>debug_print_*</code> 的输出进<strong>服务器日志</strong>（<code>log_destination</code>），不在客户端显示。输出量可能巨大，仅在排查特定问题时按会话临时开启，绝不持久化。</p>
+        </div>
+
+        <h3>第三类：酷刑测试——节点复制/序列化（3 个）+ 缓存失效（1 个）—— 绝对不用</h3>
+
+        <p>这 4 个参数是 PG 开发者用来找代码 Bug 的"酷刑测试"。它们会显著改变系统行为，<strong>在生产环境打开等于自杀</strong>。</p>
+
+        <table>
+            <thead>
+                <tr><th>参数</th><th>类型</th><th>作用</th><th>后果</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>debug_copy_parse_plan_trees</code></td><td>bool</td><td>强制复制-比较循环测试</td><td>每次查询额外复制+比较整棵树</td></tr>
+                <tr><td><code>debug_write_read_parse_plan_trees</code></td><td>bool</td><td>序列化-反序列化往返测试</td><td>每次查询额外序列化+反序列化</td></tr>
+                <tr><td><code>debug_raw_expression_coverage_test</code></td><td>bool</td><td>遍历表达式树覆盖率测试</td><td>强制遍历每个表达式节点</td></tr>
+                <tr><td><code>debug_discard_caches</code></td><td>int(0-5)</td><td>激进失效目录缓存</td><td><strong>慢几个数量级</strong>，5 最激进</td></tr>
+            </tbody>
+        </table>
+
+        <pre><code>-- debug_discard_caches 不是布尔！是整数 0-5
+SHOW debug_discard_caches;
+-- 应为 0
+
+-- 设置不同级别（仅在测试环境！）
+SET debug_discard_caches = 1;  -- 最轻度
+SET debug_discard_caches = 5;  -- 最激进，极慢
+
+-- 恢复
+SET debug_discard_caches = 0;</code></pre>
+
+        <p>PV19 实测验证：级别 0-5 全部可设 ✅</p>
+
+        <h3>第四类：强制特定行为（2 个）—— 测试专用</h3>
+
+        <table>
+            <thead>
+                <tr><th>参数</th><th>类型</th><th>枚举值</th><th>作用</th><th>实测验证</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>debug_parallel_query</code></td><td>enum</td><td>off / on / regress</td><td>强制并行计划</td><td>3 个枚举值全部切换成功 ✅</td></tr>
+                <tr><td><code>debug_logical_replication_streaming</code></td><td>enum</td><td>buffered / immediate</td><td>强制逻辑复制即时流式</td><td>2 个枚举值全部切换成功 ✅</td></tr>
+            </tbody>
+        </table>
+
+        <h4>debug_parallel_query 的重命名故事</h4>
+
+        <p>从 <code>force_parallel_mode</code> 重命名为 <code>debug_parallel_query</code>——因为用户一直误以为它能"强制规划器生成有用的并行查询"，实际上它是<strong>测试并行代码路径</strong>的。</p>
+
+        <pre><code>-- PG19 中 force_parallel_mode 已彻底移除
+SELECT count(*) FROM pg_settings WHERE name = 'force_parallel_mode';
+-- 结果: 0 ✅
+
+-- 正确用法：测试并行代码路径
+SET debug_parallel_query = on;
+SELECT * FROM some_table WHERE id = 1;
+SET debug_parallel_query = off;
+
+-- ❌ 错误想法：想加速查询
+-- debug_parallel_query = on 不会让你的查询更快！
+-- 想加速？调 max_parallel_workers_per_gather</code></pre>
+
+        <pre><code>-- debug_parallel_query 的 3 个模式
+SET debug_parallel_query = off;      -- 关闭（默认）
+SET debug_parallel_query = on;       -- 强制使用并行
+SET debug_parallel_query = regress;  -- 回归测试专用</code></pre>
+
+        <p>PG19 实测：3 个枚举值全部切换成功 ✅</p>
+
+        <h3>第五类：⭐ Direct I/O（1 个）—— 披着 debug_ 前缀的未来</h3>
+
+        <table>
+            <thead>
+                <tr><th>维度</th><th>说明</th><th>实测确认</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>参数</td><td><code>debug_io_direct</code></td><td>✅</td></tr>
+                <tr><td>作用</td><td>启用 O_DIRECT 绕过 OS 页面缓存</td><td>✅</td></tr>
+                <tr><td>合法值</td><td><code>data</code>、<code>wal</code>、<code>wal_init</code>（可逗号组合）</td><td>✅ 5 种组合全部 ALTER SYSTEM 通过</td></tr>
+                <tr><td>设置时机</td><td>仅服务器启动时（postmaster 上下文）</td><td>✅ SET 被拒绝</td></tr>
+                <tr><td>当前状态</td><td>文档说"会降低性能"——异步 I/O 基础设施仍在落地</td><td>—</td></tr>
+                <tr><td><strong>未来展望</strong></td><td><strong>摆脱 fsync 错误陷阱的公认出路</strong></td><td>—</td></tr>
+            </tbody>
+        </table>
+
+        <pre><code>-- 合法值验证（ALTER SYSTEM + 重启生效）
+ALTER SYSTEM SET debug_io_direct = 'data';               -- OK ✅
+ALTER SYSTEM SET debug_io_direct = 'wal';                -- OK ✅
+ALTER SYSTEM SET debug_io_direct = 'wal_init';           -- OK ✅
+ALTER SYSTEM SET debug_io_direct = 'data,wal';           -- OK ✅
+ALTER SYSTEM SET debug_io_direct = 'data,wal,wal_init';  -- OK ✅
+
+-- SET 不行（需要重启）
+SET debug_io_direct = 'data';
+-- ERROR: parameter "debug_io_direct" cannot be changed without restarting the server
+
+-- 恢复
+ALTER SYSTEM RESET debug_io_direct;
+-- 记得重启才生效！</code></pre>
+
+        <div class="highlight">
+            <p>⭐ <strong>为什么 debug_io_direct 值得关注</strong>：它是 PostgreSQL 摆脱 <code>fsyncgate</code> 阴影的公认出路。当 PG 自己管理写回、自己处理 I/O 错误，就不再依赖内核页面缓存——不再被 Linux 脏页丢弃+静默重试的坑困扰。当前性能仍不如传统路径，因为异步 I/O 基础设施还在落地中，但这是未来版本的重点演进方向。</p>
+        </div>
+
+        <hr>
+
+        <h2>PG19 Beta1 全量验证清单</h2>
+
+        <p>所有验证在 PG19 Beta1 上执行（PostgreSQL 19beta1 on x86_64-pc-linux-gnu, compiled by gcc 4.8.5）</p>
+
+        <table>
+            <thead>
+                <tr><th>#</th><th>验证项</th><th>预期</th><th>实测</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>V1</td><td>debug_* 参数总数</td><td>14</td><td>14 ✅</td></tr>
+                <tr><td>V2</td><td>14 个参数全部可查 pg_settings</td><td>14 行输出</td><td>14 行 ✅</td></tr>
+                <tr><td>V3</td><td>debug_assertions SET 被拒绝</td><td>ERROR</td><td>ERROR ✅</td></tr>
+                <tr><td>V4</td><td>debug_exec_backend SET 被拒绝</td><td>ERROR</td><td>ERROR ✅</td></tr>
+                <tr><td>V5</td><td>debug_print_raw_parse on/off</td><td>切换成功</td><td>成功 ✅</td></tr>
+                <tr><td>V6</td><td>debug_print_parse on/off</td><td>切换成功</td><td>成功 ✅</td></tr>
+                <tr><td>V7</td><td>debug_print_rewritten on/off</td><td>切换成功</td><td>成功 ✅</td></tr>
+                <tr><td>V8</td><td>debug_print_plan on/off</td><td>切换成功</td><td>成功 ✅</td></tr>
+                <tr><td>V9</td><td>debug_pretty_print 默认 on</td><td>on</td><td>on ✅</td></tr>
+                <tr><td>V10</td><td>debug_copy_parse_plan_trees 默认 off</td><td>off</td><td>off ✅</td></tr>
+                <tr><td>V11</td><td>debug_write_read_parse_plan_trees 默认 off</td><td>off</td><td>off ✅</td></tr>
+                <tr><td>V12</td><td>debug_raw_expression_coverage_test 默认 off</td><td>off</td><td>off ✅</td></tr>
+                <tr><td>V13</td><td>debug_discard_caches 级别 0-5</td><td>全部可设</td><td>成功 ✅</td></tr>
+                <tr><td>V14</td><td>debug_parallel_query enum(off/on/regress)</td><td>全部可设</td><td>成功 ✅</td></tr>
+                <tr><td>V15</td><td>debug_logical_replication_streaming enum</td><td>buffered/immediate</td><td>成功 ✅</td></tr>
+                <tr><td>V16</td><td>debug_io_direct ALTER SYSTEM 5 种值</td><td>全部通过</td><td>成功 ✅</td></tr>
+                <tr><td>V17</td><td>debug_io_direct SET 被拒绝</td><td>ERROR</td><td>ERROR ✅</td></tr>
+                <tr><td>V18</td><td>force_parallel_mode 已移除</td><td>0 行</td><td>0 行 ✅</td></tr>
+                <tr><td>V19</td><td>debug_io_direct 当前值空</td><td>空字符串</td><td>"" ✅</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>白话总结</h2>
+
+        <p>14 个 <code>debug_</code> 参数，按实用性排列：</p>
+
+        <table>
+            <thead>
+                <tr><th>数量</th><th>参数</th><th>白话</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>3 个能看</td><td><code>debug_assertions</code>、<code>debug_exec_backend</code>、<code>debug_pretty_print</code></td><td>查看构建信息，不用改</td></tr>
+                <tr><td>4 个偶尔调试</td><td><code>debug_print_raw_parse</code>、<code>debug_print_parse</code>、<code>debug_print_rewritten</code>、<code>debug_print_plan</code></td><td>查解析树/计划树细节，按会话开，用完关</td></tr>
+                <tr><td>1 个未来方向</td><td><code>debug_io_direct</code></td><td>Direct I/O，关注但暂不生产用</td></tr>
+                <tr><td>6 个酷刑测试</td><td><code>debug_copy_parse_plan_trees</code>、<code>debug_write_read_parse_plan_trees</code>、<code>debug_raw_expression_coverage_test</code>、<code>debug_discard_caches</code>、<code>debug_parallel_query</code>、<code>debug_logical_replication_streaming</code></td><td>PG 开发者在 buildfarm 里跑的，不在你的生产库跑</td></tr>
+            </tbody>
+        </table>
+
+        <p>Pavlo Golub 说得好：<strong>正式集群上别碰任何带 debug_ 前缀的东西。</strong></p>
+
+        <hr>
+
+        <h2>参考来源</h2>
+        <ul>
+            <li>Christophe Pettus — <a href="https://thebuild.com/blog/all-your-gucs-in-a-row-the-debug-family/"><em>All Your GUCs in a Row: the debug_* family</em></a> | The Build, 2026-06-11</li>
+            <li>PostgreSQL 官方文档 — <a href="https://www.postgresql.org/docs/current/runtime-config-developer.html">Developer Options</a></li>
+            <li>PG19 Beta1 实测验证 — 110.41.133.39:10190 | 2026-06-11 | 19 项验证全部通过</li>
+        </ul>
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
