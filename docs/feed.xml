@@ -7,7 +7,7 @@
     <language>zh-CN</language>
     <lastBuildDate>Thu, 11 Jun 2026 10:50:00 +0800</lastBuildDate>
     <item>
-      <title>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏</title>
+      <title>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关"</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/debug-guc-family-internal-switches.html</link>
       <description>PG19 Beta1 实测验证 PostgreSQL 全部 14 个 debug_ 前缀 GUC 参数，发现 Christophe Pettus 原文遗漏 2 个（debug_exec_backend、debug_print_raw_parse），逐项验证 debug_io_direct 5 种合法值、debug_parallel_query 3 个枚举、debug_discard_caches 整数 0-5、force_parallel_mode 彻底移除。白话分类：3 个能看、4 个偶尔调试、1 个未来方向、6 个酷刑测试。</description>
       <pubDate>Thu, 11 Jun 2026 10:50:00 +0800</pubDate>

@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏 - PG习思集</title>
+    <title>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
     <meta name="description" content="PG19 Beta1 实测验证 PostgreSQL 全部 14 个 debug_ 前缀 GUC 参数，发现 Christophe Pettus 原文遗漏 2 个（debug_exec_backend、debug_print_raw_parse），逐项验证 debug_io_direct 5 种合法值、debug_parallel_query 3 个枚举、debug_discard_caches 整数 0-5、force_parallel_mode 彻底移除。白话分类：3 个能看、4 个偶尔调试、1 个未来方向、6 个酷刑测试。">
-    <meta property="og:title" content="debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏">
+    <meta property="og:title" content="debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关"">
     <meta property="og:description" content="PG19 实测 14 个 debug_ GUC，发现原文遗漏 2 个，验证 debug_io_direct/debug_parallel_query 等全部参数行为。">
     <meta property="og:type" content="article">
     <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/debug-guc-family-internal-switches.html">
@@ -27,7 +27,7 @@
     <main class="container">
         <article class="post-full">
     <header class="post-header">
-        <h1>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关" —— PG19 实测纠正原文 2 处遗漏</h1>
+        <h1>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关"</h1>
         <div class="post-meta">
             <span class="badge badge-verified" title="SQL 已在 PG19 Beta1 真实环境中验证">✅ PG19 Beta1 验证通过</span>
             <time datetime="2026-06-11">2026-06-11</time>
