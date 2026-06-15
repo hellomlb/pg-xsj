@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Patroni 静默删除复制槽：一次数据迁移事故的技术拆解 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="深度拆解 Patroni 静默删除复制槽事故：HA 重启后手动逻辑复制槽消失、PG 日志无任何记录、根因分析（Patroni 假设自己是唯一槽管理者）、ignore_slots 修复方案、排查清单、与 Stolon/pg_auto_failover/CloudNativePG 的备选工具对比。">
+    <meta property="og:title" content="Patroni 静默删除复制槽：一次数据迁移事故的技术拆解">
+    <meta property="og:description" content="深度拆解 Patroni 静默删除复制槽事故：HA 重启后槽消失、PG 日志无记录、根因分析、修复方案、排查清单、工具对比。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/patroni-silent-slot-deletion.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>Patroni 静默删除复制槽：一次数据迁移事故的技术拆解</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-15">2026-06-15</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">Patroni</span>
+                <span class="tag">复制槽</span>
+                <span class="tag">逻辑复制</span>
+                <span class="tag">HA</span>
+                <span class="tag">数据迁移</span>
+                <span class="tag">故障排查</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <blockquote class="callout-tldr">
+            <strong>来源</strong>：<a href="https://stormatics.tech/blogs/when-patroni-silently-deletes-your-replication-slots" target="_blank" rel="noopener">When Patroni Silently Deletes Your Replication Slots</a> — semab tariq（Stormatics，2026-06-12）<br>
+            <strong>关键词</strong>：Patroni、复制槽、逻辑复制、HA 切换、数据迁移<br>
+            <strong>风险等级</strong>：⚠️ 高 — 静默数据丢失，PG 日志无任何记录
+        </blockquote>
+
+        <h2>一句话总结</h2>
+
+        <p>在 Patroni 管理的集群上<strong>手动创建的复制槽（逻辑复制/CDC），会在任何一次节点重启后被静默删除</strong>——PG 日志里找不到任何痕迹，因为删除动作是 Patroni 发起的，不是 PG 自己干的。修复很简单（一行 YAML 配置），但不知道这个行为，踩坑就是灾难。</p>
+
+        <p>本文不是翻译，是对原文的<strong>技术拆解与扩展</strong>——从事故还原到根因分析到修复方案到工具对比。</p>
+
+        <hr>
+
+        <h2>事故场景</h2>
+
+        <p><strong>环境</strong>：源端是 Patroni 管理的 3 节点 PG 集群，目标端是独立 PG 集群。通过<strong>逻辑复制</strong>做数据迁移，手动在发布端创建了 <code>publication</code> + <code>logical replication slot</code>。</p>
+
+        <p><strong>一切都好</strong>：数据同步稳定运行，延迟很低。</p>
+
+        <p><strong>触发</strong>：Patroni 管理的发布节点发生了一次重启（例行维护 / HA 切换）。</p>
+
+        <p><strong>结果</strong>：逻辑复制槽消失了。目标端无法再同步数据。</p>
+
+        <p><strong>第一反应</strong>：查 PG 日志 → <strong>没有任何关于槽被删除的记录</strong>。</p>
+
+        <p>这不是 PG 的 bug，也不是 Patroni 的 bug。但它的后果和一个 bug 一样严重——你丢了一个复制槽，而没有任何人告诉你。</p>
+
+        <hr>
+
+        <h2>根因：Patroni 的复制槽清理逻辑</h2>
+
+        <p>Patroni 在启动/重启 PG 时，会执行一次<strong>复制槽一致性检查</strong>。核心逻辑用一句话概括：</p>
+
+        <blockquote>
+            <strong>所有不被 Patroni 自身管理的复制槽，一律删除。</strong>
+        </blockquote>
+
+        <p>伪代码还原：</p>
+
+        <pre><code># Patroni 内部清理逻辑（简化）
+managed_slots = get_dcs_replication_slots()  # 从 DCS 获取 Patroni 管理的槽
+
+for slot in pg_get_all_replication_slots():
+    if slot.name not in managed_slots:
+        # 不被 Patroni 管理的槽 → 直接删除
+        pg_drop_replication_slot(slot.name)</code></pre>
+
+        <h3>为什么 PG 日志里没有记录？</h3>
+
+        <p>因为删除操作是 Patroni <strong>通过 SQL 接口</strong>执行 <code>pg_drop_replication_slot()</code>，不是 PG 自身的后台进程干的。PG 只在以下情况写日志：</p>
+
+        <ul>
+            <li>流复制 WAL sender 异常断开</li>
+            <li><code>max_slot_wal_keep_size</code> 触发强制删除</li>
+        </ul>
+
+        <p>外部工具手动执行的管理命令，<strong>PG 不记录日志</strong>。这是排查时最让你抓狂的一点——你天然会去 PG 日志里找线索，但什么都没有。</p>
+
+        <h3>Patroni 这样设计的动机</h3>
+
+        <p>从集群管理视角看，这个设计是合理甚至必要的：</p>
+
+        <table>
+            <thead>
+                <tr><th>风险</th><th>Patroni 的考虑</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>未知槽阻止 WAL 清理</td><td>残留槽 → WAL 堆积 → 磁盘耗尽 → 集群宕机</td></tr>
+                <tr><td>集群完全控制</td><td>Patroni 假设自己是复制槽的唯一管理者（流复制）</td></tr>
+                <tr><td>HA 一致性</td><td>故障转移后，所有节点必须对复制槽状态有一致视图</td></tr>
+            </tbody>
+        </table>
+
+        <p>问题在于：这个假设在逻辑复制、CDC、数据迁移等场景下不成立。PG 生态越来越多样化，手动创建的槽是合理的运维操作——但 Patroni 不认。</p>
+
+        <blockquote class="callout-tip">
+            <strong>核心矛盾</strong>：Patroni 把 HA 集群当作"封闭系统"，而逻辑复制需要"开放接口"。这两个设计哲学在槽管理上正面冲突。
+        </blockquote>
+
+        <hr>
+
+        <h2>修复方案</h2>
+
+        <h3>方案 1：ignore_slots 配置（推荐）</h3>
+
+        <pre><code># patroni.yaml
+bootstrap:
+  dcs:
+    ignore_slots:
+      - type: logical    # 忽略所有逻辑复制槽
+      - name: my_cdc     # 或按名称忽略特定槽</code></pre>
+
+        <p>加了这个配置后，Patroni 在清理时自动跳过匹配的槽。配置不复杂，但不知道这个参数才是最大的坑。</p>
+
+        <h3>方案 2：patronictl 显式注册</h3>
+
+        <pre><code>patronictl edit-config -s 'slots={mig_slot: {"type": "logical", "database": "mydb", "plugin": "pgoutput"}}'</code></pre>
+
+        <p>把槽注册为 Patroni 管理的对象，让它"认识"这个槽。</p>
+
+        <h3>方案 3：独立发布端（长期 CDC 场景推荐）</h3>
+
+        <p>对于长期运行的逻辑复制/CDC 管道，考虑：</p>
+
+        <ul>
+            <li>使用专门的 CDC 工具（Debezium 等），它们有独立的槽管理</li>
+            <li>在非 Patroni 管理的独立实例上做发布端</li>
+        </ul>
+
+        <hr>
+
+        <h2>排查清单</h2>
+
+        <p>当 Patroni 集群上的逻辑复制突然中断时，按以下顺序排查：</p>
+
+        <table>
+            <thead>
+                <tr><th>#</th><th>检查项</th><th>命令/方法</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>1</td><td>槽是否还存在</td><td><code>SELECT * FROM pg_replication_slots;</code></td></tr>
+                <tr><td>2</td><td>Patroni 是否重启过</td><td>Patroni 日志 / <code>systemctl status patroni</code></td></tr>
+                <tr><td>3</td><td>检查 Patroni 配置</td><td><code>patronictl show-config</code> 确认 <code>ignore_slots</code></td></tr>
+                <tr><td>4</td><td>DCS 中的槽列表</td><td><code>patronictl list -f json</code> 对比预期</td></tr>
+                <tr><td>5</td><td>WAL 是否被回收</td><td><code>SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) FROM pg_replication_slots;</code></td></tr>
+            </tbody>
+        </table>
+
+        <blockquote class="callout-warn">
+            <strong>关键心态</strong>：在 Patroni 集群上做逻辑复制，不要假设你手动创建的槽能"活过"下一次重启。必须显式告诉 Patroni。
+        </blockquote>
+
+        <hr>
+
+        <h2>备选工具对比</h2>
+
+        <table>
+            <thead>
+                <tr><th>工具</th><th>复制槽管理策略</th><th>手动槽安全性</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>Patroni</strong></td><td>启发式清理，不认识的槽删除</td><td>❌ 危险</td></tr>
+                <tr><td>Stolon</td><td>通过 store 管理槽状态，不认识的不清理</td><td>⚠️ 不删除但不管理</td></tr>
+                <tr><td>pg_auto_failover</td><td>只管理自己的流复制槽</td><td>✅ 不干预用户槽</td></tr>
+                <tr><td>CloudNativePG (k8s)</td><td>声明式配置，显式定义所有槽</td><td>✅ 安全</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>遗留问题</h2>
+
+        <p>PG 17 引入的 <code>pg_replication_slot_advance()</code> 和逻辑复制槽故障转移支持，部分缓解了这个问题。但根本矛盾——"集群管理者对复制槽的完全控制"vs"运维人员对外部消费者的支持"——仍然需要行业达成共识的解决方案。</p>
+
+        <p>一个可能的演进方向：Patroni 引入"槽命名空间"概念，区分 <code>system</code>（流复制槽）和 <code>user</code>（用户槽，不被自动清理）。但目前这还不是现实。</p>
+
+        <hr>
+
+        <h2>核心教训</h2>
+
+        <ol>
+            <li><strong>永远显式配置</strong>：在 Patroni 集群上创建的任何复制槽，必须在 Patroni 配置中显式声明。没有"默认安全"这回事。</li>
+            <li><strong>排查时先确认 Patroni 行为</strong>：Node 重启后逻辑复制中断，第一站不应该看 PG 日志，应该看 Patroni 日志和 DCS 状态。</li>
+            <li><strong>设计哲学冲突</strong>：Patroni 把 HA 集群当作"封闭系统"，而逻辑复制需要"开放接口"。运维人员需要意识到这个张力——当这两个假设碰撞时，槽是第一个牺牲品。</li>
+        </ol>
+    </div>
+
+    <footer class="post-footer">
+        <p class="post-license">
+            本文基于 <a href="https://stormatics.tech/blogs/when-patroni-silently-deletes-your-replication-slots" target="_blank" rel="noopener">semab tariq（Stormatics）的原文</a> 进行技术拆解与扩展。
+        </p>
+    </footer>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 PG习思集 · Powered by <a href="https://pages.github.com/">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
