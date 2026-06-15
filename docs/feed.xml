@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Thu, 11 Jun 2026 10:50:00 +0800</lastBuildDate>
+    <lastBuildDate>Mon, 15 Jun 2026 15:20:00 +0800</lastBuildDate>
+    <item>
+      <title>Patroni 静默删除复制槽：一次数据迁移事故的技术拆解</title>
+      <link>https://hellomlb.github.io/pg-xsj/ops/patroni-silent-slot-deletion.html</link>
+      <description>Patroni 重启后静默删除手动创建的逻辑复制槽，PG 日志无任何记录。本文从事故还原到根因分析（Patroni 假设自己是复制槽唯一管理者），给出 ignore_slots 修复方案、5 步排查清单，并与 Stolon/pg_auto_failover/CloudNativePG 做备选工具对比。</description>
+      <pubDate>Mon, 15 Jun 2026 15:20:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/patroni-silent-slot-deletion.html</guid>
+    </item>
     <item>
       <title>debug_* GUC 家族：PostgreSQL 的 14 个"内脏检查开关"</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/debug-guc-family-internal-switches.html</link>
