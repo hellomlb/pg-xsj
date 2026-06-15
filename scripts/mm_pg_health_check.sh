@@ -1,6 +1,6 @@
 #!/bin/bash
 #=============================================================================
-# 木木 PG 健康巡检 (mm_pg_health_check) v2.2
+# 木木 PG 健康巡检 (mm_pg_health_check) v3.0
 # 新增: 文件描述符耗尽检查 (FD)/data_checksums检查/pg_stat_statements深度巡检
 # 新增: OS三故障检测(data_sync_retry/collation/THP增强) — fsyncgate/glibc排序/THP
 # 新增: P0诊断项(慢SQL/长事务/阻塞会话) + P1增强(网络IO/连通性/登录失败/备份/膨胀)
@@ -192,6 +192,12 @@ check_kernel_params() {
     local dirty_ratio; dirty_ratio=$(sysctl -n vm.dirty_ratio 2>/dev/null)
     local dirty_bg_ratio; dirty_bg_ratio=$(sysctl -n vm.dirty_background_ratio 2>/dev/null)
     local overcommit; overcommit=$(sysctl -n vm.overcommit_memory 2>/dev/null)
+    local overcommit_ratio; overcommit_ratio=$(sysctl -n vm.overcommit_ratio 2>/dev/null)
+    local dirty_expire; dirty_expire=$(sysctl -n vm.dirty_expire_centisecs 2>/dev/null)
+    local dirty_writeback; dirty_writeback=$(sysctl -n vm.dirty_writeback_centisecs 2>/dev/null)
+    local vfs_cache; vfs_cache=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null)
+    local min_free; min_free=$(sysctl -n vm.min_free_kbytes 2>/dev/null)
+    local nr_hugepages; nr_hugepages=$(sysctl -n vm.nr_hugepages 2>/dev/null)
 
     wDetail "vm.swappiness=${swappiness}" kernel_params
     wDetail "kernel.shmall=${shmall}"     kernel_params
@@ -199,16 +205,86 @@ check_kernel_params() {
     wDetail "vm.dirty_ratio=${dirty_ratio}" kernel_params
     wDetail "vm.dirty_background_ratio=${dirty_bg_ratio}" kernel_params
     wDetail "vm.overcommit_memory=${overcommit}" kernel_params
+    wDetail "vm.overcommit_ratio=${overcommit_ratio}" kernel_params
+    wDetail "vm.dirty_expire_centisecs=${dirty_expire}" kernel_params
+    wDetail "vm.dirty_writeback_centisecs=${dirty_writeback}" kernel_params
+    wDetail "vm.vfs_cache_pressure=${vfs_cache}" kernel_params
+    wDetail "vm.min_free_kbytes=${min_free}" kernel_params
+    wDetail "vm.nr_hugepages=${nr_hugepages}" kernel_params
 
-    # 武器库推荐：overcommit_memory=2, swappiness=1 for DB
+    # 武器库推荐：DB 专用服务器内核参数
     local issues=0
-    [ "$swappiness" != "1" ] && [ "$swappiness" != "0" ] && issues=$((issues+1))
-    [ "$overcommit" != "2" ] && issues=$((issues+1))
+    local detail=""
 
-    if [ "$issues" -ge 2 ]; then
-        wResult "ERROR" kernel_params
-    elif [ "$issues" -eq 1 ]; then
-        wResult "WARNING" kernel_params
+    # 1. swappiness: DB推荐0（禁止主动换出PG内存）
+    if [ "$swappiness" != "0" ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ❌ vm.swappiness=${swappiness} (推荐0, 非0会导致PG内存页被换出到磁盘)\n"
+    fi
+
+    # 2. overcommit_memory: 2=严格模式（PG不需要overcommit）
+    [ "$overcommit" != "2" ] && issues=$((issues+1)) && \
+        detail+="  ⚠️ vm.overcommit_memory=${overcommit} (推荐2, 严格模式防OOM killer)\n"
+
+    # 3. overcommit_ratio: overcommit=2 时可用内存比例, DB推荐95(=RAM的95%可提交)
+    if [ -n "$overcommit_ratio" ] && [ "$overcommit" = "2" ] 2>/dev/null; then
+        if [ "$overcommit_ratio" != "95" ] 2>/dev/null; then
+            issues=$((issues+1))
+            detail+="  ⚠️ vm.overcommit_ratio=${overcommit_ratio}% (推荐95%, 留5%给OS内核+缓存)\n"
+        fi
+    fi
+
+    # 4. dirty_ratio: DB推荐 ≤ 20（过高=崩溃时丢失数据多）
+    if [ -n "$dirty_ratio" ] && [ "$dirty_ratio" -gt 20 ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ⚠️ vm.dirty_ratio=${dirty_ratio}% (推荐≤20%, 当前过高=脏页堆积+崩溃丢数据)\n"
+    fi
+
+    # 5. dirty_background_ratio: 推荐 ≤ 10
+    if [ -n "$dirty_bg_ratio" ] && [ "$dirty_bg_ratio" -gt 10 ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ⚠️ vm.dirty_background_ratio=${dirty_bg_ratio}% (推荐≤10%, 后台写回太晚)\n"
+    fi
+
+    # 6. dirty_expire_centisecs: 脏页最大存活时间(1/100秒), 推荐<3000(30s)
+    if [ -n "$dirty_expire" ] && [ "$dirty_expire" -gt 3000 ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ⚠️ vm.dirty_expire_centisecs=${dirty_expire} (推荐<3000=30s, 太长=脏页堆积)\n"
+    fi
+
+    # 7. dirty_writeback_centisecs: pdflush唤醒间隔, 推荐=500(5s)
+    if [ -n "$dirty_writeback" ] && [ "$dirty_writeback" -gt 1000 ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ⚠️ vm.dirty_writeback_centisecs=${dirty_writeback} (推荐500=5s, 太长=脏页写回延迟)\n"
+    fi
+
+    # 8. vfs_cache_pressure: 回收缓存倾向, 推荐50-100
+    if [ -n "$vfs_cache" ] && [ "$vfs_cache" -lt 50 ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ⚠️ vm.vfs_cache_pressure=${vfs_cache} (推荐50-100, 太低=inode缓存膨胀)\n"
+    elif [ -n "$vfs_cache" ] && [ "$vfs_cache" -gt 200 ] 2>/dev/null; then
+        issues=$((issues+1))
+        detail+="  ⚠️ vm.vfs_cache_pressure=${vfs_cache} (过高会导致频繁回收dentry/inode缓存)\n"
+    fi
+
+    # 9. min_free_kbytes: 保留内存防碎片, 建议≥1%总内存或内核3.14+自动
+    if [ -n "$min_free" ] && [ "$min_free" -lt 65536 ] 2>/dev/null && [ -f /proc/meminfo ]; then
+        local mem_total_gb; mem_total_gb=$(awk '/MemTotal/{printf \"%.0f\", $2/1024/1024}' /proc/meminfo 2>/dev/null)
+        if [ -n "$mem_total_gb" ] && [ "$mem_total_gb" -ge 64 ] 2>/dev/null; then
+            issues=$((issues+1))
+            detail+="  ⚠️ vm.min_free_kbytes=${min_free}KB (内存≥64GB, 推荐≥$(awk -v m="$mem_total_gb" 'BEGIN{printf \"%.0f\", m*10240}')KB ~ 1%总内存)\n"
+        fi
+    else
+        detail+="  ✅ vm.min_free_kbytes=${min_free}KB (内核≥3.14+: kswapd自动维护)\n"
+    fi
+
+    if [ "$issues" -gt 0 ]; then
+        wDetail "${detail}" kernel_params
+        if [ "$issues" -ge 3 ]; then
+            wResult "ERROR" kernel_params
+        else
+            wResult "WARNING" kernel_params
+        fi
     else
         wResult "NORMAL" kernel_params
     fi
@@ -367,6 +443,119 @@ check_memory_usage() {
     else
         wResult "UNKOWN" memory_usage
     fi
+}
+
+# ---- 内存碎片 + HugePages + Swap 深度检查 ----
+# 基于 /proc/buddyinfo 和 /proc/meminfo
+check_memory_fragmentation() {
+    local detail=""
+    detail+="===== 内存深度检查 (碎片/HugePages/Swap) =====\n\n"
+
+    # 1. Buddyinfo 内存碎片分析
+    detail+="--- 内存碎片 (buddyinfo) ---\n"
+    if [ -f /proc/buddyinfo ]; then
+        local buddy_raw; buddy_raw=$(cat /proc/buddyinfo 2>/dev/null)
+        detail+="${buddy_raw}\n"
+        # 提取 Normal 区域的 order-0 到 order-10
+        local normal_order0; normal_order0=$(awk '/Normal/{print $4}' /proc/buddyinfo 2>/dev/null)
+        local normal_order10; normal_order10=$(awk '/Normal/{print $14}' /proc/buddyinfo 2>/dev/null)
+        local frag_ratio
+        if [ -n "$normal_order10" ] && [ "$normal_order10" -gt 0 ] 2>/dev/null; then
+            frag_ratio=$(awk -v o0="$normal_order0" -v o10="$normal_order10" 'BEGIN{printf "%.1f", o0/o10}')
+            detail+="  碎片指数(order0/order10): ${frag_ratio} (越小越好, >1=碎片严重)\n"
+            if [ "$(echo "$frag_ratio > 10" | bc 2>/dev/null || echo "0")" = "1" ]; then
+                detail+="  ❌ 内存碎片严重! order-0 碎片远多于大块连续内存\n"
+                detail+="     建议: 开启 transparent_hugepage / 调整 min_free_kbytes\n"
+            elif [ "$(echo "$frag_ratio > 3" | bc 2>/dev/null || echo "0")" = "1" ]; then
+                detail+="  ⚠️ 存在一定内存碎片，关注趋势\n"
+            else
+                detail+="  ✅ 内存碎片程度可接受\n"
+            fi
+        else
+            detail+="  (无法计算碎片指数)\n"
+        fi
+        detail+="\n"
+    else
+        detail+="  (Linux only: /proc/buddyinfo 不可用)\n\n"
+    fi
+
+    # 2. HugePages 配置
+    detail+="--- HugePages ---\n"
+    if [ -f /proc/meminfo ]; then
+        local hp_total; hp_total=$(awk '/HugePages_Total/{print $2}' /proc/meminfo 2>/dev/null)
+        local hp_free; hp_free=$(awk '/HugePages_Free/{print $2}' /proc/meminfo 2>/dev/null)
+        local hp_rsvd; hp_rsvd=$(awk '/HugePages_Rsvd/{print $2}' /proc/meminfo 2>/dev/null)
+        local hp_size; hp_size=$(awk '/Hugepagesize/{print $2}' /proc/meminfo 2>/dev/null)
+        local mem_total; mem_total=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
+
+        if [ -n "$hp_total" ] && [ "$hp_total" -gt 0 ] 2>/dev/null; then
+            local hp_used=$((hp_total - hp_free))
+            local hp_used_pct; hp_used_pct=$(awk -v u="$hp_used" -v t="$hp_total" 'BEGIN{printf "%.1f", u/t*100}')
+            detail+="  HugePages_Total: ${hp_total}\n"
+            detail+="  HugePages_Free:  ${hp_free}\n"
+            detail+="  HugePages_Rsvd:  ${hp_rsvd}\n"
+            detail+="  Hugepagesize:    ${hp_size} KB\n"
+            detail+="  使用率: ${hp_used_pct}%\n"
+
+            # PG shared_buffers 与 hugepages 匹配检查
+            local sb_setting; sb_setting=$(sql_exec "SELECT setting FROM pg_settings WHERE name='shared_buffers'" 2>/dev/null || echo "")
+            if [ -n "$sb_setting" ]; then
+                local hp_mem=$((hp_total * hp_size / 1024))  # MB
+                detail+="  PG shared_buffers: ${sb_setting} (HugePages 总内存: ${hp_mem}MB)\n"
+                if [ "$hp_used_pct" -lt 50 ] 2>/dev/null; then
+                    detail+="  ⚠️ HugePages 使用率不足50%, 预留可能过多\n"
+                fi
+            fi
+        else
+            detail+="  HugePages: 未启用 (或显式配置为0)\n"
+            if [ -f /proc/sys/vm/nr_hugepages ]; then
+                local hp_config; hp_config=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null)
+                detail+="  /proc/sys/vm/nr_hugepages = ${hp_config}\n"
+            fi
+            # 检查透明大页
+            local thp_status; thp_status=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+            if [ -n "$thp_status" ]; then
+                detail+="  Transparent HugePages: ${thp_status}\n"
+            fi
+        fi
+        detail+="\n"
+
+        # 3. Swap + DirectMap
+        detail+="--- Swap & 大页映射 ---\n"
+        local swap_total; swap_total=$(awk '/SwapTotal/{print $2}' /proc/meminfo 2>/dev/null)
+        local swap_free; swap_free=$(awk '/SwapFree/{print $2}' /proc/meminfo 2>/dev/null)
+        local swap_cached; swap_cached=$(awk '/SwapCached/{print $2}' /proc/meminfo 2>/dev/null)
+        local dm_4k; dm_4k=$(awk '/DirectMap4k/{print $2}' /proc/meminfo 2>/dev/null)
+        local dm_2m; dm_2m=$(awk '/DirectMap2M/{print $2}' /proc/meminfo 2>/dev/null)
+
+        if [ -n "$swap_total" ] && [ "$swap_total" -gt 0 ] 2>/dev/null; then
+            local swap_used=$((swap_total - swap_free))
+            local swap_pct; swap_pct=$(awk -v u="$swap_used" -v t="$swap_total" 'BEGIN{printf "%.1f", u/t*100}')
+            detail+="  Swap: ${swap_used}KB / ${swap_total}KB (${swap_pct}% 已用)\n"
+            detail+="  SwapCached: ${swap_cached}KB\n"
+            if [ -n "$swap_used" ] && [ "$swap_used" -gt 0 ] 2>/dev/null; then
+                detail+="  ❌ Swap 已使用! PG 不应使用交换分区（${swap_pct}%, ${swap_used}KB/${swap_total}KB）\n"
+                detail+="     建议: 关闭 swap / 增加 RAM / 设置 vm.swappiness=0\n"
+            else
+                detail+="  ✅ Swap 未使用\n"
+            fi
+        else
+            detail+="  Swap: 未启用或无交换空间\n"
+        fi
+
+        if [ -n "$dm_2m" ] && [ "$dm_2m" -gt 0 ] 2>/dev/null; then
+            local dm_total=$((dm_4k + dm_2m))
+            local dm_2m_pct; dm_2m_pct=$(awk -v d2="$dm_2m" -v dt="$dm_total" 'BEGIN{printf "%.1f", d2/dt*100}')
+            detail+="  DirectMap: 4K=${dm_4k}KB / 2M=${dm_2m}KB\n"
+            detail+="  大页映射率(2MB+): ${dm_2m_pct}% (越高越好)\n"
+        fi
+        detail+="\n"
+    else
+        detail+="  (Linux only: /proc/meminfo 不可用)\n\n"
+    fi
+
+    wDetail "${detail}" memory_fragmentation
+    wResult "NORMAL" memory_fragmentation  # 仅报告，不打断巡检
 }
 
 check_disk_usage() {
@@ -809,7 +998,7 @@ check_db_logical_replication() {
 
         # 4. Subscription Worker 错误检查 (PG17+)
         local pg_ver; pg_ver=$(sql_exec "SELECT current_setting('server_version_num')::int" 2>/dev/null || echo "0")
-        if [ "$pg_ver" -ge 170000 ] 2>/dev/null; then
+        if [ "$pg_ver" -ge 170000 ] && [ "$pg_ver" -lt 190000 ] 2>/dev/null; then
             local worker_stats
             worker_stats=$(sql_table "SELECT
                 subname,
@@ -837,7 +1026,7 @@ check_db_logical_replication() {
                 fi
             fi
         else
-            detail+="Subscription Worker 详情需 PG17+ (当前版本不支持 pg_stat_subscription_workers)\n"
+            detail+="Subscription Worker 详情需 PG17-18 (PG19 已移除 pg_stat_subscription_workers 视图)\n"
         fi
     fi
 
@@ -1060,20 +1249,57 @@ check_db_checkpoint() {
     local detail=""
     detail+="===== Checkpoint 统计检查 =====\n\n"
     local issues=0
+    local pg_major; pg_major=$(sql_exec "SELECT current_setting('server_version_num')::int / 10000" 2>/dev/null || echo "0")
 
-    # pg_stat_bgwriter checkpoint 统计
-    local ckpt_stats
-    ckpt_stats=$(sql_table "SELECT
-        checkpoints_timed,
-        checkpoints_req,
-        checkpoint_write_time AS write_time_ms,
-        checkpoint_sync_time AS sync_time_ms,
-        buffers_checkpoint,
-        stats_reset
-    FROM pg_stat_bgwriter;" 2>/dev/null)
-    detail+="--- pg_stat_bgwriter (Checkpoint 相关) ---\n${ckpt_stats}\n\n"
+    if [ "$pg_major" -ge 19 ] 2>/dev/null; then
+        # PG19: pg_stat_bgwriter 已精简，checkpoint 相关列被移除
+        detail+="--- PG19+ 说明 ---\n"
+        detail+="PG19 已将 checkpoint 统计从 pg_stat_bgwriter 移出\n"
+        detail+="pg_stat_checkpoint 视图尚在开发中，当前 Beta 暂不可用\n\n"
+    else
+        # PG <= 18: 使用 pg_stat_bgwriter 的传统 checkpoint 列
+        local ckpt_stats
+        ckpt_stats=$(sql_table "SELECT
+            checkpoints_timed,
+            checkpoints_req,
+            checkpoint_write_time AS write_time_ms,
+            checkpoint_sync_time AS sync_time_ms,
+            buffers_checkpoint,
+            stats_reset
+        FROM pg_stat_bgwriter;" 2>/dev/null)
+        detail+="--- pg_stat_bgwriter (Checkpoint 相关) ---\n${ckpt_stats}\n\n"
 
-    # Checkpoint 参数
+        local timed; timed=$(sql_exec "SELECT checkpoints_timed FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
+        local req;  req=$(sql_exec "SELECT checkpoints_req FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
+        local total_ckpt=$((timed + req))
+        detail+="checkpoints_timed(按时间): ${timed} / checkpoints_req(按WAL): ${req}\n"
+
+        if [ "$total_ckpt" -gt 0 ]; then
+            local req_pct; req_pct=$(awk -v r="$req" -v t="$total_ckpt" 'BEGIN{printf "%.0f", r/t*100}')
+            detail+="请求触发占比: ${req_pct}% (超过50%说明max_wal_size太小)\n"
+            if [ "$req_pct" -gt 70 ]; then
+                detail+="警告: 超过70%的checkpoint由WAL触发，建议增大max_wal_size\n"
+                issues=$((issues+2))
+            elif [ "$req_pct" -gt 50 ]; then
+                detail+="警告: 超过50%的checkpoint由WAL触发，考虑增大max_wal_size\n"
+                issues=$((issues+1))
+            fi
+
+            local write_time; write_time=$(sql_exec "SELECT checkpoint_write_time FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
+            local sync_time;  sync_time=$(sql_exec "SELECT checkpoint_sync_time FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
+            local avg_write
+            avg_write=$(awk -v w="$write_time" -v t="$total_ckpt" 'BEGIN{printf "%.0f", w/t}')
+            local avg_sync
+            avg_sync=$(awk -v s="$sync_time" -v t="$total_ckpt" 'BEGIN{printf "%.0f", s/t}')
+            detail+="平均 write_time: ${avg_write}ms / sync_time: ${avg_sync}ms\n"
+            if [ "$avg_write" -gt 30000 ]; then
+                detail+="警告: 平均 checkpoint 写入时间过长(>30s)，IO性能可能不足\n"
+                issues=$((issues+1))
+            fi
+        fi
+    fi
+
+    # Checkpoint 参数（所有版本通用）
     local ckpt_timeout; ckpt_timeout=$(sql_exec "SELECT setting FROM pg_settings WHERE name='checkpoint_timeout'")
     local max_wal_size;  max_wal_size=$(sql_exec "SELECT setting FROM pg_settings WHERE name='max_wal_size'")
     local min_wal_size;  min_wal_size=$(sql_exec "SELECT setting FROM pg_settings WHERE name='min_wal_size'")
@@ -1083,36 +1309,6 @@ check_db_checkpoint() {
     detail+="max_wal_size = ${max_wal_size}\n"
     detail+="min_wal_size = ${min_wal_size}\n"
     detail+="checkpoint_completion_target = ${ckpt_completion}\n\n"
-
-    # 被迫 checkpoint 比例
-    local timed; timed=$(sql_exec "SELECT checkpoints_timed FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
-    local req;  req=$(sql_exec "SELECT checkpoints_req FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
-    local total_ckpt=$((timed + req))
-    detail+="checkpoints_timed(按时间): ${timed} / checkpoints_req(按WAL): ${req}\n"
-
-    if [ "$total_ckpt" -gt 0 ]; then
-        local req_pct; req_pct=$(awk -v r="$req" -v t="$total_ckpt" 'BEGIN{printf "%.0f", r/t*100}')
-        detail+="请求触发占比: ${req_pct}% (超过50%说明max_wal_size太小)\n"
-        if [ "$req_pct" -gt 70 ]; then
-            detail+="警告: 超过70%的checkpoint由WAL触发，建议增大max_wal_size\n"
-            issues=$((issues+2))
-        elif [ "$req_pct" -gt 50 ]; then
-            detail+="警告: 超过50%的checkpoint由WAL触发，考虑增大max_wal_size\n"
-            issues=$((issues+1))
-        fi
-
-        local write_time; write_time=$(sql_exec "SELECT checkpoint_write_time FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
-        local sync_time;  sync_time=$(sql_exec "SELECT checkpoint_sync_time FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
-        local avg_write
-        avg_write=$(awk -v w="$write_time" -v t="$total_ckpt" 'BEGIN{printf "%.0f", w/t}')
-        local avg_sync
-        avg_sync=$(awk -v s="$sync_time" -v t="$total_ckpt" 'BEGIN{printf "%.0f", s/t}')
-        detail+="平均 write_time: ${avg_write}ms / sync_time: ${avg_sync}ms\n"
-        if [ "$avg_write" -gt 30000 ]; then
-            detail+="警告: 平均 checkpoint 写入时间过长(>30s)，IO性能可能不足\n"
-            issues=$((issues+1))
-        fi
-    fi
 
     wDetail "${detail}" db_checkpoint
 
@@ -1131,8 +1327,17 @@ check_db_bgwriter() {
     local issues=0
 
     # bgwriter 统计
-    local bgw_stats
-    bgw_stats=$(sql_table "SELECT
+    local pg_major; pg_major=$(sql_exec "SELECT current_setting('server_version_num')::int / 10000" 2>/dev/null || echo "0")
+    if [ "$pg_major" -ge 19 ] 2>/dev/null; then
+        # PG19: pg_stat_bgwriter 仅保留 4 列
+        local bgw_stats
+        bgw_stats=$(sql_table "SELECT buffers_clean, maxwritten_clean, buffers_alloc, stats_reset FROM pg_stat_bgwriter;" 2>/dev/null)
+        detail+="--- pg_stat_bgwriter (PG19 精简视图) ---\n${bgw_stats}\n\n"
+        detail+="PG19 已移除 buffers_backend/buffers_checkpoint/buffers_backend_fsync\n"
+        detail+="bgwriter 效率分析暂不可用\n\n"
+    else
+        # PG <= 18
+        bgw_stats=$(sql_table "SELECT
         buffers_checkpoint,
         buffers_clean,
         buffers_backend,
@@ -1140,24 +1345,16 @@ check_db_bgwriter() {
         buffers_alloc,
         maxwritten_clean,
         stats_reset
-    FROM pg_stat_bgwriter;" 2>/dev/null)
-    detail+="--- pg_stat_bgwriter (BgWriter 相关) ---\n${bgw_stats}\n\n"
+        FROM pg_stat_bgwriter;" 2>/dev/null)
+        detail+="--- pg_stat_bgwriter (BgWriter 相关) ---\n${bgw_stats}\n\n"
+        # bgwriter 效率分析
+        local clean; clean=$(sql_exec "SELECT buffers_clean FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
+        local backend; backend=$(sql_exec "SELECT buffers_backend FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
+        local total_buf=$((clean + backend))
+    fi
 
-    # bgwriter 参数
-    local bgw_delay; bgw_delay=$(sql_exec "SELECT setting FROM pg_settings WHERE name='bgwriter_delay'")
-    local bgw_lru_maxpages; bgw_lru_maxpages=$(sql_exec "SELECT setting FROM pg_settings WHERE name='bgwriter_lru_maxpages'")
-    local bgw_lru_multiplier; bgw_lru_multiplier=$(sql_exec "SELECT setting FROM pg_settings WHERE name='bgwriter_lru_multiplier'")
-    detail+="--- BgWriter 参数 ---\n"
-    detail+="bgwriter_delay = ${bgw_delay}ms\n"
-    detail+="bgwriter_lru_maxpages = ${bgw_lru_maxpages}\n"
-    detail+="bgwriter_lru_multiplier = ${bgw_lru_multiplier}\n\n"
-
-    # bgwriter 效率分析
-    local clean; clean=$(sql_exec "SELECT buffers_clean FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
-    local backend; backend=$(sql_exec "SELECT buffers_backend FROM pg_stat_bgwriter" 2>/dev/null || echo "0")
-    local total_buf=$((clean + backend))
-
-    if [ "$total_buf" -gt 0 ]; then
+    # 仅在 PG<19 且有 total_buf 定义时进行效率分析
+    if [ -n "${total_buf+x}" ] && [ "$total_buf" -gt 0 ] 2>/dev/null; then
         local backend_pct; backend_pct=$(awk -v b="$backend" -v t="$total_buf" 'BEGIN{printf "%.0f", b/t*100}')
         detail+="--- BgWriter 效率 ---\n"
         detail+="buffers_clean(bgwriter写): ${clean}\n"
@@ -1210,21 +1407,40 @@ check_db_slru() {
 
     # pg_stat_slru 全部 SLRU 缓存统计
     local slru_stats
-    slru_stats=$(sql_table "SELECT
-        name,
-        blks_hit,
-        blks_read,
-        blks_zeroed,
-        blks_written,
-        blks_exists,
-        flushes,
-        truncates,
-        CASE WHEN blks_hit + blks_read > 0
-            THEN round(100.0 * blks_read / (blks_hit + blks_read), 2)
-            ELSE 0 END AS read_pct
-    FROM pg_stat_slru
-    ORDER BY name;" 2>/dev/null)
-    detail+="--- pg_stat_slru (全部缓存) ---\n${slru_stats:-无数据}\n\n"
+    local pg_ver_slru; pg_ver_slru=$(sql_exec "SELECT current_setting('server_version_num')::int / 10000" 2>/dev/null || echo "16")
+    if [ "$pg_ver_slru" -le 15 ] 2>/dev/null; then
+        # PG15: 无 flushes/truncates 列
+        slru_stats=$(sql_table "SELECT
+            name,
+            blks_hit,
+            blks_read,
+            blks_zeroed,
+            blks_written,
+            blks_exists,
+            CASE WHEN blks_hit + blks_read > 0
+                THEN round(100.0 * blks_read / (blks_hit + blks_read), 2)
+                ELSE 0 END AS read_pct
+        FROM pg_stat_slru
+        ORDER BY name;" 2>/dev/null)
+        detail+="--- pg_stat_slru (全部缓存, PG15 无 flushes/truncates) ---\n${slru_stats:-无数据}\n\n"
+    else
+        # PG16+: 完整列
+        slru_stats=$(sql_table "SELECT
+            name,
+            blks_hit,
+            blks_read,
+            blks_zeroed,
+            blks_written,
+            blks_exists,
+            flushes,
+            truncates,
+            CASE WHEN blks_hit + blks_read > 0
+                THEN round(100.0 * blks_read / (blks_hit + blks_read), 2)
+                ELSE 0 END AS read_pct
+        FROM pg_stat_slru
+        ORDER BY name;" 2>/dev/null)
+        detail+="--- pg_stat_slru (全部缓存) ---\n${slru_stats:-无数据}\n\n"
+    fi
 
     # 重点：commit_timestamp 缓存（PG16名为 CommitTs，PG17+名为 commit_timestamp）
     local ct_hit; ct_hit=$(sql_exec "SELECT blks_hit FROM pg_stat_slru WHERE name IN ('commit_timestamp', 'CommitTs')" 2>/dev/null || echo "0")
@@ -1251,8 +1467,8 @@ check_db_slru() {
     fi
 
     # 其他 SLRU：subtrans（回卷关键，PG16名为 Subtrans）
-    local st_hit; st_hit=$(sql_exec "SELECT blks_hit FROM pg_stat_slru WHERE name IN ('subtrans', 'Subtrans')" 2>/dev/null || echo "0")
-    local st_read; st_read=$(sql_exec "SELECT blks_read FROM pg_stat_slru WHERE name IN ('subtrans', 'Subtrans')" 2>/dev/null || echo "0")
+    local st_hit; st_hit=$(sql_exec "SELECT blks_hit FROM pg_stat_slru WHERE name IN ('subtransaction', 'subtrans', 'Subtrans')" 2>/dev/null || echo "0")
+    local st_read; st_read=$(sql_exec "SELECT blks_read FROM pg_stat_slru WHERE name IN ('subtransaction', 'subtrans', 'Subtrans')" 2>/dev/null || echo "0")
     local st_total=$((st_hit + st_read))
     if [ "$st_total" -gt 0 ] && [ "$st_read" -gt 0 ]; then
         local st_read_pct
@@ -1334,6 +1550,11 @@ check_db_stat_health() {
     local detail=""
     detail+="===== 统计信息健康度检查 =====\n\n"
     local issues=0
+    local pg_ver; pg_ver=$(sql_exec "SELECT current_setting('server_version_num')::int / 10000" 2>/dev/null || echo "16")
+    local mod_col; mod_col="n_mod_since_analyze"
+    if [ "$pg_ver" -le 15 ] 2>/dev/null; then
+        mod_col="n_tup_mod"
+    fi
 
     # --- 1. n_live_tup > n_tup_ins 异常表 ---
     # 正常增量更新下 n_tup_ins >= n_live_tup（累计插入不可能小于当前活元组）
@@ -1393,14 +1614,14 @@ check_db_stat_health() {
         WHERE n_live_tup > 0
         AND last_autoanalyze IS NOT NULL
         AND last_autoanalyze < now() - interval '7 days'
-        AND n_tup_mod > 0" 2>/dev/null || echo "0")
+        AND ${mod_col} > 0" 2>/dev/null || echo "0")
     detail+="有变更且 autoanalyze 超期 7 天: ${stale_analyze}\n"
 
     if [ "$stale_analyze" -gt 0 ]; then
         local stale_a_list
-        stale_a_list=$(sql_exec "SELECT '  ' || schemaname || '.' || relname || ': last_aa=' || last_autoanalyze::date || ' mods=' || n_tup_mod
+        stale_a_list=$(sql_exec "SELECT '  ' || schemaname || '.' || relname || ': last_aa=' || last_autoanalyze::date || ' mods=' || ${mod_col}
             FROM pg_stat_user_tables
-            WHERE n_live_tup > 0 AND last_autoanalyze < now() - interval '7 days' AND n_tup_mod > 0
+            WHERE n_live_tup > 0 AND last_autoanalyze < now() - interval '7 days' AND ${mod_col} > 0
             ORDER BY last_autoanalyze ASC LIMIT 20" 2>/dev/null || echo "")
         detail+="超期表列表 (前20):\n${stale_a_list}\n"
         if [ "$stale_analyze" -gt 10 ]; then
@@ -1959,6 +2180,23 @@ check_param_formulas() {
     local avm_recommended; avm_recommended=$(awk -v c="$cpu_cores" 'BEGIN{r=c/2; if(r>8) r=8; if(r<5) r=5; printf "%.0f", r}')
     local avm_actual; avm_actual=$(sql_exec "SELECT setting FROM pg_settings WHERE name='autovacuum_max_workers'")
     detail+="autovacuum_max_workers: 推荐=${avm_recommended} 实际=${avm_actual}\n"
+
+    # vacuum_buffer_usage_limit (公式: 建议≥2MB, 甜点=min(256MB, NBuffers/8))
+    local vbul_actual; vbul_actual=$(sql_exec "SELECT setting FROM pg_settings WHERE name='vacuum_buffer_usage_limit'")
+    local vbul_n; vbul_n=$(echo "$vbul_actual" | sed 's/kB//;s/MB/*1024/;s/GB/*1048576/' | bc 2>/dev/null || echo "0")
+    # NBuffers = shared_buffers_8k_pages, buffer 上限 = NBuffers/8
+    local nbuffers; nbuffers=$(sql_exec "SELECT setting FROM pg_settings WHERE name='shared_buffers'" 2>/dev/null | grep -oE '[0-9]+')
+    local vbul_max; vbul_max=$(( nbuffers / 8 * 8 / 1024 ))  # 转成 kB/1024 → MB
+    local vbul_actual_fmt="$vbul_actual"
+    # 如果实际值比 NBuffers/8 大，会被源码 clamp
+    if [ "$vbul_n" -gt "$((vbul_max * 1024))" ] 2>/dev/null; then
+        vbul_actual_fmt="${vbul_actual} (实测可能被clamp到${vbul_max}MB)"
+    fi
+    detail+="vacuum_buffer_usage_limit: 推荐≥2MB(默认256KB偏小), 上限$(printf '%.0f' "$vbul_max")MB 实际=${vbul_actual_fmt}\n"
+    if [ "$vbul_n" -lt 1024 ] 2>/dev/null; then  # < 1MB
+        issues=$((issues+1))
+        detail+="  建议: 增大 vacuum_buffer_usage_limit 至 2MB+ (当前${vbul_actual}偏小, 见 MEMORY.md vacuum_buffer_usage_limit 完整认知)\n"
+    fi
 
     wDetail "${detail}" param_formulas
 
@@ -2963,16 +3201,633 @@ write_html_footer() {
 </div>
 </div>
 <div class="footer">
-  木木 PG 健康巡检 v2.2 | $(date "+%Y-%m-%d %H:%M:%S") | ${PG_VARIANT}
+  木木 PG 健康巡检 v3.0 | $(date "+%Y-%m-%d %H:%M:%S") | ${PG_VARIANT}
 </div>
 </body>
 </html>
 HTMLEOF
 }
 
+#################### 新增 DB 巡检项 (v3.0 — pgcheck 互补) ####################
+
+# --------------------------------------------------------------------------
+# H1: VACUUM/ANALYZE 建议 (pgcheck: vacuum_need / analyze_need)
+# 基于 pg_stat_user_tables，检测需要维护的表
+# --------------------------------------------------------------------------
+check_db_vacuum_analyze_need() {
+    local detail=""
+    detail+="===== VACUUM / ANALYZE 维护建议 =====\n\n"
+
+    # 1. 需要 VACUUM 的表 (死元组比例 > 20% 或从未 VACUUM 且行数>1000)
+    local vacuum_need
+    vacuum_need=$(sql_table "WITH stats AS (
+      SELECT
+        schemaname, relname,
+        n_live_tup,
+        n_dead_tup,
+        CASE WHEN n_live_tup + n_dead_tup > 0
+             THEN n_dead_tup::float / (n_live_tup + n_dead_tup)::float
+             ELSE 0 END AS dead_ratio,
+        last_vacuum,
+        last_autovacuum,
+        age(now(), greatest(last_vacuum, last_autovacuum)) AS since_vacuum
+      FROM pg_stat_user_tables
+      WHERE n_live_tup > 0
+    )
+    SELECT
+      schemaname || '.' || relname AS table_name,
+      n_live_tup,
+      n_dead_tup,
+      round((dead_ratio * 100)::numeric, 1) AS dead_pct,
+      last_vacuum,
+      EXTRACT(DAY FROM since_vacuum) AS days_since_vacuum
+    FROM stats
+    WHERE dead_ratio > 0.20
+       OR (last_vacuum IS NULL AND last_autovacuum IS NULL AND n_live_tup > 1000)
+       OR since_vacuum > interval '7 days'
+    ORDER BY dead_ratio DESC
+    LIMIT 20" 2>/dev/null || echo "")
+
+    detail+="--- 需要 VACUUM 的表 (死元组>20% 或 7天未清理) ---\n"
+    if [ -z "$vacuum_need" ]; then
+        detail+="✅ 暂无急需 VACUUM 的表\n"
+    else
+        detail+="${vacuum_need}\n\n"
+        detail+="💡 建议: VACUUM 命令示例:\n"
+        detail+="   VACUUM (VERBOSE, ANALYZE) <schema>.<table>;\n"
+        detail+="   或启用 autovacuum 并调优 autovacuum_vacuum_scale_factor\n"
+    fi
+    detail+="\n"
+
+    # 2. 需要 ANALYZE 的表 (统计信息过期)
+    local analyze_need
+    analyze_need=$(sql_table "WITH stats AS (
+      SELECT
+        schemaname, relname,
+        n_live_tup,
+        n_mod_since_analyze,
+        CASE WHEN n_live_tup > 0
+             THEN n_mod_since_analyze::float / n_live_tup::float
+             ELSE 0 END AS mod_ratio,
+        last_analyze,
+        last_autoanalyze,
+        age(now(), greatest(last_analyze, last_autoanalyze)) AS since_analyze
+      FROM pg_stat_user_tables
+      WHERE n_live_tup > 0
+    )
+    SELECT
+      schemaname || '.' || relname AS table_name,
+      n_live_tup,
+      n_mod_since_analyze,
+      round((mod_ratio * 100)::numeric, 1) AS mod_pct,
+      last_analyze,
+      EXTRACT(DAY FROM since_analyze) AS days_since_analyze
+    FROM stats
+    WHERE mod_ratio > 0.10
+       OR (last_analyze IS NULL AND last_autoanalyze IS NULL AND n_live_tup > 1000)
+       OR since_analyze > interval '7 days'
+    ORDER BY mod_ratio DESC
+    LIMIT 20" 2>/dev/null || echo "")
+
+    detail+="--- 需要 ANALYZE 的表 (修改>10% 或 7天未分析) ---\n"
+    if [ -z "$analyze_need" ]; then
+        detail+="✅ 暂无急需 ANALYZE 的表\n"
+    else
+        detail+="${analyze_need}\n\n"
+        detail+="💡 建议: ANALYZE 命令示例:\n"
+        detail+="   ANALYZE <schema>.<table>;\n"
+        detail+="   或调优 default_statistics_target 和列级 statistics\n"
+    fi
+
+    wDetail "${detail}" db_vacuum_analyze_need
+
+    local v_count; v_count=$(echo "$vacuum_need" | grep -c "." || echo "0")
+    local a_count; a_count=$(echo "$analyze_need" | grep -c "." || echo "0")
+    if [ "$v_count" -gt 5 ] || [ "$a_count" -gt 5 ]; then
+        wResult "WARNING" db_vacuum_analyze_need
+    elif [ "$v_count" -gt 0 ] || [ "$a_count" -gt 0 ]; then
+        wResult "INFO" db_vacuum_analyze_need
+    else
+        wResult "NORMAL" db_vacuum_analyze_need
+    fi
+}
+
+# --------------------------------------------------------------------------
+# H2: 递归锁等待树 (pgcheck: lock_tree)
+# 基于 pg_locks + pg_stat_activity，定位根阻塞者
+# --------------------------------------------------------------------------
+check_db_lock_tree() {
+    local detail=""
+    detail+="===== 递归锁等待树 (Lock Wait Chain) =====\n\n"
+
+    local block_info
+    block_info=$(sql_table "SELECT
+        blocked.pid AS blocked_pid,
+        substring(replace(blocked.query, E'\n', ' '), 1, 80) AS blocked_query,
+        blocker.pid AS blocker_pid,
+        substring(replace(blocker.query, E'\n', ' '), 1, 80) AS blocker_query,
+        blocked.wait_event_type || '.' || blocked.wait_event AS wait_event,
+        EXTRACT(EPOCH FROM now() - blocked.xact_start)::int AS blocked_sec
+    FROM pg_stat_activity blocked
+    JOIN pg_locks blocked_locks ON blocked_locks.pid = blocked.pid AND blocked_locks.granted = false
+    JOIN pg_locks blocker_locks ON
+        blocker_locks.locktype = blocked_locks.locktype
+        AND blocker_locks.database IS NOT DISTINCT FROM blocked_locks.database
+        AND blocker_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+        AND blocker_locks.page IS NOT DISTINCT FROM blocked_locks.page
+        AND blocker_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+        AND blocker_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+        AND blocker_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+        AND blocker_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+        AND blocker_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+        AND blocker_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+        AND blocker_locks.pid != blocked_locks.pid
+        AND blocker_locks.granted = true
+    JOIN pg_stat_activity blocker ON blocker.pid = blocker_locks.pid
+    WHERE blocked.wait_event_type = 'Lock'
+    ORDER BY blocked_sec DESC
+    LIMIT 20" 2>/dev/null || echo "")
+
+    if [ -z "$block_info" ]; then
+        detail+="✅ 当前无锁等待链\n"
+        wDetail "${detail}" db_lock_tree
+        wResult "NORMAL" db_lock_tree
+        return
+    fi
+
+    detail+="--- 当前锁等待关系 (谁被谁阻塞) ---\n"
+    detail+="${block_info}\n\n"
+    detail+="💡 根阻塞者通常是:\n"
+    detail+="   1. 持有 AccessExclusiveLock 的 DDL (ALTER TABLE / DROP TABLE)\n"
+    detail+="   2. 未提交的长事务 (idle in transaction)\n"
+    detail+="   3. 死锁环 (需要排查 pg_locks 详细模式)\n\n"
+    detail+="🔍 深度排查 SQL:\n"
+    detail+="   SELECT pid, wait_event_type, wait_event, query\n"
+    detail+="   FROM pg_stat_activity WHERE wait_event_type = 'Lock';\n"
+
+    wDetail "${detail}" db_lock_tree
+    local block_count; block_count=$(echo "$block_info" | grep -c "." || echo "0")
+    if [ "$block_count" -gt 3 ]; then
+        wResult "ERROR" db_lock_tree
+    elif [ "$block_count" -gt 0 ]; then
+        wResult "WARNING" db_lock_tree
+    else
+        wResult "NORMAL" db_lock_tree
+    fi
+}
+
+# --------------------------------------------------------------------------
+# H3: WAL 生成速率监控 (pgcheck: wal_health / WAL rate)
+# 基于 pg_stat_wal (PG14+)，监控 WAL 生成速率和堆积
+# --------------------------------------------------------------------------
+check_db_wal_rate() {
+    local detail=""
+    detail+="===== WAL 生成速率监控 =====\n\n"
+
+    # 检查 PG 版本是否支持 pg_stat_wal
+    local pg_ver; pg_ver=$(sql_exec "SELECT current_setting('server_version_num')::int" 2>/dev/null || echo "0")
+
+    if [ "$pg_ver" -ge 140000 ]; then
+        local wal_info
+        wal_info=$(sql_table "SELECT
+            wal_records,
+            wal_fpi,
+            wal_bytes,
+            wal_bytes / 1024.0 / 1024.0 AS wal_mb_total,
+            stats_reset
+        FROM pg_stat_wal" 2>/dev/null || echo "")
+
+        detail+="--- pg_stat_wal 累计统计 (PG14+) ---\n"
+        if [ -n "$wal_info" ]; then
+            detail+="${wal_info}\n\n"
+        else
+            detail+="(无数据)\n\n"
+        fi
+
+        # 5秒采样计算速率
+        local wal_now; wal_now=$(sql_exec "SELECT wal_bytes FROM pg_stat_wal" 2>/dev/null || echo "0")
+        sleep 5 2>/dev/null || true
+        local wal_later; wal_later=$(sql_exec "SELECT wal_bytes FROM pg_stat_wal" 2>/dev/null || echo "0")
+        local wal_rate_mb; wal_rate_mb=$(awk -v a="$wal_now" -v b="$wal_later" 'BEGIN{if(a+0>0) printf "%.2f", (b-a)/1024.0/1024.0 / 5.0; else print "N/A"}')
+        detail+="--- WAL 生成速率 (5秒采样) ---\n"
+        detail+="  速率: ${wal_rate_mb} MB/s\n\n"
+    else
+        detail+="⚠️ PG 版本 < 14，pg_stat_wal 视图不可用\n"
+        detail+="   替代: 监控 pg_walfile_name(pg_current_wal_lsn()) 获取 WAL 文件切换频率\n\n"
+    fi
+
+    # 通用：当前 WAL LSN
+    local wal_lsn; wal_lsn=$(sql_exec "SELECT pg_current_wal_lsn()" 2>/dev/null || echo "")
+    local wal_file; wal_file=$(sql_exec "SELECT pg_walfile_name(pg_current_wal_lsn())" 2>/dev/null || echo "")
+    detail+="--- 当前 WAL 位置 ---\n"
+    detail+="  LSN: ${wal_lsn}\n"
+    detail+="  WAL 文件: ${wal_file}\n\n"
+
+    # pg_wal 目录磁盘使用
+    local pg_wal_dir="${PGDATA}/pg_wal"
+    if [ -d "$pg_wal_dir" ]; then
+        local wal_dir_size; wal_dir_size=$(du -sh "$pg_wal_dir" 2>/dev/null | awk '{print $1}')
+        detail+="--- pg_wal 目录大小 ---\n"
+        detail+="  ${pg_wal_dir}: ${wal_dir_size}\n\n"
+    fi
+
+    # 非活跃复制槽 WAL 堆积
+    local slot_lag; slot_lag=$(sql_table "SELECT
+        slot_name, slot_type, active,
+        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint AS lag_bytes,
+        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint / 1024 / 1024 AS lag_mb
+    FROM pg_replication_slots
+    ORDER BY lag_bytes DESC NULLS LAST
+    LIMIT 10" 2>/dev/null || echo "")
+
+    if [ -n "$slot_lag" ]; then
+        detail+="--- 复制槽 WAL 堆积 ---\n"
+        detail+="${slot_lag}\n\n"
+        detail+="⚠️ 非活跃复制槽会导致 WAL 无限堆积，直到 pg_wal 占满磁盘！\n"
+    fi
+
+    wDetail "${detail}" db_wal_rate
+
+    # 判定：非活跃槽 lag > 1GB 为 ERROR
+    local max_lag; max_lag=$(sql_exec "SELECT max(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots WHERE active = false" 2>/dev/null || echo "0")
+    if [ "${max_lag:-0}" -gt 1073741824 ] 2>/dev/null; then
+        wResult "ERROR" db_wal_rate
+    elif [ "${max_lag:-0}" -gt 134217728 ] 2>/dev/null; then
+        wResult "WARNING" db_wal_rate
+    else
+        wResult "NORMAL" db_wal_rate
+    fi
+}
+
+# --------------------------------------------------------------------------
+# M1: 重复/低效索引检测 (pgcheck: dup_index / inefficient_index)
+# 基于 pg_index + pg_stat_user_indexes
+# --------------------------------------------------------------------------
+check_db_dup_index() {
+    local detail=""
+    detail+="===== 重复/低效索引检测 =====\n\n"
+
+    # 1. 重复索引：同表+同列组合
+    local dup_indexes
+    dup_indexes=$(sql_table "WITH index_cols AS (
+    SELECT
+        i.indrelid::regclass AS table_name,
+        i.indexrelid::regclass AS index_name,
+        (SELECT array_agg(a.attname ORDER BY k.n)
+         FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, n)
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        ) AS col_list
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE NOT i.indisprimary AND NOT i.indisunique
+)
+SELECT
+    a.table_name,
+    a.index_name AS index1,
+    b.index_name AS index2,
+    array_to_string(a.col_list, ', ') AS columns
+FROM index_cols a
+JOIN index_cols b
+    ON a.table_name = b.table_name
+    AND a.col_list = b.col_list
+    AND a.index_name < b.index_name
+ORDER BY a.table_name
+LIMIT 20" 2>/dev/null || echo "")
+
+    detail+="--- 重复索引 (相同表的相同列组合) ---\n"
+    if [ -z "$dup_indexes" ]; then
+        detail+="✅ 未发现重复索引\n"
+    else
+        detail+="${dup_indexes}\n\n"
+        detail+="💡 建议: 删除冗余索引 (保留一个，删除其他)\n"
+        detail+="   DROP INDEX CONCURRENTLY <index_name>;\n\n"
+    fi
+
+    # 2. 低效索引：扫描次数少但体积大
+    local inefficient
+    inefficient=$(sql_table "SELECT
+        schemaname || '.' || relname AS table_name,
+        indexrelname AS index_name,
+        idx_scan,
+        pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+        idx_tup_read,
+        idx_tup_fetch
+    FROM pg_stat_user_indexes
+    WHERE idx_scan < 100
+      AND pg_relation_size(indexrelid) > 10 * 1024 * 1024
+      AND schemaname != 'pg_toast'
+    ORDER BY pg_relation_size(indexrelid) DESC
+    LIMIT 20" 2>/dev/null || echo "")
+
+    detail+="--- 低效索引 (扫描次数<100 且大小>10MB) ---\n"
+    if [ -z "$inefficient" ]; then
+        detail+="✅ 未发现明显低效索引\n"
+    else
+        detail+="${inefficient}\n\n"
+        detail+="💡 建议: 评估这些索引是否仍被使用，考虑删除\n"
+    fi
+
+    wDetail "${detail}" db_dup_index
+
+    local dup_count; dup_count=$(echo "$dup_indexes" | grep -c "." || echo "0")
+    if [ "$dup_count" -gt 0 ]; then
+        wResult "WARNING" db_dup_index
+    else
+        wResult "NORMAL" db_dup_index
+    fi
+}
+
+# --------------------------------------------------------------------------
+# M2: NULL 值比例统计 (pgcheck: null_stats)
+# 基于 pg_stats.null_frac，识别高 NULL 比例列
+# --------------------------------------------------------------------------
+check_db_null_ratio() {
+    local detail=""
+    detail+="===== NULL 值比例统计 =====\n\n"
+    detail+="基于 pg_stats.null_frac (ANALYZE 后更新)\n\n"
+
+    local null_stats
+    null_stats=$(sql_table "SELECT
+        schemaname || '.' || tablename AS table_name,
+        attname AS column_name,
+        round((null_frac * 100)::numeric, 1) AS null_pct,
+        n_distinct
+    FROM pg_stats
+    WHERE null_frac > 0.5
+      AND schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+    ORDER BY null_frac DESC
+    LIMIT 30" 2>/dev/null || echo "")
+
+    detail+="--- 高 NULL 比例列 (NULL>50%) ---\n"
+    if [ -z "$null_stats" ]; then
+        detail+="✅ 未发现异常高 NULL 比例列\n"
+    else
+        detail+="${null_stats}\n\n"
+        detail+="💡 说明:\n"
+        detail+="   - NULL>80%: 考虑是否需要该列，或改为稀疏存储\n"
+        detail+="   - 含 NULL 列的索引: 默认 B-tree 不索引 NULL 值\n"
+        detail+="   - 部分索引 (WHERE col IS NOT NULL) 可节省空间\n\n"
+    fi
+
+    wDetail "${detail}" db_null_ratio
+
+    local high_null; high_null=$(echo "$null_stats" | awk '$3+0 > 80 {count++} END{print count+0}')
+    if [ "$high_null" -gt 5 ]; then
+        wResult "INFO" db_null_ratio
+    else
+        wResult "NORMAL" db_null_ratio
+    fi
+}
+
+# --------------------------------------------------------------------------
+# M3: int2/int4 主键溢出风险 (pgcheck: int2_int4_columns)
+# 检测 smallint/integer 自增主键是否接近溢出
+# --------------------------------------------------------------------------
+check_db_int_overflow() {
+    local detail=""
+    detail+="===== int2/int4 主键溢出风险 =====\n\n"
+
+    # 找出 int2/int4 且有序列的列
+    local int_cols
+    int_cols=$(sql_table "SELECT
+        n.nspname || '.' || c.relname AS table_name,
+        a.attname AS column_name,
+        t.typname AS data_type,
+        pg_get_serial_sequence(n.nspname || '.' || c.relname, a.attname) AS seq_name
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE t.typname IN ('int2', 'int4')
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND n.nspname NOT IN ('pg_toast', 'information_schema', 'pg_catalog')
+      AND pg_get_serial_sequence(n.nspname || '.' || c.relname, a.attname) IS NOT NULL
+    ORDER BY table_name
+    LIMIT 50" 2>/dev/null || echo "")
+
+    detail+="--- 使用 int2/int4 且有序列的列 ---\n"
+    if [ -z "$int_cols" ]; then
+        detail+="✅ 未发现 int2/int4 自增列\n"
+        wDetail "${detail}" db_int_overflow
+        wResult "NORMAL" db_int_overflow
+        return
+    fi
+
+    detail+="${int_cols}\n\n"
+
+    # 逐个检查序列当前值
+    detail+="--- 序列当前值 ---\n"
+    local overflow_found=0
+    while IFS= read -r line; do
+        local seq_name; seq_name=$(echo "$line" | awk '{print $NF}')
+        local data_type; data_type=$(echo "$line" | awk '{print $(NF-1)}')
+        if [ -n "$seq_name" ] && [ "$seq_name" != "" ]; then
+            local curr_val; curr_val=$(sql_exec "SELECT last_value FROM ${seq_name}" 2>/dev/null || echo "N/A")
+            if [ "$curr_val" != "N/A" ]; then
+                local pct=0
+                if [ "$data_type" = "int2" ]; then
+                    pct=$(awk -v v="$curr_val" 'BEGIN{printf "%.1f", v/32767.0*100}')
+                elif [ "$data_type" = "int4" ]; then
+                    pct=$(awk -v v="$curr_val" 'BEGIN{printf "%.1f", v/2147483647.0*100}')
+                fi
+                detail+="   ${seq_name}: last_value=${curr_val} (${pct}% 已用)\n"
+                if [ "$data_type" = "int2" ] && [ "$curr_val" -gt 25000 ] 2>/dev/null; then
+                    overflow_found=$((overflow_found+1))
+                elif [ "$data_type" = "int4" ] && [ "$curr_val" -gt 1800000000 ] 2>/dev/null; then
+                    overflow_found=$((overflow_found+1))
+                fi
+            fi
+        fi
+    done <<< "$(echo "$int_cols" | tail -n +3 | head -20)"
+
+    detail+="\n⚠️ 风险说明:\n"
+    detail+="   - int2 (smallint) 最大值: 32,767 | 告警线: 25,000 (76%)\n"
+    detail+="   - int4 (integer) 最大值: 2,147,483,647 | 告警线: 1,800,000,000 (84%)\n"
+    detail+="   - 建议: 使用 int8 (bigint) 或 serial8/bigserial\n"
+
+    wDetail "${detail}" db_int_overflow
+
+    if [ "$overflow_found" -gt 0 ]; then
+        wResult "WARNING" db_int_overflow
+    else
+        wResult "INFO" db_int_overflow
+    fi
+}
+
+# --------------------------------------------------------------------------
+# M4: idle in transaction 监控
+# pg_stat_activity: state='idle in transaction' 的会话
+# --------------------------------------------------------------------------
+check_db_idle_in_txn() {
+    local detail=""
+    detail+="===== idle in transaction 会话监控 =====\n\n"
+
+    local idle_txn
+    idle_txn=$(sql_table "SELECT
+        pid,
+        usename,
+        application_name,
+        client_addr,
+        xact_start,
+        EXTRACT(EPOCH FROM now() - xact_start)::int AS xact_age_sec,
+        substring(replace(query, E'\n', ' '), 1, 100) AS last_query
+    FROM pg_stat_activity
+    WHERE state = 'idle in transaction'
+    ORDER BY xact_start ASC
+    LIMIT 20" 2>/dev/null || echo "")
+
+    detail+="--- idle in transaction 会话 ---\n"
+    if [ -z "$idle_txn" ]; then
+        detail+="✅ 当前无 idle in transaction 会话\n"
+    else
+        detail+="${idle_txn}\n\n"
+        detail+="⚠️ 风险:\n"
+        detail+="   - idle in transaction 持有行锁但不执行任何操作\n"
+        detail+="   - 阻止 VACUUM 清理死元组 (xmin 冻结)\n"
+        detail+="   - 长时间 idle in txn 可能导致 XID 回卷风险\n\n"
+        detail+="💡 修复:\n"
+        detail+="   1. 应用端: 确保事务及时提交/回滚\n"
+        detail+="   2. 设置 idle_in_transaction_session_timeout (PG 9.6+)\n"
+        detail+="      ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';\n"
+    fi
+
+    wDetail "${detail}" db_idle_in_txn
+
+    local idle_count; idle_count=$(echo "$idle_txn" | grep -c "." || echo "0")
+    if [ "$idle_count" -gt 3 ]; then
+        wResult "WARNING" db_idle_in_txn
+    elif [ "$idle_count" -gt 0 ]; then
+        wResult "INFO" db_idle_in_txn
+    else
+        wResult "NORMAL" db_idle_in_txn
+    fi
+}
+
+# --------------------------------------------------------------------------
+# L1: 未使用索引清理建议 (pgcheck: unused_index)
+# 基于 pg_stat_user_indexes.idx_scan=0，排除 PK/UK
+# --------------------------------------------------------------------------
+check_db_unused_index() {
+    local detail=""
+    detail+="===== 未使用索引清理建议 =====\n\n"
+
+    local unused_idx
+    unused_idx=$(sql_table "SELECT
+        schemaname || '.' || relname AS table_name,
+        indexrelname AS index_name,
+        idx_scan,
+        pg_size_pretty(pg_relation_size(psi.indexrelid)) AS index_size
+    FROM pg_stat_user_indexes psi
+    JOIN pg_index pi ON pi.indexrelid = psi.indexrelid
+    WHERE psi.idx_scan = 0
+      AND NOT pi.indisprimary
+      AND NOT pi.indisunique
+      AND psi.schemaname != 'pg_toast'
+    ORDER BY pg_relation_size(psi.indexrelid) DESC
+    LIMIT 30" 2>/dev/null || echo "")
+
+    detail+="--- 从未使用的索引 (idx_scan=0，排除PK/UK) ---\n"
+    if [ -z "$unused_idx" ]; then
+        detail+="✅ 未发现未使用的索引\n"
+    else
+        detail+="${unused_idx}\n\n"
+        detail+="⚠️ 注意:\n"
+        detail+="   - 索引可能在业务低峰期才被使用，需长期观察\n"
+        detail+="   - 外键索引: 即使未 scan，也可能需要用于约束校验\n"
+        detail+="   - 删除前确认: SELECT * FROM pg_stat_user_indexes WHERE indexrelname='<name>'\n\n"
+        detail+="🗑️ 删除命令示例:\n"
+        detail+="   DROP INDEX CONCURRENTLY <schema>.<index_name>;\n"
+    fi
+
+    wDetail "${detail}" db_unused_index
+
+    local unused_count; unused_count=$(echo "$unused_idx" | grep -c "." || echo "0")
+    if [ "$unused_count" -gt 0 ]; then
+        wResult "INFO" db_unused_index
+    else
+        wResult "NORMAL" db_unused_index
+    fi
+}
+
+# --------------------------------------------------------------------------
+# L2: 函数/触发器依赖检查 (自研)
+# 基于 pg_trigger + pg_proc + pg_depend
+# --------------------------------------------------------------------------
+check_db_func_trigger_dep() {
+    local detail=""
+    detail+="===== 函数/触发器依赖检查 =====\n\n"
+
+    # 1. 触发器 -> 函数 依赖关系
+    local trigger_funcs
+    trigger_funcs=$(sql_table "SELECT
+        n.nspname || '.' || c.relname AS table_name,
+        t.tgname AS trigger_name,
+        p.proname AS function_name,
+        CASE WHEN p.prolang = (SELECT oid FROM pg_language WHERE lanname='plpgsql') THEN 'plpgsql' ELSE 'other' END AS lang
+    FROM pg_trigger t
+    JOIN pg_class c ON c.oid = t.tgrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_proc p ON p.oid = t.tgfoid
+    WHERE NOT t.tgisinternal
+    ORDER BY n.nspname, c.relname
+    LIMIT 50" 2>/dev/null || echo "")
+
+    detail+="--- 触发器 -> 函数 依赖关系 ---\n"
+    if [ -z "$trigger_funcs" ]; then
+        detail+="(当前数据库无自定义触发器)\n"
+    else
+        detail+="${trigger_funcs}\n\n"
+    fi
+
+    # 2. 检测被触发器引用但已不存在的函数 (理论上不应发生，但做安全检查)
+    local orphan_triggers
+    orphan_triggers=$(sql_table "SELECT
+        t.tgname AS trigger_name,
+        t.tgrelid::regclass AS table_name,
+        t.tgfoid AS missing_func_oid
+    FROM pg_trigger t
+    LEFT JOIN pg_proc p ON p.oid = t.tgfoid
+    WHERE p.oid IS NULL
+      AND NOT t.tgisinternal
+    LIMIT 20" 2>/dev/null || echo "")
+
+    if [ -n "$orphan_triggers" ]; then
+        detail+="❌ 检测到引用不存在函数的触发器！\n"
+        detail+="${orphan_triggers}\n\n"
+    fi
+
+    # 3. 函数依赖的其他对象 (pg_depend)
+    local func_deps
+    func_deps=$(sql_table "SELECT
+        p.proname AS function_name,
+        d.classid::regclass AS source_type,
+        d.objid::regclass AS depended_object
+    FROM pg_depend d
+    JOIN pg_proc p ON p.oid = d.refobjid
+    WHERE d.refclassid = 'pg_proc'::regclass
+      AND d.deptype = 'n'
+    LIMIT 30" 2>/dev/null || echo "")
+
+    detail+="--- 函数依赖对象 (pg_depend) ---\n"
+    if [ -z "$func_deps" ]; then
+        detail+="(无额外依赖信息)\n"
+    else
+        detail+="${func_deps}\n\n"
+    fi
+
+    wDetail "${detail}" db_func_trigger_dep
+
+    if [ -n "$orphan_triggers" ]; then
+        wResult "ERROR" db_func_trigger_dep
+    else
+        wResult "NORMAL" db_func_trigger_dep
+    fi
+}
+
 #################### 主流程 ####################
 main() {
-    echo "🩺 木木 PG 健康巡检 v2.0"
+    echo "🩺 木木 PG 健康巡检 v3.0"
     echo "=================================="
 
     # 变体检测
@@ -2993,6 +3848,7 @@ main() {
     check_af_alg &
     check_cpu_usage &
     check_memory_usage &
+    check_memory_fragmentation &
     check_disk_usage &
     check_syslog_errors &
     check_cron_backup &
@@ -3030,11 +3886,20 @@ main() {
     check_db_long_txn &
     check_db_blocking &
     check_db_data_checksums &
+    check_db_vacuum_analyze_need &
+    check_db_lock_tree &
+    check_db_dup_index &
+    check_db_null_ratio &
+    check_db_idle_in_txn &
+    check_db_unused_index &
+    check_db_func_trigger_dep &
     wait
     check_param_formulas
     check_security
     check_backup_depth
     check_db_bloat
+    check_db_wal_rate
+    check_db_int_overflow
 
     # ===== Schema 结构健康 =====
     echo "[3.5/4] 执行 Schema 结构健康检查..."
@@ -3048,11 +3913,11 @@ main() {
 
     # OS 检查项
     write_check_section "📊 操作系统巡检" "os" "os_" \
-      "os_user_expire kernel_params resource_limits selinux transparent_hugepage af_alg cpu_usage memory_usage disk_usage syslog_errors cron_backup host_uptime network_io host_connectivity login_failures file_descriptors"
+      "os_user_expire kernel_params resource_limits selinux transparent_hugepage af_alg cpu_usage memory_usage memory_fragmentation disk_usage syslog_errors cron_backup host_uptime network_io host_connectivity login_failures file_descriptors"
 
     # 数据库检查项
     write_check_section "🗄️ 数据库巡检" "db" "db_" \
-      "db_version db_connections db_replication db_archive db_autovacuum db_xid_mxid db_locks db_tablespace db_log_errors db_logical_replication db_data_sync_retry db_collation db_checkpoint db_bgwriter db_slru db_external_calls db_stat_health guc_tuning_sanities partition_config query_id_chain pgss_deep db_slow_sql db_long_txn db_blocking db_data_checksums backup_depth db_bloat"
+      "db_version db_connections db_replication db_archive db_autovacuum db_xid_mxid db_locks db_tablespace db_log_errors db_logical_replication db_data_sync_retry db_collation db_checkpoint db_bgwriter db_slru db_external_calls db_stat_health guc_tuning_sanities partition_config query_id_chain pgss_deep db_slow_sql db_long_txn db_blocking db_data_checksums backup_depth db_bloat db_vacuum_analyze_need db_lock_tree db_wal_rate db_dup_index db_null_ratio db_int_overflow db_idle_in_txn db_unused_index db_func_trigger_dep"
 
     # 参数公式验证
     write_check_section "📐 参数公式验证 (武器库 5.1)" "param" "param_" \
