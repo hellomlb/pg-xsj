@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Mon, 15 Jun 2026 15:20:00 +0800</lastBuildDate>
+    <lastBuildDate>Tue, 16 Jun 2026 10:32:00 +0800</lastBuildDate>
+    <item>
+      <title>PG19 应用时间时态表实测：WITHOUT OVERLAPS + FOR PORTION OF + PERIOD FK 三特性全部验证通过</title>
+      <link>https://hellomlb.github.io/pg-xsj/kernel/pg19-temporal-tables.html</link>
+      <description>在 PG19 Beta1 上完成 SQL:2011 应用时间时态表全量实测。btree_gist 编译安装后三特性全部通过：WITHOUT OVERLAPS 引擎级时间不重叠、FOR PORTION OF 一行 SQL 自动行拆分、PERIOD FK 多行 UNION 覆盖语义。附完整 SQL 示例和真实执行输出。</description>
+      <pubDate>Tue, 16 Jun 2026 10:32:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/pg19-temporal-tables.html</guid>
+    </item>
     <item>
       <title>Patroni 静默删除复制槽：一次数据迁移事故的技术拆解</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/patroni-silent-slot-deletion.html</link>
