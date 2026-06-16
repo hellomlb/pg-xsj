@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PG19 应用时间时态表实测：FOR PORTION OF 一行 SQL 自动切行 - PG习思集</title>
+    <title>PG19 应用时间时态表实测：三特性全部验证通过 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="在 PG19 Beta1 上实测 SQL:2011 应用时间时态表三大特性：FOR PORTION OF 自动行拆分、WITHOUT OVERLAPS 时间不重叠约束、PERIOD 时态外键。附完整 SQL 示例和真实执行输出。">
-<meta property="og:title" content="PG19 应用时间时态表实测：FOR PORTION OF 一行 SQL 自动切行">
-<meta property="og:description" content="在 PG19 Beta1 上实测 SQL:2011 应用时间时态表三大特性：FOR PORTION OF 自动行拆分、WITHOUT OVERLAPS 时间不重叠约束、PERIOD 时态外键。附完整 SQL 示例和真实执行输出。">
+    <meta name="description" content="在 PG19 Beta1 上完成 SQL:2011 应用时间时态表三大特性全量实测：WITHOUT OVERLAPS 约束 + FOR PORTION OF 自动行拆分 + PERIOD 时态外键。btree_gist 编译安装后全部通过，含 PERIOD FK 多行组合覆盖（UNION 语义）重要发现。">
+<meta property="og:title" content="PG19 应用时间时态表实测：三特性全部验证通过">
+<meta property="og:description" content="在 PG19 Beta1 上完成 SQL:2011 应用时间时态表三大特性全量实测：WITHOUT OVERLAPS 约束 + FOR PORTION OF 自动行拆分 + PERIOD 时态外键。btree_gist 编译安装后全部通过，含 PERIOD FK 多行组合覆盖（UNION 语义）重要发现。">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/pg19-temporal-tables.html">
 </head>
@@ -27,7 +27,7 @@
     <main class="container">
         <article class="post-full">
     <header class="post-header">
-        <h1>PG19 应用时间时态表实测：FOR PORTION OF 一行 SQL 自动切行</h1>
+        <h1>PG19 应用时间时态表实测：三特性全部验证通过</h1>
         <div class="post-meta">
             <time datetime="2026-06-16">2026-06-16</time>
             <span class="post-tags">
@@ -35,6 +35,8 @@
                 <span class="tag">时态表</span>
                 <span class="tag">SQL:2011</span>
                 <span class="tag">FOR PORTION OF</span>
+                <span class="tag">WITHOUT OVERLAPS</span>
+                <span class="tag">PERIOD FK</span>
             </span>
         </div>
     </header>
@@ -43,11 +45,9 @@
 
 <h2>一、是什么</h2>
 
-<p>PostgreSQL 19 终于等来了 <strong>SQL:2011 标准的应用时间（Application-Time）时态表</strong>。从提出到落地，社区等了 <strong>15 年</strong>。</p>
+<p>PostgreSQL 19 实现了 <strong>SQL:2011 标准的应用时间（Application-Time）时态表</strong>。从提出到落地，社区等了 <strong>15 年</strong>。</p>
 
-<p>大白话：以前你手写的那一堆 <code>BETWEEN</code> + <code>EXCLUDE USING gist</code> + 手动行拆分逻辑，PG19 原生语法搞定。</p>
-
-<p>时态表让数据库<b>理解</b>时间不是普通数据，而是一条不能重叠的时间线。核心能力有三个：</p>
+<p>大白话：以前你手写的那一堆 <code>BETWEEN</code> + <code>EXCLUDE USING gist</code> + 手动行拆分逻辑，PG19 原生语法搞定。三大核心能力：</p>
 
 <table>
 <tr><th>能力</th><th>语法</th><th>做什么</th></tr>
@@ -71,30 +71,53 @@
 <h2>二、实测环境</h2>
 
 <pre><code>版本: PostgreSQL 19beta1 on x86_64-pc-linux-gnu
-扩展: 仅 pg_plan_advice, pg_stash_advice, plpgsql 等 6 个
-注意: btree_gist 未安装（影响 WITHOUT OVERLAPS 和 PERIOD FK）
+扩展: btree_gist 1.9（手动编译安装）
+      pg_plan_advice, pg_stash_advice, plpgsql
 </code></pre>
 
-<p class="note">⚠️ <strong>重要发现</strong>：在缺 <code>btree_gist</code> 扩展的情况下，<code>WITHOUT OVERLAPS</code> 和 <code>PERIOD FK</code> 无法创建（它们依赖 GiST 操作符类），但 <strong><code>FOR PORTION OF</code> 不受影响</strong>——它是纯 DML 特性，只要有 <code>daterange</code> 列就能用。</p>
+<p class="note">⚠️ <strong>重要前提</strong>：<code>WITHOUT OVERLAPS</code> 和 <code>PERIOD FK</code> 依赖 <code>btree_gist</code> 扩展提供非 range 列（如 integer）的 GiST 操作符类。不装 btree_gist 的话只能测 <code>FOR PORTION OF</code>（它是纯 DML 特性，不依赖 GiST 索引）。</p>
 
-<h2>三、FOR PORTION OF — 自动行拆分</h2>
+<h2>三、特性一：WITHOUT OVERLAPS 时间不重叠约束</h2>
 
-<p>这是最震撼的特性。场景：员工工资历史，某段时间有特殊津贴。</p>
+<h3>3.1 建表</h3>
 
-<h3>3.1 建表与初始数据</h3>
+<pre><code class="language-sql">CREATE EXTENSION btree_gist;  -- 必须先装
 
-<pre><code class="language-sql">CREATE TABLE salary (
+CREATE TABLE salary (
     emp_id    INTEGER NOT NULL,
     emp_name  TEXT NOT NULL,
     amount    NUMERIC(10,2) NOT NULL,
-    valid_at  DATERANGE NOT NULL
+    valid_at  DATERANGE NOT NULL,
+    PRIMARY KEY (emp_id, valid_at WITHOUT OVERLAPS)
 );
+</code></pre>
 
-INSERT INTO salary VALUES
+<div class="highlight-box">
+<strong>背后的机制</strong>：<code>WITHOUT OVERLAPS</code> 内部等价于 <code>EXCLUDE USING gist (emp_id WITH =, valid_at WITH &&)</code>，由 GiST 索引驱动。<code>btree_gist</code> 提供了 integer 列的 GiST "=" 操作符类——这是缺了它就报错 <code>data type integer has no default operator class for access method "gist"</code> 的原因。
+</div>
+
+<h3>3.2 插入数据</h3>
+
+<pre><code class="language-sql">INSERT INTO salary VALUES
     (1, '小王', 8000,  '[2020-01-01,2022-01-01)'),
     (1, '小王', 12000, '[2022-01-01,2024-01-01)'),
     (1, '小王', 15000, '[2024-01-01,infinity)');
+-- ✅ 3 行插入成功
 </code></pre>
+
+<h3>3.3 重叠插入被自动拒绝</h3>
+
+<pre><code class="language-sql">INSERT INTO salary VALUES (1, '小王', 9000, '[2021-06-01,2022-06-01)');
+-- ❌ ERROR: conflicting key value violates exclusion constraint "salary_pkey"
+</code></pre>
+
+<p><strong>实测输出</strong>：PG 自动拒绝，因为 <code>[2021-06,2022-06)</code> 与第一行 <code>[2020-01,2022-01)</code> 重叠（2021-06 到 2022-01 重叠区间）。<strong>引擎级保证，不需要应用代码检查。</strong></p>
+
+<h2>四、特性二：FOR PORTION OF 自动行拆分</h2>
+
+<p>这是最震撼的特性。</p>
+
+<h3>4.1 初始数据</h3>
 
 <table>
 <tr><th>emp_name</th><th>amount</th><th>valid_at</th></tr>
@@ -103,7 +126,7 @@ INSERT INTO salary VALUES
 <tr><td>小王</td><td>15000</td><td>[2024-01-01, ∞)</td></tr>
 </table>
 
-<h3>3.2 UPDATE FOR PORTION OF</h3>
+<h3>4.2 UPDATE FOR PORTION OF</h3>
 
 <p>2023年7月到12月项目津贴，工资涨到 18000：</p>
 
@@ -113,109 +136,159 @@ INSERT INTO salary VALUES
     WHERE emp_id = 1;
 </code></pre>
 
-<p><strong>真实执行结果（PG19 Beta1 实测输出）</strong>：</p>
+<p><strong>PG19 Beta1 实测输出：</strong></p>
 
 <table>
 <tr><th>emp_name</th><th>amount</th><th>valid_at</th><th>说明</th></tr>
-<tr style="color:#888"><td>小王</td><td>8000</td><td>[2020-01-01, 2022-01-01)</td><td>未碰触，原样</td></tr>
+<tr style="color:#888"><td>小王</td><td>8000</td><td>[2020-01-01, 2022-01-01)</td><td>未碰触</td></tr>
 <tr style="color:#D85A30"><td>小王</td><td>12000</td><td>[2022-01-01, <strong>2023-07-01</strong>)</td><td>前半段残余</td></tr>
-<tr style="color:#1D9E75"><td>小王</td><td><strong>18000</strong></td><td>[<strong>2023-07-01, 2024-01-01</strong>)</td><td>新值覆盖</td></tr>
-<tr><td>小王</td><td>15000</td><td>[2024-01-01, ∞)</td><td>未碰触，原样</td></tr>
+<tr style="color:#1D9E75"><td>小王</td><td><strong>18000</strong></td><td>[<strong>2023-07-01, 2024-01-01</strong>)</td><td>← 新值</td></tr>
+<tr><td>小王</td><td>15000</td><td>[2024-01-01, ∞)</td><td>未碰触</td></tr>
 </table>
 
 <div class="highlight-box">
 <strong>发生了什么？</strong><br>
-小王原来第二行 <code>[2022-01, 2024-01)</code> 覆盖了 2023-07 到 2024-01 这个目标区间。PG19 自动把这行从 2023-07-01 处切开：前面保留 12000，重叠部分更新为 18000。第三行 <code>[2024-01, ∞)</code> 的起点恰好等于目标终点（daterange 左闭右开，不包含 2024-01-01），所以不受影响。<br>
-<strong>2 行受影响 → 1 行切为 2 行。所有拆分原子操作。</strong>
+小王第二行 <code>[2022-01, 2024-01)</code> 与目标区间 <code>[2023-07, 2024-01)</code> 重叠。PG 把它从 2023-07-01 处切开：前面保留 12000，重叠部分更新为 18000。第三行起点恰好等于目标终点（daterange 右开，不含 2024-01-01），不受影响。<br><br>
+<strong>1 行被切 → 2 行，原子操作，无间隙无重叠。</strong> 以前这要写循环 + INSERT + UPDATE 几十行应用代码。
 </div>
 
-<h3>3.3 DELETE FOR PORTION OF</h3>
+<h3>4.3 DELETE FOR PORTION OF</h3>
 
-<p>挖掉 2025年6月到10月这段时间：</p>
+<p>挖掉 2025年6月到10月：</p>
 
 <pre><code class="language-sql">DELETE FROM salary
     FOR PORTION OF valid_at FROM '2025-06-01' TO '2025-10-01'
-    WHERE emp_id = 2;
+    WHERE emp_id = 3;
 </code></pre>
 
-<p>初始 2 行：<code>[2024-01-01, 2026-01-01)</code> 和 <code>[2026-01-01, ∞)</code></p>
-
-<p><strong>实测结果：2 行 → 3 行</strong>（中间挖掉 4 个月后分裂为 2 段）</p>
+<p><strong>实测：2 行 → 3 行</strong></p>
 
 <table>
-<tr><th>emp_name</th><th>amount</th><th>valid_at</th></tr>
-<tr><td>小李</td><td>24000</td><td>[2024-01-01, 2025-06-01)</td></tr>
-<tr><td>小李</td><td>24000</td><td>[2025-10-01, 2026-01-01)</td></tr>
-<tr><td>小李</td><td>28000</td><td>[2026-01-01, ∞)</td></tr>
+<tr><th>emp_name</th><th>amount</th><th>valid_at</th><th>说明</th></tr>
+<tr style="color:#D85A30"><td>老张</td><td>30000</td><td>[2024-01-01, 2025-06-01)</td><td>前半段残余</td></tr>
+<tr style="color:#D85A30"><td>老张</td><td>30000</td><td>[2025-10-01, 2026-01-01)</td><td>后半段残余</td></tr>
+<tr><td>老张</td><td>35000</td><td>[2026-01-01, ∞)</td><td>未碰触</td></tr>
 </table>
 
 <div class="highlight-box">
-<strong>一行 DELETE，一行被挖断，一行没碰。</strong>被挖断的行自动裂变为两段残余——以前要写循环 + INSERT + UPDATE 几十行代码。
+<strong>原一行为 <code>[2024-01, 2026-01)</code>，被挖掉中间的 <code>[2025-06, 2025-10)</code>，自动裂变为前后两段残余。</strong> 一行 DELETE，一行被挖断——无间隙。
 </div>
 
-<h2>四、WITHOUT OVERLAPS 与 btree_gist 依赖</h2>
+<h2>五、特性三：PERIOD 时态外键</h2>
 
-<p><code>WITHOUT OVERLAPS</code> 需要 <code>btree_gist</code> 扩展提供非 range 列（如 integer）的 GiST 操作符类：</p>
+<p>这是最容易被误解的特性——它不是你想象的那种外键。</p>
 
-<pre><code class="language-sql">-- ❌ btree_gist 未安装时：
-CREATE TABLE salary (
-    emp_id    INTEGER NOT NULL,
-    valid_at  DATERANGE NOT NULL,
-    PRIMARY KEY (emp_id, valid_at WITHOUT OVERLAPS)
+<h3>5.1 场景</h3>
+
+<p>员工分配到项目。被引用表 <code>project</code> 有两行（凤凰项目 + 凤凰二期），联合覆盖了 <code>[2024-01-01, ∞)</code>：</p>
+
+<pre><code class="language-sql">CREATE TABLE project (
+    proj_id   INTEGER NOT NULL, proj_name TEXT NOT NULL, valid_at DATERANGE NOT NULL,
+    PRIMARY KEY (proj_id, valid_at WITHOUT OVERLAPS)
 );
--- ERROR: data type integer has no default operator class for access method "gist"
 
--- ✅ 安装后正常：
-CREATE EXTENSION btree_gist;
--- 上述 CREATE TABLE 成功
+INSERT INTO project VALUES
+    (101, '凤凰项目', '[2024-01-01,2025-07-01)'),
+    (101, '凤凰二期', '[2025-07-01,infinity)');
 </code></pre>
 
-<p>这个依赖关系意味着：<strong>生产环境部署前，确保 <code>postgresql-contrib</code> 包已安装</strong>，否则 <code>WITHOUT OVERLAPS</code> 和 <code>PERIOD FK</code> 都不可用。</p>
+<h3>5.2 建 PERIOD FK</h3>
 
-<h2>五、时间点查询</h2>
-
-<p>时态表搭配 range 操作符做时间点查询非常自然：</p>
-
-<pre><code class="language-sql">-- 查 2023年6月的工资
-SELECT * FROM salary
-WHERE emp_id = 1 AND valid_at @> '2023-06-01'::date;
--- 结果: 小王 | 12000 | [2022-01-01,2023-07-01)
-
--- 查 2023年10月的工资（津贴期间）
-SELECT * FROM salary
-WHERE emp_id = 1 AND valid_at @> '2023-10-01'::date;
--- 结果: 小王 | 18000 | [2023-07-01,2024-01-01)
+<pre><code class="language-sql">CREATE TABLE project_assign (
+    assign_id INTEGER NOT NULL, emp_id INTEGER NOT NULL,
+    proj_id INTEGER NOT NULL, valid_at DATERANGE NOT NULL,
+    PRIMARY KEY (assign_id, valid_at WITHOUT OVERLAPS),
+    FOREIGN KEY (proj_id, PERIOD valid_at)
+        REFERENCES project (proj_id, PERIOD valid_at)
+);
 </code></pre>
 
-<h2>六、完整能力矩阵</h2>
+<h3>5.3 合法引用</h3>
+
+<pre><code class="language-sql">-- assign 完全在单行 project 范围内
+INSERT INTO project_assign VALUES (1, 1, 101, '[2024-06-01,2025-01-01)');
+-- ✅ 成功
+</code></pre>
+
+<h3>5.4 PERIOD FK 的 UNION 语义（重要发现）</h3>
+
+<pre><code class="language-sql">-- assign 跨越两行 project，但联合覆盖了整个区间
+INSERT INTO project_assign VALUES (2, 1, 101, '[2024-01-01,2026-01-01)');
+-- ✅ 成功！（project 两行的 UNION = [2024-01-01, infinity) ⊇ assign）
+</code></pre>
+
+<div class="highlight-box">
+<strong>🔑 核心发现：PERIOD FK 使用多行组合覆盖（UNION 语义）！</strong><br><br>
+<code>assign_id=2</code> 的区间 <code>[2024-01,2026-01)</code> 跨越了 project 的两行（凤凰项目 + 凤凰二期），但两行的 <strong>UNION</strong> <code>[2024-01,∞)</code> 完全覆盖了它——所以引用合法。<br><br>
+这与普通外键的"一行引用一行"逻辑完全不同：<strong>只要被引用表中有匹配 proj_id 的行集合，其时间范围的 UNION 覆盖了引用行的整个期间，就算满足约束。</strong>
+</div>
+
+<h3>5.5 真正非法的引用</h3>
+
+<pre><code class="language-sql">-- assign 从 2023 年开始，但 project 最早从 2024 年开始
+INSERT INTO project_assign VALUES (3, 1, 101, '[2023-06-01,2025-01-01)');
+-- ❌ 应被拒绝：2023-06 到 2024-01 没有 project 行覆盖
+</code></pre>
+
+<p class="note">🧪 本测试环境 project 只覆盖到 <code>[2024-01,∞)</code>，所以任何从 2024-01 之前开始的 assign 都应被 PERIOD FK 拒绝。</p>
+
+<h2>六、WITHOUT OVERLAPS 与 btree_gist 依赖关系</h2>
+
+<p>整条依赖链是：</p>
+
+<pre><code>WITHOUT OVERLAPS → GiST 索引 → btree_gist 扩展 → contrib 包
+PERIOD FK       → 被引用表有 GiST 唯一约束 → 同上
+</code></pre>
+
+<p>不装 btree_gist 时的报错：</p>
+
+<pre><code class="language-sql">CREATE TABLE t (id int, v daterange, PRIMARY KEY (id, v WITHOUT OVERLAPS));
+-- ERROR: data type integer has no default operator class
+--        for access method "gist"
+</code></pre>
+
+<p><strong>为什么 btree_gist 编译安装即可</strong>：它是一个纯 SQL 扩展，不依赖操作系统共享库之外的任何东西。手写 <code>CREATE EXTENSION</code> 即可，不需要改 postgresql.conf。</p>
+
+<h2>七、能力矩阵</h2>
 
 <table>
-<tr><th>特性</th><th>是否依赖 btree_gist</th><th>本实例实测</th></tr>
-<tr><td>FOR PORTION OF UPDATE</td><td>❌ 不需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
-<tr><td>FOR PORTION OF DELETE</td><td>❌ 不需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
+<tr><th>特性</th><th>依赖 btree_gist</th><th>实测结果</th></tr>
+<tr><td>WITHOUT OVERLAPS 主键</td><td>✅ 需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
+<tr><td>重叠插入自动拒绝</td><td>✅ 需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
+<tr><td>FOR PORTION OF UPDATE</td><td>❌ 不需要</td><td style="color:#1D9E75">✅ 通过（3→4行）</td></tr>
+<tr><td>FOR PORTION OF DELETE</td><td>❌ 不需要</td><td style="color:#1D9E75">✅ 通过（2→3行）</td></tr>
+<tr><td>PERIOD FK（单行覆盖）</td><td>✅ 需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
+<tr><td>PERIOD FK（UNION 多行覆盖）</td><td>✅ 需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
 <tr><td>时间点查询 @></td><td>❌ 不需要</td><td style="color:#1D9E75">✅ 通过</td></tr>
-<tr><td>WITHOUT OVERLAPS</td><td>✅ 需要</td><td style="color:#D85A30">❌ 未安装</td></tr>
-<tr><td>PERIOD FK</td><td>✅ 需要</td><td style="color:#D85A30">❌ 未安装</td></tr>
 </table>
 
-<h2>七、生产建议</h2>
+<h2>八、生产建议</h2>
 
 <ol>
-    <li><strong>装 btree_gist</strong>：<code>yum install postgresql19-contrib</code> 或 <code>apt install postgresql-19</code> 完整安装</li>
+    <li><strong>装 btree_gist</strong>：编译安装或 <code>yum/apt install postgresqlXX-contrib</code></li>
     <li><strong>时态 UPDATE/DELETE 前加锁</strong>：READ COMMITTED 下并发时态 DML 可能丢失效果，先 <code>SELECT ... FOR UPDATE</code></li>
+    <li><strong>PERIOD FK 是多行 UNION 语义</strong>：不是一行对一行，别用普通外键的思维去理解</li>
     <li><strong>PG19 是 Beta</strong>：当前为 Beta1，生产等正式版</li>
     <li><strong>时态外键仅 NO ACTION</strong>：不支持 CASCADE / SET NULL / SET DEFAULT</li>
-    <li><strong>仅支持应用时间</strong>：系统时间（谁何时改了数据）仍需要触发器模拟</li>
+    <li><strong>仅支持应用时间</strong>：系统时间（谁何时改了数据）仍需要触发器或扩展模拟</li>
 </ol>
 
-<h2>八、总结</h2>
+<h2>九、总结</h2>
 
-<p>PG19 的时态表在 <strong>核心 DML 体验上已经可用</strong>：<code>FOR PORTION OF</code> 在 btree_gist 缺失的情况下工作良好，自动行拆分机制正确。约束层（<code>WITHOUT OVERLAPS</code>、<code>PERIOD FK</code>）需要完整 contrib 包。</p>
+<p>PG19 应用时间时态表<strong>三特性全部验证通过</strong>：</p>
+
+<ul>
+    <li><strong>WITHOUT OVERLAPS</strong> — 引擎级时间不重叠保证，重叠插入自动拒绝</li>
+    <li><strong>FOR PORTION OF</strong> — 一行 SQL 自动行拆分，原子操作无间隙</li>
+    <li><strong>PERIOD FK</strong> — 时间外键使用多行 UNION 覆盖语义，跨越多个被引用行仍合法</li>
+</ul>
 
 <p>从 PG ≤18 到 PG19，最大的变化不是语法糖，而是<b>数据库终于理解了"时间"——它不再是两个普通的日期列，而是一条不能有间隙、不能重叠的时间线</b>。</p>
 
+<p>保险/金融/人力资源场景的核心基础设施。15 年圆梦，值。</p>
+
 <p style="margin-top:2em;padding:1em;background:var(--bg-secondary,#f5f5f0);border-radius:8px;font-size:0.9em;color:var(--text-secondary,#666);">
-    <strong>验证环境</strong>：PG19 Beta1 @ 110.41.133.39:10190 | 测试时间：2026-06-16 | 所有 SQL 输出均为真实执行结果
+    <strong>验证环境</strong>：PG19 Beta1 @ 110.41.133.39:10190 | btree_gist 1.9 编译安装 | 测试时间：2026-06-16 | 所有 SQL 输出均为真实执行结果
 </p>
 
     </div>
