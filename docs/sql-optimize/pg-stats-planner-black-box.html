@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="深度解析 pg_stats 视图、MCV 最频值、直方图、相关性、多列统计 5 大核心机制，结合 PG 19 Beta 1 实测数据，看 PostgreSQL 查询规划器如何根据统计信息做决策。">
+    <meta property="og:title" content="pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的">
+    <meta property="og:description" content="规划器不读数据，只读 pg_stats。摘要错，决策就错。本文从 5 大机制到 6 步排错法，全链路实战。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/pg-stats-planner-black-box.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="本文 SQL 已在 PostgreSQL 19 Beta 1 环境中实测验证通过">✅ SQL 验证通过 (PG19)</span>
+            <span class="badge badge-pending" title="PG 16.11 / 16.14 暂无可用环境，待补充">⏳ PG 16 待验证</span>
+            <time datetime="2026-06-23">2026-06-23</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">pg_stats</span>
+                <span class="tag">pg_statistic</span>
+                <span class="tag">MCV</span>
+                <span class="tag">直方图</span>
+                <span class="tag">多列统计</span>
+                <span class="tag">CREATE STATISTICS</span>
+                <span class="tag">查询规划器</span>
+                <span class="tag">Richard Yen</span>
+                <span class="tag">POSETTE 2026</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+
+        <h2>一句话总结</h2>
+
+        <p><strong>PostgreSQL 查询规划器不读你的数据，它读 <code>pg_stats</code> 里的「数据户口本」。户口本错，决策就错。</strong> 本文基于 Richard Yen 在 <a href="https://posetteconf.com/2026/">POSETTE 2026</a> 的演讲，从 5 大核心机制到 6 步排错法，全链路实战，所有 SQL 在 PG 19 Beta 1 上 1M 数据实测验证。</p>
+
+        <blockquote>
+            <p><em>"The Query Planner is only as smart as the statistics you feed it."</em> — Richard Yen</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>为什么这事重要：一个真实的"反直觉"案例</h2>
+
+        <p>假设我们有这样一张表（Richard 演讲原例 + 我重新造数据）：</p>
+
+<pre><code>CREATE TABLE customers (
+    id          bigserial PRIMARY KEY,
+    city        text NOT NULL,
+    state       text NOT NULL,
+    signup_date date NOT NULL
+);</code></pre>
+
+        <p>我们给 <code>state</code> 建了索引，但查 <code>state = 'CA'</code> 时，规划器选了 <strong>Bitmap Heap Scan</strong> 而不是 Index Scan。这违反了很多人的直觉——"明明有索引为什么不用？"</p>
+
+        <p>答案藏在 <code>pg_stats</code> 里。CA 占 6.5% ≈ 65000 行，Bitmap Heap Scan 实际更快。规划器没有错，是我们看不懂它。</p>
+
+        <hr>
+
+        <h2>核心机制 1：pg_statistic vs pg_stats</h2>
+
+        <h3>1.1 真相与人类视图</h3>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>维度</th>
+                    <th>pg_statistic</th>
+                    <th>pg_stats</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>存储格式</td><td>优化给规划器用（数组/二进制）</td><td>人类可读</td></tr>
+                <tr><td>谁能看</td><td>superuser</td><td>public（默认）</td></tr>
+                <tr><td>更新方式</td><td><code>ANALYZE</code> 表时</td><td><code>pg_statistic</code> 的视图</td></tr>
+            </tbody>
+        </table>
+
+        <h3>1.2 实测：四大核心字段</h3>
+
+<pre><code>SELECT attname, n_distinct, null_frac, correlation
+FROM pg_stats
+WHERE tablename = 'customers'
+ORDER BY attname;</code></pre>
+
+        <p>PG 19 Beta 1 实测结果（1M 行 customers 表）：</p>
+
+        <table>
+            <thead>
+                <tr><th>attname</th><th>n_distinct</th><th>null_frac</th><th>correlation</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>city</td><td>10005</td><td>0</td><td>-0.29</td></tr>
+                <tr><td>id</td><td><strong>-1</strong></td><td>0</td><td><strong>1</strong></td></tr>
+                <tr><td>signup_date</td><td>1825</td><td>0</td><td>0.01</td></tr>
+                <tr><td>state</td><td>50</td><td>0</td><td>-0.07</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>关键解读</strong>：</p>
+        <ul>
+            <li><strong><code>n_distinct = -1</code></strong> 表示该列所有行值唯一（PG 内部用负数标记"唯一"）。</li>
+            <li><strong><code>correlation</code></strong> 是 [-1, +1] 区间的数。+1 表示物理顺序 = 逻辑顺序（<code>id</code> 是 bigserial 自增插入，所以 1.0 完美排序）。0 表示完全乱序。</li>
+            <li><code>city</code> 的 correlation = -0.29 是负的：意味着物理顺序大致按 <code>city</code> 倒序排列（因为我们用伪随机种子造数据）。</li>
+        </ul>
+
+        <h3>1.3 实战经验：n_distinct 估算精度</h3>
+
+<pre><code>-- 实际 distinct 值
+SELECT COUNT(DISTINCT city) FROM customers;  -- 10005
+
+-- pg_stats 估算
+SELECT n_distinct FROM pg_stats WHERE tablename='customers' AND attname='city';  -- 10005</code></pre>
+
+        <p>误差 <strong>0%</strong>。但注意：n_distinct 是基于 <strong>采样</strong> 估算的，10M+ 行的表可能误差 1-5%。</p>
+
+        <hr>
+
+        <h2>核心机制 2：MCV（最频值）—— 等值查询的"快查表"</h2>
+
+        <h3>2.1 看 MCV</h3>
+
+<pre><code>SELECT
+    unnest(most_common_vals::text::text[]) AS state,
+    ROUND(unnest(most_common_freqs)::numeric, 4) AS frequency
+FROM pg_stats
+WHERE tablename = 'customers' AND attname = 'state'
+LIMIT 8;</code></pre>
+
+        <p>PG 19 Beta 1 实测（造数据时把 5 个州各设 6.5%）：</p>
+
+        <table>
+            <thead><tr><th>state</th><th>frequency</th></tr></thead>
+            <tbody>
+                <tr><td>NY</td><td>0.0655</td></tr>
+                <tr><td>FL</td><td>0.0651</td></tr>
+                <tr><td>CA</td><td>0.0647</td></tr>
+                <tr><td>TX</td><td>0.0646</td></tr>
+                <tr><td>WY</td><td>0.0642</td></tr>
+                <tr><td>IA</td><td>0.0163</td></tr>
+                <tr><td>KY</td><td>0.0160</td></tr>
+                <tr><td>ID</td><td>0.0158</td></tr>
+            </tbody>
+        </table>
+
+        <p>注意：5 个州各占 6.5% 进入 MCV，其余 45 个州因为都是 1.5% 或更低，**MCV 只列高频**，不常见的值进直方图。</p>
+
+        <h3>2.2 MCV 怎么影响规划</h3>
+
+        <p>查 <code>state = 'CA'</code> 时，规划器：</p>
+        <ol>
+            <li>看 <code>most_common_vals</code> 找到 'CA'</li>
+            <li>读对应 <code>most_common_freqs</code> = 0.0647</li>
+            <li>行数估算 = 100万 × 0.0647 ≈ <strong>64700 行</strong></li>
+            <li>对比 Bitmap Heap Scan vs Seq Scan 的 cost，选便宜的</li>
+        </ol>
+
+        <p>这就是为什么规划器「知道」CA 多——它读的是 MCV，不是你的数据。</p>
+
+        <p><strong>数据越倾斜，MCV 越值钱。</strong> 如果某列所有值都均匀（每个 1%），MCV 反而没意义，直方图更管用。</p>
+
+        <hr>
+
+        <h2>核心机制 3：直方图 —— 范围查询的"分布地图"</h2>
+
+        <h3>3.1 默认 100 桶是什么样</h3>
+
+<pre><code>SELECT (unnest(histogram_bounds::text::timestamp[]))::date AS bucket_bound
+FROM pg_stats
+WHERE tablename = 'customers' AND attname = 'signup_date'
+LIMIT 8;</code></pre>
+
+        <p>PG 19 Beta 1 实测（默认 STATISTICS=100）：</p>
+
+        <pre><code>bucket_bound
+─────────────
+ 2017-12-31
+ 2018-01-18
+ 2018-02-05
+ 2018-02-24
+ 2018-03-15
+ 2018-04-01
+ 2018-04-20
+ 2018-05-08</code></pre>
+
+        <p><strong>桶宽 ≈ 17 天</strong>。1M 行 ÷ 100 桶 = 1万行/桶。我们的数据是均匀分布 5 年（1825 天），所以 17 天/桶完全合理。</p>
+
+        <h3>3.2 调到 1000 桶：精度提升 8.5 倍</h3>
+
+<pre><code>ALTER TABLE customers ALTER COLUMN signup_date SET STATISTICS 1000;
+ANALYZE customers;</code></pre>
+
+        <p>实测结果（同样前 8 个桶）：</p>
+
+        <pre><code>bucket_bound
+─────────────
+ 2017-12-31
+ 2018-01-01
+ 2018-01-03
+ 2018-01-05
+ 2018-01-07
+ 2018-01-09
+ 2018-01-10
+ 2018-01-12</code></pre>
+
+        <p><strong>桶宽 ≈ 2 天</strong>。精度提升 8.5 倍。</p>
+
+        <h3>3.3 实战建议</h3>
+
+        <blockquote>
+            <p>⚠️ <strong>不要全局调高</strong> <code>default_statistics_target</code>！ANALYZE 会变慢，<code>pg_statistic</code> 会膨胀。只调"估算问题大的列"。</p>
+        </blockquote>
+
+        <table>
+            <thead>
+                <tr><th>场景</th><th>推荐</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>OLTP 表，< 1000 万行</td><td>默认 100 够用</td></tr>
+                <tr><td>DW/分析型表</td><td>500-1000 全局</td></tr>
+                <tr><td>时间范围查询慢</td><td>对时间列单独 <code>SET STATISTICS 1000</code></td></tr>
+                <tr><td>列基数极高</td><td>单列 2000+</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>核心机制 4：Correlation —— 物理顺序的"提示"</h2>
+
+        <p>回到我们的实测数据：</p>
+
+        <ul>
+            <li><code>id</code>：correlation = <strong>1.0</strong>（bigserial 顺序插入，物理 = 逻辑）</li>
+            <li><code>city</code>：correlation = -0.29（伪随机，物理顺序与 city 倒序弱相关）</li>
+            <li><code>signup_date</code>：correlation = 0.01（伪随机，物理乱序）</li>
+        </ul>
+
+        <p><strong>这影响什么？</strong> Index Scan 的成本估算。</p>
+
+        <p>如果 <code>correlation = 1.0</code>，走 <code>WHERE id &gt; 500000</code> 时，规划器认为「物理读是连续的」，random_page_cost 接近 seq_page_cost，Index Scan 几乎免费。</p>
+
+        <p>如果 <code>correlation ≈ 0</code>，物理读 = 东一榔头西一棒槌，Index Scan 成本暴涨，Seq Scan 反而更划算。</p>
+
+        <p><strong>调优技巧</strong>：经常 <code>ORDER BY</code> 的列，定期 <code>CLUSTER table USING index</code> 重建表的物理顺序，让 correlation 趋近 1.0。</p>
+
+        <hr>
+
+        <h2>核心机制 5：多列统计 —— 解决"列独立性谎言"</h2>
+
+        <h3>5.1 问题的本质</h3>
+
+        <p>默认规划器假设列之间<strong>统计独立</strong>：</p>
+
+        <p style="text-align:center"><code>P(city='Cheyenne' ∧ state='WY') = P(city) × P(state)</code></p>
+
+        <p>但 Cheyenne 99% 都在 Wyoming。这假设在地理数据上是假的。</p>
+
+        <h3>5.2 实测：50000 行 vs 估算偏差</h3>
+
+        <p>我们造数据时设计：<code>Cheyenne</code> 99% 都在 <code>WY</code>。查询：</p>
+
+<pre><code>EXPLAIN ANALYZE SELECT * FROM customers WHERE city = 'Cheyenne' AND state = 'WY';</code></pre>
+
+        <p><strong>4a. 没有多列统计时</strong>（PG 19 Beta 1 实测）：</p>
+
+        <pre><code>Bitmap Heap Scan on customers
+  (cost=1250.18..6959.86 rows=3167 width=24)
+  (actual time=3.897..8.460 rows=49999.00 loops=1)
+  Recheck Cond: ((city = 'Cheyenne'::text) AND (state = 'WY'::text))</code></pre>
+
+        <p>规划器估算 <strong>3167 行</strong>，实际 <strong>49999 行</strong>，偏差 <strong>15.8 倍</strong>。</p>
+
+        <h3>5.3 解决：CREATE STATISTICS</h3>
+
+<pre><code>CREATE STATISTICS customers_city_state (dependencies, ndistinct)
+    ON city, state FROM customers;
+ANALYZE customers;</code></pre>
+
+        <p><strong>4b. 创建多列统计后</strong>（PG 19 Beta 1 实测）：</p>
+
+        <pre><code>Bitmap Heap Scan on customers
+  (cost=1349.24..7376.84 rows=52767 width=24)
+  (actual time=3.629..8.202 rows=49999.00 loops=1)
+  Recheck Cond: ((city = 'Cheyenne'::text) AND (state = 'WY'::text))</code></pre>
+
+        <p>规划器估算 <strong>52767 行</strong>，实际 <strong>49999 行</strong>，偏差 <strong>1.05 倍</strong>。</p>
+
+        <table>
+            <thead>
+                <tr><th>状态</th><th>规划器估算</th><th>实际行数</th><th>偏差</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>无多列统计</td><td>3167</td><td>49999</td><td><strong>15.8x</strong></td></tr>
+                <tr><td>有多列统计</td><td>52767</td><td>49999</td><td><strong>1.05x</strong></td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>15.8 倍 → 1.05 倍</strong>。一行 DDL 解决问题。</p>
+
+        <h3>5.4 何时该用 CREATE STATISTICS？</h3>
+
+        <p>判断标准：</p>
+        <ol>
+            <li>查询 WHERE 子句里同时过滤<strong>两列或更多列</strong></li>
+            <li>实际行数 / 规划器估算 &gt; 10x</li>
+            <li>业务上知道这些列<strong>强相关</strong>（如 city↔state, product_id↔category_id）</li>
+        </ol>
+
+        <p>注意：<code>(dependencies, ndistinct)</code> 是组合写法，等价于创建两条统计。如只要一种，写 <code>dependencies</code> 即可。</p>
+
+        <hr>
+
+        <h2>核心机制 6：错估会"向上传染"—— 找最深的估算偏差节点</h2>
+
+        <h3>6.1 树形计划的解剖</h3>
+
+        <p><code>EXPLAIN ANALYZE</code> 输出是棵树，<strong>自底向上</strong>执行：</p>
+
+        <pre><code>        Limit           ← 第 1 层（最浅，根节点）
+          │
+        Sort            ← 第 2 层
+          │
+        Hash Join       ← 第 3 层
+          │
+     ┌────┴────┐
+   Scan      Hash          ← 第 4 层
+  orders    (build)
+     │
+   orders
+   表       ← 叶子（最深）</code></pre>
+
+        <p><strong>"最深的节点"= 离叶子最近的 = 数据离开存储层的第一站</strong> = <code>Seq Scan</code> / <code>Index Scan</code> / <code>Bitmap Heap Scan</code>。</p>
+
+        <h3>6.2 错估的"滚雪球"效应</h3>
+
+        <p>规划器是<strong>串联反应</strong>——底层的行数估算错了，<strong>会像滚雪球一样</strong>乘给上层。</p>
+
+        <p>举例：</p>
+        <ul>
+            <li>底层 Seq Scan 估 1000 行 → 实际 100 万行</li>
+            <li>上层 Hash Join 不知道底层翻车 → 选错 join 算法</li>
+            <li>上上层 Sort 内存爆</li>
+            <li>顶层 Limit 拿不到数</li>
+        </ul>
+
+        <p><strong>但根因只是底层那个 Scan 把行数估错了 1000 倍</strong>。</p>
+
+        <h3>6.3 实操：找"最深的估算偏差节点"</h3>
+
+        <p>从 EXPLAIN 输出<strong>从上往下翻</strong>，找第一个出现 <code>Scan</code> 关键字的节点：</p>
+
+        <table>
+            <thead>
+                <tr><th>节点类型</th><th>是不是"最深"？</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Seq Scan / Index Scan / Index Only Scan / Bitmap Heap Scan</td><td>✅ 是</td></tr>
+                <tr><td>Hash Join / Nested Loop / Merge Join</td><td>❌ 不是（上层）</td></tr>
+                <tr><td>Sort / Aggregate / Limit</td><td>❌ 不是（更上层）</td></tr>
+                <tr><td>Append (UNION ALL)</td><td>看里面</td></tr>
+            </tbody>
+        </table>
+
+        <p>找到第一个 Scan 节点 → 看它的 <code>rows=N</code> vs <code>actual rows=M</code> → <strong>是！这就是病灶</strong>。</p>
+
+        <hr>
+
+        <h2>实战排错 6 步法（Richard 钦定顺序）</h2>
+
+        <p>当查询计划看起来不对时，按这个顺序来：</p>
+
+        <table>
+            <thead>
+                <tr><th>步骤</th><th>动作</th><th>何时用</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>1️⃣</td>
+                    <td><code>EXPLAIN ANALYZE</code> 对比估算行数 vs 实际行数</td>
+                    <td>永远是第一步</td>
+                </tr>
+                <tr>
+                    <td>2️⃣</td>
+                    <td>找<strong>最深的估算偏差节点</strong></td>
+                    <td>那里才是"病灶"</td>
+                </tr>
+                <tr>
+                    <td>3️⃣</td>
+                    <td>看 <code>pg_stats</code> 那列的 n_distinct / MCV</td>
+                    <td>数据真如规划器认为的那样？</td>
+                </tr>
+                <tr>
+                    <td>4️⃣</td>
+                    <td>跑 <code>ANALYZE</code></td>
+                    <td>大 batch load / 迁移后，autovacuum 没追上</td>
+                </tr>
+                <tr>
+                    <td>5️⃣</td>
+                    <td>单列仍偏差 → <code>ALTER COLUMN SET STATISTICS</code></td>
+                    <td>桶数不够</td>
+                </tr>
+                <tr>
+                    <td>6️⃣</td>
+                    <td>多列联合偏差 → <code>CREATE STATISTICS</code></td>
+                    <td>列相关</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <blockquote>
+            <p>⛔ <strong>最后</strong>才考虑改 SQL 或设 <code>enable_seqscan=off</code>，别本末倒置。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>成本参数速查：什么影响 cost 估算</h2>
+
+        <p>规划器最后算 cost 时，用三个核心参数：</p>
+
+        <table>
+            <thead>
+                <tr><th>参数</th><th>含义</th><th>默认值</th><th>何时调</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>random_page_cost</td>
+                    <td>随机读一页的成本（Index Scan 走 heap fetch）</td>
+                    <td>4.0</td>
+                    <td>用 SSD 调到 1.1</td>
+                </tr>
+                <tr>
+                    <td>seq_page_cost</td>
+                    <td>顺序读一页的成本（Seq Scan）</td>
+                    <td>1.0</td>
+                    <td>通常不动</td>
+                </tr>
+                <tr>
+                    <td>cpu_tuple_cost</td>
+                    <td>处理每行的 CPU 成本</td>
+                    <td>0.01</td>
+                    <td>几乎永远不动</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p><strong>PG 调优的第一原则</strong>：<em>先查统计信息，再调 random_page_cost</em>。调 cost 参数治标不治本。</p>
+
+        <hr>
+
+        <h2>PG 19 vs PG 16 实测差异：Bitmap Heap Scan 成为主流</h2>
+
+        <p>注意：Richard 演讲里 CA（17%）走的是 <code>Seq Scan</code>，但我 PG 19 Beta 1 1M 数据实测时 CA（6.5%）走的是 <code>Bitmap Heap Scan</code>。</p>
+
+        <p>原因：</p>
+        <ul>
+            <li>PG 19 优化器更倾向于 Bitmap Heap Scan，因为它能批量读 page</li>
+            <li>我数据是 6.5% 而不是 Richard 的 17%，规模差</li>
+            <li>PG 19 的 cost 模型对 SSD 场景有微调</li>
+        </ul>
+
+        <p><strong>结论</strong>：在 PG 19 上，"没有索引时 Seq Scan"是常规；但只要有索引，规划器经常选 Bitmap Heap Scan 而不是 Index Scan。这是好事——现代硬件下 Bitmap 通常更快。</p>
+
+        <hr>
+
+        <h2>和木木武器库已有沉淀的关联</h2>
+
+        <table>
+            <thead>
+                <tr><th>已有沉淀</th><th>本文补充</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>default_statistics_target 详解（2026-06-12）</td>
+                    <td>实测桶宽 17天 → 2天 提升 8.5 倍</td>
+                </tr>
+                <tr>
+                    <td>CREATE STATISTICS 武器库 6.1</td>
+                    <td>实测 15.8x → 1.05x 的精度跃升</td>
+                </tr>
+                <tr>
+                    <td>优化器双轴评估（2026-06-11）</td>
+                    <td>统计质量 = 搜索精度的关键变量</td>
+                </tr>
+                <tr>
+                    <td>PG Weekly #652 解读</td>
+                    <td>补 n_distinct = -1 的含义（人类少知的 PG 内部约定）</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>SQL 验证状态（实事求是）</h2>
+
+        <table>
+            <thead>
+                <tr><th>环境</th><th>状态</th><th>实测时间</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>PostgreSQL 19 Beta 1</td><td>✅ 全部 5 个 SQL 通过</td><td>2026-06-23</td></tr>
+                <tr><td>PostgreSQL 16.11</td><td>⏳ 当前无环境，待老木提供实例后补</td><td>—</td></tr>
+                <tr><td>PostgreSQL 16.14</td><td>⏳ 当前无环境，待老木提供实例后补</td><td>—</td></tr>
+            </tbody>
+        </table>
+
+        <p>本博客涉及的所有 SQL（pg_stats 视图、MCV 展开、CREATE STATISTICS、SET STATISTICS 等）均为 PG 10+ 稳定特性，<strong>在 PG 16.11 / 16.14 上必能运行</strong>。但因当前团队没有 16.x 测试环境，按博客发布铁律第 6 条「不先发后验」，等老木提供实例后补实测。</p>
+
+        <p>测试脚本：<code>scripts/test_pg_stats_blog.js</code>（已提交）</p>
+
+        <hr>
+
+        <h2>参考资料</h2>
+
+        <ul>
+            <li><a href="http://richyen.com/postgres/2026/06/22/pg_stats_how_postgres_internal_stats_work.html">pg_stats: How Postgres Internal Stats Work — Richard Yen</a>（POSETTE 2026 演讲同款）</li>
+            <li><a href="https://www.postgresql.org/docs/current/view-pg-stats.html">PostgreSQL 官方文档：pg_stats 视图</a></li>
+            <li><a href="https://www.postgresql.org/docs/current/view-pg-statistic.html">PostgreSQL 官方文档：pg_statistic 系统表</a></li>
+            <li><a href="https://www.postgresql.org/docs/current/sql-createstatistics.html">PostgreSQL 官方文档：CREATE STATISTICS</a></li>
+            <li><a href="https://www.postgresql.org/docs/current/planner-stats.html">PostgreSQL 官方文档：Using EXPLAIN / planner statistics</a></li>
+        </ul>
+
+    </div><!-- .post-content -->
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
