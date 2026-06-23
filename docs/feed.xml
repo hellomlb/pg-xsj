@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Tue, 16 Jun 2026 10:32:00 +0800</lastBuildDate>
+    <lastBuildDate>Tue, 23 Jun 2026 10:50:00 +0800</lastBuildDate>
+    <item>
+      <title>pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/pg-stats-planner-black-box.html</link>
+      <description>规划器不读你的数据，只读 pg_stats 里的「数据户口本」。户口本错，决策就错。本文从 pg_statistic vs pg_stats、MCV 最频值、直方图、相关性、多列统计 5 大核心机制到「最深的估算偏差节点」排错法，全链路实战，所有 SQL 在 PG 19 Beta 1 上 1M 数据实测验证。实测关键数据：多列统计 15.8x → 1.05x、直方图桶宽 17天 → 2天、n_distinct 0% 误差。</description>
+      <pubDate>Tue, 23 Jun 2026 10:50:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/pg-stats-planner-black-box.html</guid>
+    </item>
     <item>
       <title>PG19 应用时间时态表实测：WITHOUT OVERLAPS + FOR PORTION OF + PERIOD FK 三特性全部验证通过</title>
       <link>https://hellomlb.github.io/pg-xsj/kernel/pg19-temporal-tables.html</link>
