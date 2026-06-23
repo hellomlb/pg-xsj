@@ -6,7 +6,7 @@
     <title>pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="深度解析 pg_stats 视图、MCV 最频值、直方图、相关性、多列统计 5 大核心机制，结合 PG 19 Beta 1 实测数据，看 PostgreSQL 查询规划器如何根据统计信息做决策。">
+    <meta name="description" content="深度解析 pg_stats 视图、MCV 最频值、直方图、相关性、多列统计 5 大核心机制，结合 PG 19 Beta 1 1M 行 customers 表的运行数据，看 PostgreSQL 查询规划器如何根据统计信息做决策。">
     <meta property="og:title" content="pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的">
     <meta property="og:description" content="规划器不读数据，只读 pg_stats。摘要错，决策就错。本文从 5 大机制到 6 步排错法，全链路实战。">
     <meta property="og:type" content="article">
@@ -29,8 +29,6 @@
     <header class="post-header">
         <h1>pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的</h1>
         <div class="post-meta">
-            <span class="badge badge-verified" title="本文 SQL 已在 PostgreSQL 19 Beta 1 环境中实测验证通过">✅ SQL 验证通过 (PG19)</span>
-            <span class="badge badge-pending" title="PG 16.11 / 16.14 暂无可用环境，待补充">⏳ PG 16 待验证</span>
             <time datetime="2026-06-23">2026-06-23</time>
             <span class="post-category sql-optimize">SQL 优化</span>
             <span class="post-tags">
@@ -51,7 +49,7 @@
 
         <h2>一句话总结</h2>
 
-        <p><strong>PostgreSQL 查询规划器不读你的数据，它读 <code>pg_stats</code> 里的「数据户口本」。户口本错，决策就错。</strong> 本文基于 Richard Yen 在 <a href="https://posetteconf.com/2026/">POSETTE 2026</a> 的演讲，从 5 大核心机制到 6 步排错法，全链路实战，所有 SQL 在 PG 19 Beta 1 上 1M 数据实测验证。</p>
+        <p><strong>PostgreSQL 查询规划器不读你的数据，它读 <code>pg_stats</code> 里的「数据户口本」。户口本错，决策就错。</strong> 本文基于 Richard Yen 在 <a href="https://posetteconf.com/2026/">POSETTE 2026</a> 的演讲，从 5 大核心机制到 6 步排错法，全链路实战，所有示例在 PG 19 Beta 1 的 1M 行 customers 表上跑出真实数据。</p>
 
         <blockquote>
             <p><em>"The Query Planner is only as smart as the statistics you feed it."</em> — Richard Yen</p>
@@ -95,14 +93,14 @@
             </tbody>
         </table>
 
-        <h3>1.2 实测：四大核心字段</h3>
+        <h3>1.2 四大核心字段</h3>
 
 <pre><code>SELECT attname, n_distinct, null_frac, correlation
 FROM pg_stats
 WHERE tablename = 'customers'
 ORDER BY attname;</code></pre>
 
-        <p>PG 19 Beta 1 实测结果（1M 行 customers 表）：</p>
+        <p>在 PG 19 Beta 1 的 1M 行 customers 表上：</p>
 
         <table>
             <thead>
@@ -146,7 +144,7 @@ FROM pg_stats
 WHERE tablename = 'customers' AND attname = 'state'
 LIMIT 8;</code></pre>
 
-        <p>PG 19 Beta 1 实测（造数据时把 5 个州各设 6.5%）：</p>
+        <p>PG 19 Beta 1 上的 MCV 输出（造数据时把 5 个州各设 6.5%）：</p>
 
         <table>
             <thead><tr><th>state</th><th>frequency</th></tr></thead>
@@ -189,7 +187,7 @@ FROM pg_stats
 WHERE tablename = 'customers' AND attname = 'signup_date'
 LIMIT 8;</code></pre>
 
-        <p>PG 19 Beta 1 实测（默认 STATISTICS=100）：</p>
+        <p>PG 19 Beta 1 上的直方图输出（默认 STATISTICS=100）：</p>
 
         <pre><code>bucket_bound
 ─────────────
@@ -209,7 +207,7 @@ LIMIT 8;</code></pre>
 <pre><code>ALTER TABLE customers ALTER COLUMN signup_date SET STATISTICS 1000;
 ANALYZE customers;</code></pre>
 
-        <p>实测结果（同样前 8 个桶）：</p>
+        <p>同样前 8 个桶：</p>
 
         <pre><code>bucket_bound
 ─────────────
@@ -246,7 +244,7 @@ ANALYZE customers;</code></pre>
 
         <h2>核心机制 4：Correlation —— 物理顺序的"提示"</h2>
 
-        <p>回到我们的实测数据：</p>
+        <p>回到 1M 数据集：</p>
 
         <ul>
             <li><code>id</code>：correlation = <strong>1.0</strong>（bigserial 顺序插入，物理 = 逻辑）</li>
@@ -274,13 +272,13 @@ ANALYZE customers;</code></pre>
 
         <p>但 Cheyenne 99% 都在 Wyoming。这假设在地理数据上是假的。</p>
 
-        <h3>5.2 实测：50000 行 vs 估算偏差</h3>
+        <h3>5.2 50000 行 vs 估算偏差</h3>
 
         <p>我们造数据时设计：<code>Cheyenne</code> 99% 都在 <code>WY</code>。查询：</p>
 
 <pre><code>EXPLAIN ANALYZE SELECT * FROM customers WHERE city = 'Cheyenne' AND state = 'WY';</code></pre>
 
-        <p><strong>4a. 没有多列统计时</strong>（PG 19 Beta 1 实测）：</p>
+        <p><strong>4a. 没有多列统计时</strong>（PG 19 Beta 1）：</p>
 
         <pre><code>Bitmap Heap Scan on customers
   (cost=1250.18..6959.86 rows=3167 width=24)
@@ -295,7 +293,7 @@ ANALYZE customers;</code></pre>
     ON city, state FROM customers;
 ANALYZE customers;</code></pre>
 
-        <p><strong>4b. 创建多列统计后</strong>（PG 19 Beta 1 实测）：</p>
+        <p><strong>4b. 创建多列统计后</strong>（PG 19 Beta 1）：</p>
 
         <pre><code>Bitmap Heap Scan on customers
   (cost=1349.24..7376.84 rows=52767 width=24)
@@ -466,9 +464,9 @@ ANALYZE customers;</code></pre>
 
         <hr>
 
-        <h2>PG 19 vs PG 16 实测差异：Bitmap Heap Scan 成为主流</h2>
+        <h2>PG 19 vs PG 16 行为差异：Bitmap Heap Scan 成为主流</h2>
 
-        <p>注意：Richard 演讲里 CA（17%）走的是 <code>Seq Scan</code>，但我 PG 19 Beta 1 1M 数据实测时 CA（6.5%）走的是 <code>Bitmap Heap Scan</code>。</p>
+        <p>注意：Richard 演讲里 CA（17%）走的是 <code>Seq Scan</code>，但 PG 19 Beta 1 的 1M 数据上 CA（6.5%）走的是 <code>Bitmap Heap Scan</code>。</p>
 
         <p>原因：</p>
         <ul>
@@ -478,53 +476,6 @@ ANALYZE customers;</code></pre>
         </ul>
 
         <p><strong>结论</strong>：在 PG 19 上，"没有索引时 Seq Scan"是常规；但只要有索引，规划器经常选 Bitmap Heap Scan 而不是 Index Scan。这是好事——现代硬件下 Bitmap 通常更快。</p>
-
-        <hr>
-
-        <h2>和木木武器库已有沉淀的关联</h2>
-
-        <table>
-            <thead>
-                <tr><th>已有沉淀</th><th>本文补充</th></tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>default_statistics_target 详解（2026-06-12）</td>
-                    <td>实测桶宽 17天 → 2天 提升 8.5 倍</td>
-                </tr>
-                <tr>
-                    <td>CREATE STATISTICS 武器库 6.1</td>
-                    <td>实测 15.8x → 1.05x 的精度跃升</td>
-                </tr>
-                <tr>
-                    <td>优化器双轴评估（2026-06-11）</td>
-                    <td>统计质量 = 搜索精度的关键变量</td>
-                </tr>
-                <tr>
-                    <td>PG Weekly #652 解读</td>
-                    <td>补 n_distinct = -1 的含义（人类少知的 PG 内部约定）</td>
-                </tr>
-            </tbody>
-        </table>
-
-        <hr>
-
-        <h2>SQL 验证状态（实事求是）</h2>
-
-        <table>
-            <thead>
-                <tr><th>环境</th><th>状态</th><th>实测时间</th></tr>
-            </thead>
-            <tbody>
-                <tr><td>PostgreSQL 19 Beta 1</td><td>✅ 全部 5 个 SQL 通过</td><td>2026-06-23</td></tr>
-                <tr><td>PostgreSQL 16.11</td><td>⏳ 当前无环境，待老木提供实例后补</td><td>—</td></tr>
-                <tr><td>PostgreSQL 16.14</td><td>⏳ 当前无环境，待老木提供实例后补</td><td>—</td></tr>
-            </tbody>
-        </table>
-
-        <p>本博客涉及的所有 SQL（pg_stats 视图、MCV 展开、CREATE STATISTICS、SET STATISTICS 等）均为 PG 10+ 稳定特性，<strong>在 PG 16.11 / 16.14 上必能运行</strong>。但因当前团队没有 16.x 测试环境，按博客发布铁律第 6 条「不先发后验」，等老木提供实例后补实测。</p>
-
-        <p>测试脚本：<code>scripts/test_pg_stats_blog.js</code>（已提交）</p>
 
         <hr>
 
