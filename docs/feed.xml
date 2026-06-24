@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Tue, 23 Jun 2026 10:50:00 +0800</lastBuildDate>
+    <lastBuildDate>Wed, 24 Jun 2026 09:20:00 +0800</lastBuildDate>
+    <item>
+      <title>dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device</title>
+      <link>https://hellomlb.github.io/pg-xsj/ops/dynamic-shared-memory-type.html</link>
+      <description>Docker 容器下 PG 并行查询报 No space left on device，根因不是磁盘满，是 Docker 默认 /dev/shm 仅 64MB 导致 POSIX 动态共享内存分配失败。本文拆解 POSIX shm → tmpfs → 容器默认 64MB 的完整根因链，给出 Docker/Docker Compose/Kubernetes 三套场景的正确修复方案 + 七种错误修法后果分析。所有 SQL 在 PG 16.11 和 16.14 上实测验证通过。</description>
+      <pubDate>Wed, 24 Jun 2026 09:20:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/ops/dynamic-shared-memory-type.html</guid>
+    </item>
     <item>
       <title>pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的</title>
       <link>https://hellomlb.github.io/pg-xsj/sql-optimize/pg-stats-planner-black-box.html</link>

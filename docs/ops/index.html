@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/ops/dynamic-shared-memory-type.html">dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-06-24">2026-06-24</time>
+            <span class="post-category ops">日常运维</span>
+        </div>
+        <p class="post-excerpt">Docker 容器下 PG 并行查询报 No space left on device，根因不是磁盘满，是 Docker 默认 /dev/shm 仅 64MB。本文拆解 POSIX shm → tmpfs → 容器默认 64MB 的完整根因链，给出 Docker/Docker Compose/Kubernetes 三套场景的正确修复方案，以及七种错误修法的后果分析。所有 SQL 在 PG 16.11 和 16.14 上实测验证通过。</p>
+        <a href="/pg-xsj/ops/dynamic-shared-memory-type.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/ops/patroni-silent-slot-deletion.html">Patroni 静默删除复制槽：一次数据迁移事故的技术拆解</a></h3>
         <div class="post-meta">
             <time datetime="2026-06-15">2026-06-15</time>
