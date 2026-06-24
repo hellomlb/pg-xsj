@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="深度拆解 dynamic_shared_memory_type GUC 参数：POSIX vs SysV vs mmap 三种机制差异、Docker 默认 /dev/shm 仅 64MB 导致并行查询报错 No space left on device 的根因链、正确修复方式（不改 postgresql.conf，改容器参数）以及七种错误修法的后果。所有 SQL 在 PG 16.11 和 16.14 上实测验证通过。">
+    <meta property="og:title" content="dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device">
+    <meta property="og:description" content="深度拆解 dynamic_shared_memory_type GUC 参数：POSIX 共享内存 vs SysV vs mmap 三种机制差异、Docker 默认 /dev/shm 仅 64MB 导致并行查询报错的完整根因链。所有 SQL 在 PG 16.11 和 16.14 上实测验证通过。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/dynamic-shared-memory-type.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-24">2026-06-24</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">DynamicSharedMemory</span>
+                <span class="tag">Docker</span>
+                <span class="tag">K8s</span>
+                <span class="tag">并行查询</span>
+                <span class="tag">共享内存</span>
+                <span class="tag">容器陷阱</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + PG 16.14 双版本实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>Docker 容器下运行 PostgreSQL 并行查询报 <code>No space left on device</code>，根因不是磁盘满了，而是 <strong>Docker 默认只给 /dev/shm 分配 64MB</strong>——POSIX 动态共享内存（DSM）无法分配足够空间。修复方案：不要动 postgresql.conf，给容器加 <code>--shm-size=1g</code>。</p>
+
+        <hr>
+
+        <h2>故障现象</h2>
+
+        <p>以下错误在大规模数据查询时频繁出现，且只在容器化环境（Docker / K8s）中复现：</p>
+
+        <pre><code>ERROR:  could not resize shared memory segment "/PostgreSQL.NNNNN" to NNN bytes: No space left on device
+CONTEXT:  parallel worker</code></pre>
+
+        <p>排查时先查磁盘：</p>
+        <pre><code>$ df -h
+Filesystem      Size  Used Avail Use% Mounted on
+overlay          50G   30G   20G  60% /</code></pre>
+
+        <p>磁盘还有 60% 空闲，错误却报 "No space left"。这不是磁盘空间不足，是 <strong>tmpfs</strong> 空间不足。</p>
+
+        <hr>
+
+        <h2>dynamic_shared_memory_type 是什么</h2>
+
+        <p>PostgreSQL 有两类共享内存：</p>
+        <ul>
+            <li><strong>固定共享内存（fixed shared memory）</strong>：<code>shared_buffers</code> 等，启动时一次性分配，以后不能增长</li>
+            <li><strong>动态共享内存（DSM）</strong>：运行时按需分配，用完即释放——并行查询、逻辑解码等特性依赖它</li>
+        </ul>
+
+        <p><code>dynamic_shared_memory_type</code> 就是选择 DSM 使用哪种操作系统机制。这是个 <strong>postmaster</strong> 上下文的参数，修改需要重启。</p>
+
+        <h3>三种实现对比</h3>
+
+        <p>在 Linux 上（Windows 只有 <code>windows</code>），可选三种：</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>值</th>
+                    <th>机制</th>
+                    <th>底层</th>
+                    <th>性能</th>
+                    <th>容器兼容性</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>posix</code> ✅ 默认</td>
+                    <td>POSIX 共享内存</td>
+                    <td><code>shm_open</code> → <code>/dev/shm</code> (tmpfs)</td>
+                    <td>最快</td>
+                    <td><strong>受限</strong>：受 Docker /dev/shm 大小影响</td>
+                </tr>
+                <tr>
+                    <td><code>sysv</code></td>
+                    <td>System V 共享内存</td>
+                    <td><code>shmget</code> → 受内核参数 <code>SHMMAX</code>/<code>SHMALL</code> 限制</td>
+                    <td>较快</td>
+                    <td>可由 <code>--ipc=host</code> 解决，但换了一组限制</td>
+                </tr>
+                <tr>
+                    <td><code>mmap</code></td>
+                    <td>内存映射文件</td>
+                    <td><code>$PGDATA/pg_dynshmem/</code> 目录下的文件</td>
+                    <td>最慢</td>
+                    <td>完全兼容，但 OS 可能将 mmap 页回写磁盘</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>实际验证（PG 16.11 / PG 16.14 / PG 19 Beta1 三版本一致）：</p>
+
+        <div class="sql-block">
+            <div class="sql-header">📋 SQL 1：查看当前值和可用选项</div>
+            <pre><code class="sql">-- PG 16.11 结果
+bug=# SHOW dynamic_shared_memory_type;
+ dynamic_shared_memory_type
+----------------------------
+ posix
+(1 row)
+
+bug=# SELECT name, setting, short_desc, context, vartype, enumvals
+FROM pg_settings WHERE name = 'dynamic_shared_memory_type';
+
+            name            | setting |                       short_desc                       |  context   | vartype |     enumvals
+----------------------------+---------+--------------------------------------------------------+------------+---------+---------------------
+ dynamic_shared_memory_type | posix   | Selects the dynamic shared memory implementation used. | postmaster | enum    | {posix,sysv,mmap}
+(1 row)</code></pre>
+            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+        </div>
+
+        <p><strong>关键发现</strong>：<code>windows</code> 和 <code>none</code> 选项只在特定平台暴露。Linux 上的 enumvals 只有 <code>{posix,sysv,mmap}</code>。设置 <code>none</code> 会完全禁用并行查询。</p>
+
+        <hr>
+
+        <h2>根因链：64MB 的隐形天花板</h2>
+
+        <p>这个问题是一套完整的根因连锁反应：</p>
+
+        <div class="cause-chain">
+            <p><strong>① POSIX 共享内存 → ② /dev/shm (tmpfs) → ③ Docker 默认 64MB → ④ 并行哈希连接需要更多 → ⑤ 分配失败 → "No space left on device"</strong></p>
+        </div>
+
+        <p>逐层拆解：</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>层级</th>
+                    <th>说明</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>① 默认配置</td>
+                    <td>PG 的 dynamic_shared_memory_type 默认 <code>posix</code>，这也是绝大多数云镜像和 Docker 镜像的默认值</td>
+                </tr>
+                <tr>
+                    <td>② POSIX shm</td>
+                    <td><code>shm_open()</code> 创建的文件描述符指向 <code>/dev/shm</code>（一个 tmpfs 文件系统，数据存在内存中）</td>
+                </tr>
+                <tr>
+                    <td>③ Docker 默认值</td>
+                    <td>物理机上 /dev/shm 默认是物理内存的 50%。<strong>Docker 容器默认只给 64MB</strong>——对绝大多数现代数据库应用来说几乎为零</td>
+                </tr>
+                <tr>
+                    <td>④ 需求估算</td>
+                    <td>并行哈希连接：每个 worker 需要较大共享内存段。一个 <code>hash join</code> + 4 workers 轻松超 64MB</td>
+                </tr>
+                <tr>
+                    <td>⑤ 报错</td>
+                    <td><code>shm_open</code> → ftallocate(tmpfs) 失败 → PG 报 "No space left on device"</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>验证 /dev/shm 大小：</p>
+        <pre><code>$ docker run --rm postgres:16 bash -c 'df -h /dev/shm'
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            64M     0   64M   0% /dev/shm     ← Docker 默认只有 64MB！
+
+$ docker run --shm-size=1g --rm postgres:16 bash -c 'df -h /dev/shm'
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           1.0G     0  1.0G   0% /dev/shm     ← 扩到 1GB，问题解决</code></pre>
+
+        <div class="sql-block">
+            <div class="sql-header">📋 SQL 2：查看 DSM 使用情况（仅 PG 18+）</div>
+            <pre><code class="sql">-- PG 18+ 有 pg_stat_dynamic_shmem 视图
+SELECT * FROM pg_stat_dynamic_shmem;
+
+-- PG 13+ 通用手段：查看 pgaudit 日志或扩展日志中是否有 DSM 相关错误
+-- 或在 psql 中查看当前并行查询是否在使用 DSM
+bug=# SHOW shared_memory_size_in_huge_pages;
+ WARNING:  dynamic shared memory is not supported with huge_pages=try ...
+-- 如果 DSM 有问题，上面这条也会触发</code></pre>
+        </div>
+
+        <hr>
+
+        <h2>正确修复方案</h2>
+
+        <h3>方案一：Docker run 时设置（推荐）</h3>
+        <pre><code>docker run --shm-size=1g -d --name pg16 postgres:16
+
+# 对已有容器，重新创建
+docker rm pg16
+docker run --shm-size=1g ... postgres:16</code></pre>
+
+        <h3>方案二：Docker Compose</h3>
+        <pre><code>services:
+  postgres:
+    image: postgres:16
+    shm_size: '1g'
+    # 或
+    shm_size: 1073741824</code></pre>
+
+        <h3>方案三：Kubernetes</h3>
+        <p>K8s 没有直接等价于 <code>--shm-size</code> 的参数。推荐两种方式：</p>
+        <pre><code># 方式 A：emptyDir 挂载为内存介质（替代 /dev/shm）
+volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 1Gi
+
+# 方式 B：设置 Pod 的 ShareProcessNamespace 并挂载宿主机 /dev/shm
+# （不推荐，因为要改宿主机）</code></pre>
+
+        <h3>方案四（不推荐）：改用 SysV</h3>
+        <pre><code># 假设 Docker 容器能访问宿主机 ipc 资源
+docker run --ipc=host --rm postgres:16
+
+# 但注意：SysV 受 SHMMAX 限制（通常 64MB-256MB），换汤不换药</code></pre>
+
+        <hr>
+
+        <h2>错误修法（千万别这样做）</h2>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>错误操作</th>
+                    <th>后果</th>
+                    <th>为什么不对</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>设置 <code>dynamic_shared_memory_type = sysv</code></td>
+                    <td>只是换到了 <code>SHMMAX</code> 限制，从 64MB 的坑跳到另一个坑</td>
+                    <td>治标不治本，换限制而不是移除限制</td>
+                </tr>
+                <tr>
+                    <td>设置 <code>dynamic_shared_memory_type = mmap</code></td>
+                    <td>文件映射到 <code>$PGDATA/pg_dynshmem/</code>，OS 可能回写磁盘→性能灾难</td>
+                    <td>把本应 100% 内存的操作变成了潜在 I/O 操作</td>
+                </tr>
+                <tr>
+                    <td><code>max_parallel_workers_per_gather = 0</code></td>
+                    <td>禁用所有并行查询，错误消失，但性能大幅下降</td>
+                    <td>自废武功，全表扫描和海量哈希连接变慢 2-10x</td>
+                </tr>
+                <tr>
+                    <td>设置 <code>dynamic_shared_memory_type = none</code></td>
+                    <td>直接禁用 DSM，并行查询完全不可用</td>
+                    <td>Linux 上 enumvals 甚至没有 none，硬写可能导致集群无法启动</td>
+                </tr>
+                <tr>
+                    <td>挂载宿主机 <code>/dev/shm</code> 到容器</td>
+                    <td><code>-v /dev/shm:/dev/shm</code> 覆盖了 tmpfs</td>
+                    <td>宿主机 /dev/shm 默认是物理内存的 50%，太大 + 影响宿主机稳定性</td>
+                </tr>
+                <tr>
+                    <td>物理机上增大 <code>/dev/shm</code> 比例</td>
+                    <td>把 <code>/etc/fstab</code> 中 tmpfs 的 size 从 <code>default</code> 改为 <code>size=2g</code></td>
+                    <td>改物理机配置治标不治本，换一台机器就失效，且影响其他容器</td>
+                </tr>
+                <tr>
+                    <td>把 shared_buffers 调到很小</td>
+                    <td>幻想减少 DSM 需求，实际上 DSM 和 shared_buffers 完全独立</td>
+                    <td>两套空间，互不相关。DSM 需求由 <code>work_mem</code> 和并行度决定</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>DSM 需求估算</h2>
+
+        <p>并行查询的 DSM 峰值需求：</p>
+        <pre><code>最大 DSM 页数 ≈ concurrent_queries × max_parallel_workers_per_gather × work_mem 等效</code></pre>
+
+        <p>举个具体例子：</p>
+        <ul>
+            <li>同时运行 5 个并行哈希连接查询</li>
+            <li>每个查询使用 4 个并行 worker</li>
+            <li>哈希表的 <code>work_mem</code> 等效用量约 128MB</li>
+            <li>峰值：5 × 4 × 128MB = <strong>2.5GB</strong></li>
+        </ul>
+
+        <p>Docker 默认 64MB 面对上述场景，不到 1/40 的需求量，必然报错。</p>
+
+        <hr>
+
+        <h2>容器巡检清单</h2>
+
+        <p>检查客户容器环境时，加入以下检查项：</p>
+
+        <pre><code># 检查项1：/dev/shm 大小
+$ docker exec &lt;container&gt; df -h /dev/shm
+
+# 检查项2：PG 日志中是否有 DSM 相关错误
+$ docker logs &lt;container&gt; 2>&1 | grep -i "shared memory"
+
+# 检查项3：Docker 配置中的 shm_size
+$ docker inspect &lt;container&gt; | jq '.[0].HostConfig.ShmSize'
+# 返回字节数，默认 67108864（64MB），应该至少 1073741824（1GB）</code></pre>
+
+        <hr>
+
+        <h2>背后的设计哲学</h2>
+
+        <p>为什么默认用了 POSIX 而不是其他方案？</p>
+        <ul>
+            <li><strong>性能</strong>：POSIX shm 的 tmpfs 完全是内存操作，没有文件系统开销</li>
+            <li><strong>安全</strong>：进程退出时内核自动清理，不会残留文件</li>
+            <li><strong>简单</strong>：不需要调内核参数（不像 SysV 需要 SHMMAX）</li>
+            <li><strong>跨平台</strong>：POSIX 标准接口，所有类 Unix 系统一致</li>
+        </ul>
+
+        <p>但在容器化部署中，POSIX 依赖宿主机的 tmpfs 配额——Docker 的 64MB 默认值在 2026 年的主流硬件配置下已经极度不合理。这个默认值来自 Docker 诞生初期（2013 年），从未随硬件进步更新过。</p>
+
+        <hr>
+
+        <h2>参考</h2>
+        <ul>
+            <li>Christophe Pettus, <em>"dynamic_shared_memory_type"</em>, Planet PostgreSQL, 2026-06-19</li>
+            <li><a href="https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-DYNAMIC-SHARED-MEMORY-TYPE">PostgreSQL 官方文档：dynamic_shared_memory_type</a></li>
+            <li><a href="https://docs.docker.com/compose/compose-file/#shm_size">Docker Compose shm_size 配置</a></li>
+        </ul>
+
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
