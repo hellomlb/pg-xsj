@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PG19 原生分区手术刀：SPLIT PARTITION / MERGE PARTITIONS 语法与实战 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PG19 新增 SPLIT PARTITION 和 MERGE PARTITIONS DDL，数据自动迁移，无需手工 DETACH+ATTACH+INSERT。本文在 PG19 Beta1 上实测常规 SPLIT、DEFAULT 分区拆分（数据自动迁移）、一次拆分为 N 段、MERGE 合并、安全边界（不连续/重叠/范围不足全部被拒绝），并与旧方法做完整对比。">
+    <meta property="og:title" content="PG19 原生分区手术刀：SPLIT PARTITION / MERGE PARTITIONS 语法与实战">
+    <meta property="og:description" content="PG19 新增 SPLIT/MERGE PARTITION DDL，数据自动迁移，安全边界完善。在 PG19 Beta1 实测验证。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/pg19-split-merge-partition.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>PG19 原生分区手术刀：SPLIT PARTITION / MERGE PARTITIONS 语法与实战</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-29">2026-06-29</time>
+            <span class="post-category kernel">内核研究</span>
+            <span class="post-tags">
+                <span class="tag">PG19</span>
+                <span class="tag">Partition</span>
+                <span class="tag">SPLIT</span>
+                <span class="tag">MERGE</span>
+                <span class="tag">DDL</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 19 Beta1 实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>PG19 新增 <code>SPLIT PARTITION</code> 和 <code>MERGE PARTITIONS</code> 两条 DDL，<strong>数据自动迁移、索引自动重建、约束自动调整</strong>——从 5 步手工操作变成 1 条 SQL，且安全边界完善（不连续、重叠、范围不足全部被拒绝）。</p>
+
+        <hr>
+
+        <h2>旧方法痛点（PRE-PG19）</h2>
+
+        <p>在 PG18 及更早版本，要把一个分区拆成两个，你需要：</p>
+
+        <table>
+            <thead>
+                <tr><th>步骤</th><th>操作</th><th>风险</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>1</td><td><code>CREATE TABLE new_part ...</code></td><td>范围定义出错 → 数据无法插入</td></tr>
+                <tr><td>2</td><td><code>ALTER TABLE ... DETACH PARTITION old_part</code></td><td>DETACH 持有排他锁 → 阻塞所有读写</td></tr>
+                <tr><td>3</td><td><code>ALTER TABLE ... ATTACH PARTITION new_part</code></td><td>ATTACH 验证扫描 → 大分区耗时长</td></tr>
+                <tr><td>4</td><td><code>INSERT INTO new_part SELECT ... WHERE ...</code></td><td>手动迁移数据 → 可能漏行或重行</td></tr>
+                <tr><td>5</td><td><code>DROP TABLE old_part</code></td><td>误删 → 数据丢失</td></tr>
+            </tbody>
+        </table>
+
+        <p>5 步操作，每一步都可能出错，且 DETACH/ATTACH 需要排他锁。<strong>PG19 的 SPLIT/MERGE 把这 5 步封装成 1 条 SQL。</strong></p>
+
+        <hr>
+
+        <h2>SPLIT PARTITION 语法与实战</h2>
+
+        <h3>1. 常规 SPLIT（1 → 2）</h3>
+
+        <p>准备测试表和数据：</p>
+
+        <pre><code>-- 创建分区表
+CREATE TABLE orders (
+    id serial,
+    order_date date NOT NULL,
+    amount numeric(10,2),
+    region text
+) PARTITION BY RANGE (order_date);
+
+CREATE TABLE orders_2024 PARTITION OF orders
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE orders_2025 PARTITION OF orders
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+CREATE TABLE orders_2026 PARTITION OF orders
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+
+-- 插入 505 行数据
+INSERT INTO orders (order_date, amount, region)
+SELECT
+    '2025-01-01'::date + (mod(i,365)::int) * '1 day'::interval,
+    (random() * 1000)::numeric(10,2),
+    CASE mod(i, 4)
+        WHEN 0 THEN 'East'
+        WHEN 1 THEN 'West'
+        WHEN 2 THEN 'North'
+        ELSE 'South'
+    END
+FROM generate_series(1, 500) i;
+
+-- 2024、2026 各几行
+INSERT INTO orders (order_date, amount, region) VALUES
+    ('2024-06-15', 150, 'East'),
+    ('2024-08-20', 250, 'West'),
+    ('2024-03-10', 99, 'North'),
+    ('2026-02-10', 800, 'South'),
+    ('2026-07-01', 900, 'East');</code></pre>
+
+        <p>初始数据分布：</p>
+
+        <table>
+            <thead><tr><th>分区</th><th>行数</th></tr></thead>
+            <tbody>
+                <tr><td>orders_2024</td><td>3</td></tr>
+                <tr><td>orders_2025</td><td>500</td></tr>
+                <tr><td>orders_2026</td><td>2</td></tr>
+            </tbody>
+        </table>
+
+        <p>一条 SQL 拆分 2025 年为上半年和下半年：</p>
+
+        <pre><code>ALTER TABLE orders SPLIT PARTITION orders_2025 INTO (
+    PARTITION orders_2025_h1 FOR VALUES FROM ('2025-01-01') TO ('2025-07-01'),
+    PARTITION orders_2025_h2 FOR VALUES FROM ('2025-07-01') TO ('2026-01-01')
+);</code></pre>
+
+        <p>SPLIT 后数据自动按范围重新分布：</p>
+
+        <table>
+            <thead><tr><th>分区</th><th>行数</th></tr></thead>
+            <tbody>
+                <tr><td>orders_2024</td><td>3</td></tr>
+                <tr><td>orders_2025_h1</td><td>316</td></tr>
+                <tr><td>orders_2025_h2</td><td>184</td></tr>
+                <tr><td>orders_2026</td><td>2</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>500 行自动拆分，无需手工 INSERT。</strong></p>
+
+        <h3>2. DEFAULT 分区 SPLIT（数据自动迁移）</h3>
+
+        <p>DEFAULT 分区是最常见的 SPLIT 场景——新年度数据进入 DEFAULT 后，需要拆出专用分区。</p>
+
+        <pre><code>-- 先建一个只有 2024 + DEFAULT 的分区表
+CREATE TABLE orders2 (
+    id serial, order_date date NOT NULL, amount numeric(10,2)
+) PARTITION BY RANGE (order_date);
+
+CREATE TABLE orders2_2024 PARTITION OF orders2
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE orders2_default PARTITION OF orders2 DEFAULT;
+
+-- 2025 数据落入 DEFAULT
+INSERT INTO orders2 (order_date, amount) VALUES
+    ('2024-06-15', 100),
+    ('2024-08-20', 200),
+    ('2025-03-10', 300),
+    ('2025-07-22', 400),
+    ('2025-11-05', 500);</code></pre>
+
+        <p>拆分前数据分布——2025 年的数据全在 DEFAULT：</p>
+
+        <table>
+            <thead><tr><th>分区</th><th>数据</th></tr></thead>
+            <tbody>
+                <tr><td>orders2_2024</td><td>2024-06-15 ¥100, 2024-08-20 ¥200</td></tr>
+                <tr><td>orders2_default</td><td>2025-03-10 ¥300, 2025-07-22 ¥400, 2025-11-05 ¥500</td></tr>
+            </tbody>
+        </table>
+
+        <p>SPLIT DEFAULT 分区——<strong>注意最后一个分区必须显式写 <code>DEFAULT</code> 关键字</strong>：</p>
+
+        <pre><code>ALTER TABLE orders2 SPLIT PARTITION orders2_default INTO (
+    PARTITION orders2_2025 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'),
+    PARTITION orders2_default DEFAULT   -- ⚠️ 必须写 DEFAULT，不能省略
+);</code></pre>
+
+        <p>拆分后——2025 年数据自动迁移到新分区：</p>
+
+        <table>
+            <thead><tr><th>分区</th><th>数据</th></tr></thead>
+            <tbody>
+                <tr><td>orders2_2024</td><td>2024-06-15 ¥100, 2024-08-20 ¥200</td></tr>
+                <tr><td>orders2_2025</td><td>2025-03-10 ¥300, 2025-07-22 ¥400, 2025-11-05 ¥500</td></tr>
+                <tr><td>orders2_default</td><td>空（无不属于任何分区的数据）</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>关键语法提醒</strong>：SPLIT DEFAULT 分区时，如果想保留 DEFAULT 分区，最后一个子分区必须写 <code>DEFAULT</code> 关键字。如果只写分区名不写 <code>DEFAULT</code>，PG19 会报语法错误。</p>
+
+        <h3>3. 一次 SPLIT 为 N 段</h3>
+
+        <p>DEFAULT 分区可以一次拆成多个子分区——例如从 DEFAULT 拆出 4 个季度：</p>
+
+        <pre><code>ALTER TABLE sales SPLIT PARTITION sales_default INTO (
+    PARTITION sales_q1 FOR VALUES FROM ('2026-01-01') TO ('2026-04-01'),
+    PARTITION sales_q2 FOR VALUES FROM ('2026-04-01') TO ('2026-07-01'),
+    PARTITION sales_q3 FOR VALUES FROM ('2026-07-01') TO ('2026-10-01'),
+    PARTITION sales_q4 FOR VALUES FROM ('2026-10-01') TO ('2027-01-01'),
+    PARTITION sales_default DEFAULT
+);</code></pre>
+
+        <p>4 条数据自动按季度分布：</p>
+
+        <table>
+            <thead><tr><th>分区</th><th>数据</th></tr></thead>
+            <tbody>
+                <tr><td>sales_q1</td><td>2026-01-15 ¥100</td></tr>
+                <tr><td>sales_q2</td><td>2026-04-20 ¥200</td></tr>
+                <tr><td>sales_q3</td><td>2026-07-10 ¥300</td></tr>
+                <tr><td>sales_q4</td><td>2026-10-05 ¥400</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>MERGE PARTITIONS 语法与实战</h2>
+
+        <h3>合并两个分区</h3>
+
+        <pre><code>-- 将上半年 + 下半年合并回完整的 2025 分区
+ALTER TABLE orders MERGE PARTITIONS (orders_2025_h1, orders_2025_h2)
+    INTO orders_2025;</code></pre>
+
+        <p>合并后数据分布恢复如初：</p>
+
+        <table>
+            <thead><tr><th>分区</th><th>行数</th></tr></thead>
+            <tbody>
+                <tr><td>orders_2024</td><td>3</td></tr>
+                <tr><td>orders_2025</td><td>500</td></tr>
+                <tr><td>orders_2026</td><td>2</td></tr>
+            </tbody>
+        </table>
+
+        <h3>索引与约束行为</h3>
+
+        <p>MERGE 后，原分区上的索引自动重建到合并分区上：</p>
+
+        <pre><code>-- 在分区上建索引
+CREATE INDEX mt_idx1 ON mt_p1 (x);
+CREATE INDEX mt_idx2 ON mt_p2 (id);
+
+-- MERGE
+ALTER TABLE mt MERGE PARTITIONS (mt_p1, mt_p2) INTO mt_p1_p2;</code></pre>
+
+        <p>合并后索引自动迁移：</p>
+
+        <table>
+            <thead><tr><th>合并前</th><th>合并后</th></tr></thead>
+            <tbody>
+                <tr><td>mt_p1 → mt_idx1</td><td>mt_p1_p2 → mt_idx1（自动重建）</td></tr>
+                <tr><td>mt_p2 → mt_idx2</td><td>mt_p1_p2 → mt_idx2（自动重建）</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>安全边界（错误场景实测）</h2>
+
+        <p>PG19 对 SPLIT/MERGE 的安全校验非常严格。以下三种非法操作全部被拒绝：</p>
+
+        <h3>❌ 不连续范围</h3>
+
+        <pre><code>ALTER TABLE bad SPLIT PARTITION bad_p1 INTO (
+    PARTITION bad_a FOR VALUES FROM (1) TO (50),
+    PARTITION bad_b FOR VALUES FROM (60) TO (100)
+);
+-- ERROR: cannot split to partition 'bad_b' together with partition 'bad_a'</code></pre>
+
+        <p>1-50 和 60-100 有个 10 的间隙（50-60），SPLIT 拒绝。</p>
+
+        <h3>❌ 重叠范围</h3>
+
+        <pre><code>ALTER TABLE bad SPLIT PARTITION bad_p1 INTO (
+    PARTITION bad_a FOR VALUES FROM (1) TO (60),
+    PARTITION bad_b FOR VALUES FROM (50) TO (100)
+);
+-- ERROR: cannot split to partition 'bad_b' together with partition 'bad_a'</code></pre>
+
+        <p>1-60 和 50-100 有重叠区间（50-60），SPLIT 拒绝。</p>
+
+        <h3>❌ 范围无法覆盖所有数据</h3>
+
+        <pre><code>-- 原分区范围 1-100，数据包含 x=90
+ALTER TABLE t3 SPLIT PARTITION t3_p1 INTO (
+    PARTITION t3_a FOR VALUES FROM (1) TO (50),
+    PARTITION t3_b FOR VALUES FROM (50) TO (80)   -- 80 ≠ 100
+);
+-- ERROR: upper bound of partition 't3_b' is not equal to upper bound
+--        of split partition 't3_p1'</code></pre>
+
+        <p>SPLIT 后的子分区范围 <strong>必须精确覆盖</strong> 原分区的整个范围。上界不能少也不能多。</p>
+
+        <hr>
+
+        <h2>新旧方法对比</h2>
+
+        <table>
+            <thead>
+                <tr><th>维度</th><th>SPLIT/MERGE（PG19）</th><th>DETACH/ATTACH（旧方法）</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>操作步骤</td><td>1 条 SQL</td><td>5 步手工操作</td></tr>
+                <tr><td>数据迁移</td><td>自动，无漏行风险</td><td>手动 INSERT，可能漏行/重行</td></tr>
+                <tr><td>索引重建</td><td>自动</td><td>手动重建或 ATTACH 时重建</td></tr>
+                <tr><td>约束调整</td><td>自动</td><td>手动检查</td></tr>
+                <tr><td>排他锁持有时间</td><td>SPLIT/MERGE 整体持有，但数据迁移在内</td><td>DETACH + ATTACH 各持有，加上 INSERT 时间</td></tr>
+                <tr><td>出错风险</td><td>低——安全边界完善</td><td>高——每步都可能出错</td></tr>
+                <tr><td>适用版本</td><td>PG19+</td><td>PG10+（所有版本）</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>限制与注意事项</h2>
+
+        <ul>
+            <li><strong>必须同父表下</strong>：MERGE 的两个分区必须是同一个父表的直接子分区</li>
+            <li><strong>范围必须连续无重叠</strong>：SPLIT 的子分区范围必须精确覆盖原分区，无间隙无重叠</li>
+            <li><strong>仅 RANGE 分区</strong>：目前 SPLIT/MERGE 仅支持 RANGE 分区（LIST/HASH 暂不支持）</li>
+            <li><strong>排他锁</strong>：SPLIT/MERGE 是 DDL 操作，需要排他锁，大分区操作期间阻塞读写</li>
+            <li><strong>DEFAULT 关键字</strong>：SPLIT DEFAULT 分区时，保留的 DEFAULT 子分区必须显式写 <code>DEFAULT</code> 关键字</li>
+            <li><strong>子分区名可复用</strong>：MERGE INTO 的目标分区名可以与原分区名相同（如 MERGE h1+h2 INTO p1）</li>
+        </ul>
+
+        <hr>
+
+        <h2>总结</h2>
+
+        <p>PG19 的 SPLIT/MERGE PARTITION 是分区管理的<strong>手术刀级</strong>改进：</p>
+
+        <ul>
+            <li>从 5 步手工操作 → 1 条 SQL</li>
+            <li>数据自动迁移，无漏行风险</li>
+            <li>索引自动重建，约束自动调整</li>
+            <li>安全边界完善：不连续、重叠、范围不足全部被拒绝</li>
+            <li>DEFAULT 分区拆分是最常见的实战场景——新年度数据进入 DEFAULT 后，一条 SPLIT 即可拆出专用分区</li>
+        </ul>
+
+        <p><strong>迁移建议</strong>：升级到 PG19 后，所有分区拆分/合并操作优先使用 SPLIT/MERGE，不再使用 DETACH+ATTACH 手工流程。</p>
+
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

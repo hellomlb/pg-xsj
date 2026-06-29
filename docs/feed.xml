@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Sun, 29 Jun 2026 09:50:00 +0800</lastBuildDate>
+    <lastBuildDate>Sun, 29 Jun 2026 10:20:00 +0800</lastBuildDate>
+    <item>
+      <title>PG19 原生分区手术刀：SPLIT PARTITION / MERGE PARTITIONS 语法与实战</title>
+      <link>https://hellomlb.github.io/pg-xsj/kernel/pg19-split-merge-partition.html</link>
+      <description>PG19 新增 SPLIT PARTITION 和 MERGE PARTITIONS DDL，数据自动迁移、索引自动重建、约束自动调整。DEFAULT 分区拆分数据自动迁移，安全边界完善（不连续/重叠/范围不足全部被拒绝）。在 PG19 Beta1 实测验证通过。</description>
+      <pubDate>Sun, 29 Jun 2026 10:20:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/pg19-split-merge-partition.html</guid>
+    </item>
     <item>
       <title>并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果</title>
       <link>https://hellomlb.github.io/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html</link>

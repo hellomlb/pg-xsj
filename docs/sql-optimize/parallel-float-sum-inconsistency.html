@@ -6,9 +6,9 @@
     <title>并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。本文从 IEEE 754 非结合律到 Worker 动态分块与部分和合并顺序的不确定性，完整拆解并行浮点 SUM 不一致的根因链。所有数据在 PG 16.11 和 PG 16.14 上实测验证通过。">
+    <meta name="description" content="double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。本文从 IEEE 754 非结合律到 Worker 动态分块与部分和合并顺序的不确定性，完整拆解并行浮点 SUM 不一致的根因链。所有数据在 PG 16.11 和 PG 16.14 和 PG 19 Beta1 上实测验证通过。">
     <meta property="og:title" content="并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果">
-    <meta property="og:description" content="double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。本文从 IEEE 754 非结合律到 Worker 动态分块的不确定性，完整拆解根因链。所有数据在 PG 16.11 和 PG 16.14 上实测验证通过。">
+    <meta property="og:description" content="double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。本文从 IEEE 754 非结合律到 Worker 动态分块的不确定性，完整拆解根因链。所有数据在 PG 16.11 和 PG 16.14 和 PG 19 Beta1 上实测验证通过。">
     <meta property="og:type" content="article">
     <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html">
 </head>
@@ -39,7 +39,7 @@
                 <span class="tag">SUM</span>
             </span>
         </div>
-        <div class="verified-badge">✅ 已验证版 · PG 16.11 + PG 16.14 双版本实测</div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + PG 16.14 + PG 19 Beta1 三版本实测</div>
     </header>
 
     <div class="post-content">
@@ -127,11 +127,42 @@
             </tbody>
         </table>
 
-        <p><strong>关键对比</strong>：</p>
+        <h3>PG 19 Beta1（端口 10190）</h3>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>执行次数</th>
+                    <th>并行 SUM (float8)</th>
+                    <th>串行 SUM (float8)</th>
+                    <th>并行 SUM (numeric)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>1</td>
+                    <td style="color: #e53e3e;">1000000900495406600</td>
+                    <td>1000000900495200800</td>
+                    <td rowspan="3">1000000900495428540.75279313865464242</td>
+                </tr>
+                <tr>
+                    <td>2</td>
+                    <td style="color: #e53e3e;">1000000900495402400</td>
+                    <td>1000000900495200800</td>
+                </tr>
+                <tr>
+                    <td>3</td>
+                    <td style="color: #e53e3e;">1000000900495413200</td>
+                    <td>1000000900495200800</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p><strong>关键对比</strong>（PG16.11 / PG16.14 / PG19 Beta1 三版本一致）：</p>
         <ul>
-            <li><strong>并行 float8</strong>：每次不同，波动不可预测</li>
+            <li><strong>并行 float8</strong>：每次不同，波动不可预测。PG19 上同样复现，说明<em>这不是 PG 版本的 bug，而是 IEEE 754 + 并行聚合的固有特性</em></li>
             <li><strong>串行 float8</strong>：稳定但精度有限——与 true value（numeric 结果）仍有差异</li>
-            <li><strong>并行 numeric</strong>：稳定且精确——并行与否，结果始终一致</li>
+            <li><strong>并行 numeric</strong>：稳定且精确——并行与否，结果始终一致，跨越三个大版本</li>
         </ul>
 
         <hr>
