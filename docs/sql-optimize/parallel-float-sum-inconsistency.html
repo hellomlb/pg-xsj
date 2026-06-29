@@ -53,7 +53,7 @@
 
         <p>对一张 1000 行的大值+小值混合的 float8 表执行 <code>SUM</code>，启用并行后连续 5 次执行得到 5 个不同值。而在 <code>numeric</code> 列或串行模式下，结果是稳定的。</p>
 
-        <h3>PG 16.14（端口 11614）</h3>
+        <h3>PG 16.14</h3>
 
         <table>
             <thead>
@@ -96,7 +96,7 @@
 
         <p>并行 float8 的结果在 <code>1000000900494626600</code> ~ <code>1000000900494648000</code> 之间波动，差异约 2.1 × 10⁴（相对误差约 2 × 10⁻¹⁴）。</p>
 
-        <h3>PG 16.11（端口 11611）</h3>
+        <h3>PG 16.11</h3>
 
         <table>
             <thead>
@@ -127,7 +127,7 @@
             </tbody>
         </table>
 
-        <h3>PG 19 Beta1（端口 10190）</h3>
+        <h3>PG 19 Beta1</h3>
 
         <table>
             <thead>
@@ -250,7 +250,7 @@ FROM generate_series(1, 1000) AS i;
 -- 同时创建 numeric 列版本用于对照
 ALTER TABLE float_sum_test ADD COLUMN amount_numeric numeric;
 UPDATE float_sum_test SET amount_numeric = amount::numeric;</code></pre>
-            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+            <div class="sql-verified">✅ PG 16.11 + PG 16.14 + PG 19 Beta1 三版本实测通过</div>
         </div>
 
         <h3>数据构造策略</h3>
@@ -307,7 +307,7 @@ SELECT SUM(amount)::text FROM float_sum_test;
 SELECT SUM(amount)::text FROM float_sum_test;
 SELECT SUM(amount)::text FROM float_sum_test;
 SELECT SUM(amount)::text FROM float_sum_test;</code></pre>
-            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+            <div class="sql-verified">✅ PG 16.11 + PG 16.14 + PG 19 Beta1 三版本实测通过</div>
         </div>
 
         <p><strong>参数说明</strong>：<code>min_parallel_table_scan_size = '1kB'</code> 让优化器认为所有表都值得并行扫描。将 <code>parallel_setup_cost</code> 和 <code>parallel_tuple_cost</code> 设为 0 是为了让并行计划在成本估算中占据绝对优势。</p>
@@ -369,7 +369,7 @@ Finalize Aggregate
   ->  Gather (Workers Planned: 4)
         ->  Partial Aggregate
               ->  Parallel Seq Scan on float_sum_test</code></pre>
-            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+            <div class="sql-verified">✅ PG 16.11 + PG 16.14 + PG 19 Beta1 三版本实测通过</div>
         </div>
 
         <p><strong>执行流程</strong>：</p>
@@ -394,7 +394,7 @@ SELECT SUM(amount) FROM float_sum_test;
 -- 关键节点
 Aggregate
   ->  Seq Scan on float_sum_test</code></pre>
-            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+            <div class="sql-verified">✅ PG 16.11 + PG 16.14 + PG 19 Beta1 三版本实测通过</div>
         </div>
 
         <p>串行模式下只有一个进程按 B+Tree 顺序扫描所有行，加法顺序固定，所以结果稳定。</p>
