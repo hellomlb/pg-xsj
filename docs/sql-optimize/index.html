@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html">并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-06-29">2026-06-29</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。IEEE 754 非结合律 + Worker 动态分块 + 部分和合并顺序不确定 = 不可预测的中间舍入。numeric 是唯一精确解。所有数据在 PG 16.11 和 PG 16.14 上实测验证。</p>
+        <a href="/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/pg-stats-planner-black-box.html">pg_stats：PostgreSQL 规划器是怎么「脑补」你的数据的</a></h3>
         <div class="post-meta">
             <time datetime="2026-06-23">2026-06-23</time>

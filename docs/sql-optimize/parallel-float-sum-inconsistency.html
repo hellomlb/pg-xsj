@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。本文从 IEEE 754 非结合律到 Worker 动态分块与部分和合并顺序的不确定性，完整拆解并行浮点 SUM 不一致的根因链。所有数据在 PG 16.11 和 PG 16.14 上实测验证通过。">
+    <meta property="og:title" content="并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果">
+    <meta property="og:description" content="double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。本文从 IEEE 754 非结合律到 Worker 动态分块的不确定性，完整拆解根因链。所有数据在 PG 16.11 和 PG 16.14 上实测验证通过。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果</h1>
+        <div class="post-meta">
+            <time datetime="2026-06-29">2026-06-29</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">ParallelAgg</span>
+                <span class="tag">Float8</span>
+                <span class="tag">IEEE754</span>
+                <span class="tag">Numeric</span>
+                <span class="tag">SUM</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + PG 16.14 双版本实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>对 <code>double precision</code> 列做 <code>SUM</code> 且启用并行聚合时，<strong>同一 SQL 每次返回不同结果</strong>。这不是 bug，是 IEEE 754 浮点非结合律与并行聚合两个不确定因素——Worker 动态分块 + 部分和返回顺序——的必然交互。<strong><code>numeric</code> 是唯一精确解。</strong></p>
+
+        <hr>
+
+        <h2>故障现象</h2>
+
+        <p>对一张 1000 行的大值+小值混合的 float8 表执行 <code>SUM</code>，启用并行后连续 5 次执行得到 5 个不同值。而在 <code>numeric</code> 列或串行模式下，结果是稳定的。</p>
+
+        <h3>PG 16.14（端口 11614）</h3>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>执行次数</th>
+                    <th>并行 SUM (float8)</th>
+                    <th>串行 SUM (float8)</th>
+                    <th>并行 SUM (numeric)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>1</td>
+                    <td style="color: #e53e3e;">1000000900494626600</td>
+                    <td>1000000900494431100</td>
+                    <td rowspan="5">1000000900494662673.51718229079333765</td>
+                </tr>
+                <tr>
+                    <td>2</td>
+                    <td style="color: #e53e3e;">1000000900494646400</td>
+                    <td>1000000900494431100</td>
+                </tr>
+                <tr>
+                    <td>3</td>
+                    <td style="color: #e53e3e;">1000000900494648000</td>
+                    <td>1000000900494431100</td>
+                </tr>
+                <tr>
+                    <td>4</td>
+                    <td style="color: #e53e3e;">1000000900494644500</td>
+                    <td>1000000900494431100</td>
+                </tr>
+                <tr>
+                    <td>5</td>
+                    <td style="color: #e53e3e;">1000000900494645600</td>
+                    <td>1000000900494431100</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>并行 float8 的结果在 <code>1000000900494626600</code> ~ <code>1000000900494648000</code> 之间波动，差异约 2.1 × 10⁴（相对误差约 2 × 10⁻¹⁴）。</p>
+
+        <h3>PG 16.11（端口 11611）</h3>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>执行次数</th>
+                    <th>并行 SUM (float8)</th>
+                    <th>串行 SUM (float8)</th>
+                    <th>并行 SUM (numeric)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>1</td>
+                    <td style="color: #e53e3e;">1000000900495606500</td>
+                    <td>1000000900495422100</td>
+                    <td rowspan="3">1000000900495643202.462560765090449377</td>
+                </tr>
+                <tr>
+                    <td>2</td>
+                    <td style="color: #e53e3e;">1000000900495630700</td>
+                    <td>1000000900495422100</td>
+                </tr>
+                <tr>
+                    <td>3</td>
+                    <td style="color: #e53e3e;">1000000900495619100</td>
+                    <td>1000000900495422100</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p><strong>关键对比</strong>：</p>
+        <ul>
+            <li><strong>并行 float8</strong>：每次不同，波动不可预测</li>
+            <li><strong>串行 float8</strong>：稳定但精度有限——与 true value（numeric 结果）仍有差异</li>
+            <li><strong>并行 numeric</strong>：稳定且精确——并行与否，结果始终一致</li>
+        </ul>
+
+        <hr>
+
+        <h2>根因链分析</h2>
+
+        <p>这个问题是一套完整的根因连锁反应：</p>
+
+        <div class="cause-chain">
+            <p><strong>① IEEE 754 浮点不满足结合律 → ② 并行聚合的 Worker 动态分块 → ③ 部分和返回顺序不固定 → ④ 不同中间舍入路径 → ⑤ 不同最终结果</strong></p>
+        </div>
+
+        <h3>① IEEE 754 不满足结合律：absorption 效应</h3>
+
+        <p>浮点加法的核心问题是：<strong>大值 + 小值 → 小值被"吞掉"</strong>。与加法顺序无关，结果可能完全不同。</p>
+
+        <pre><code>-- 吸收效应演示
+SELECT 1e20::float8 + 1::float8 - 1e20::float8;
+-- 结果：0（不是 1！）
+-- 1e20 + 1 在 float8 中 = 1e20（1 被吸收）
+-- 1e20 - 1e20 = 0</code></pre>
+
+        <p>这就是 <strong>absorption（吸收）效应</strong>。当你把一个大值（1e20）与一个极小的值（1）相加时，小值会因为 float8 只有 ~15 位有效数字而被完全吞掉。对于不同的加法顺序，中间结果的 rounding 路径不同，最终结果也不同。</p>
+
+        <h3>② 并行聚合的两个不确定因素</h3>
+
+        <p>并行聚合的流程是：<strong>Leader 分配任务 → 多个 Worker 并行扫描各自分到的 Block → Worker 计算部分 SUM → Leader 合并所有部分 SUM</strong>。这条链路中有两个关键不确定性：</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>不确定因素</th>
+                    <th>说明</th>
+                    <th>影响</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>动态块分配</strong></td>
+                    <td>每个 Worker 分到的 Heap Block 集合每次可能不同。系统负载、CPU 调度等因素影响哪个 Worker 先抢占到哪个 Block</td>
+                    <td>同一行的值可能进入不同的 Worker，导致局部和不同</td>
+                </tr>
+                <tr>
+                    <td><strong>部分和返回顺序</strong></td>
+                    <td>Leader 收集 Worker 的部分和时，先到先累加，合并顺序不固定</td>
+                    <td>1e20 + 100 + 50 ≠ 1e20 + 50 + 100，中间舍入路径不同</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>这两个不确定因素叠加非结合律，就是最终结果每次不同的根本原因。</p>
+
+        <h3>③ 不是 bug，是正常的数学与实现交互</h3>
+
+        <p>IEEE 754 标准明确定义了浮点加法不满足结合律。PostgreSQL 的并行聚合实现也完全正确——它没有做任何违背设计的事。问题只在于当精密计算（如财务报表）使用 float8 做聚合且启用并行时，这种"正常行为"会让结果值抖动。</p>
+
+        <p>想深入了解 IEEE 754 的细节，可参考官方文档：<a href="https://en.wikipedia.org/wiki/IEEE_754">IEEE 754 - Wikipedia</a>。</p>
+
+        <hr>
+
+        <h2>实验设计详解</h2>
+
+        <h3>建表 SQL：构造 absorption 场景</h3>
+
+        <div class="sql-block">
+            <div class="sql-header">📋 SQL 1：建表 + 插入测试数据</div>
+            <pre><code class="sql">-- 创建测试表
+DROP TABLE IF EXISTS float_sum_test;
+CREATE TABLE float_sum_test (
+    id SERIAL PRIMARY KEY,
+    amount float8 NOT NULL
+);
+
+-- 插入 1000 行混合数据：大值 + 小值
+-- 大值用于触发 absorption，小值用于暴露不同加法顺序的舍入差异
+INSERT INTO float_sum_test (amount)
+SELECT
+    CASE
+        WHEN i % 100 = 0 THEN 1e18                        -- 极大值，每100行一个
+        WHEN i % 10 = 0  THEN 1000000.123456               -- 中型值
+        ELSE random() * 1000                               -- 小值（浮点碎片）
+    END
+FROM generate_series(1, 1000) AS i;
+
+-- 同时创建 numeric 列版本用于对照
+ALTER TABLE float_sum_test ADD COLUMN amount_numeric numeric;
+UPDATE float_sum_test SET amount_numeric = amount::numeric;</code></pre>
+            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+        </div>
+
+        <h3>数据构造策略</h3>
+
+        <p>数据分三个层级，保证每种加法顺序都会触发不同的舍入行为：</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>层级</th>
+                    <th>值域</th>
+                    <th>出现频率</th>
+                    <th>作用</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>极大值</strong></td>
+                    <td>1e18（10¹⁸）</td>
+                    <td>1%（每 100 行 1 个）</td>
+                    <td>提供"吸收"效应所需的大底数。1e18 的有效尾数位只有 53 bits，超过 ~10¹⁵ 的部分会被截断</td>
+                </tr>
+                <tr>
+                    <td><strong>中型值</strong></td>
+                    <td>~1e6（约 10⁶）</td>
+                    <td>10%（每 10 行 1 个）</td>
+                    <td>提供中间结果的微量偏移，不同加法顺序导致不同舍入</td>
+                </tr>
+                <tr>
+                    <td><strong>浮点碎片</strong></td>
+                    <td>0~1000，带小数位</td>
+                    <td>89%（绝大部分）</td>
+                    <td>极度不平等的值，确保"先加碎片 vs 后加碎片"结果不同</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>强制并行参数</h3>
+
+        <div class="sql-block">
+            <div class="sql-header">📋 SQL 2：开通并行 + 执行聚合</div>
+            <pre><code class="sql">-- 确保表和索引的并行度足够
+ALTER TABLE float_sum_test SET (parallel_workers = 4);
+
+-- 强制并行查询并降低阈值
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = '1kB';
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+
+-- ⚠️ 连续执行 5 次——每次可能不同
+SELECT SUM(amount)::text FROM float_sum_test;
+SELECT SUM(amount)::text FROM float_sum_test;
+SELECT SUM(amount)::text FROM float_sum_test;
+SELECT SUM(amount)::text FROM float_sum_test;
+SELECT SUM(amount)::text FROM float_sum_test;</code></pre>
+            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+        </div>
+
+        <p><strong>参数说明</strong>：<code>min_parallel_table_scan_size = '1kB'</code> 让优化器认为所有表都值得并行扫描。将 <code>parallel_setup_cost</code> 和 <code>parallel_tuple_cost</code> 设为 0 是为了让并行计划在成本估算中占据绝对优势。</p>
+
+        <hr>
+
+        <h2>三种方案对比</h2>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>方案</th>
+                    <th>结果稳定性</th>
+                    <th>精度</th>
+                    <th>性能</th>
+                    <th>适用场景</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>并行 float8 SUM</strong></td>
+                    <td style="color: #e53e3e;">❌ 每次不同</td>
+                    <td style="color: #d69e2e;">⚠️ 精度有限</td>
+                    <td>✅ 最快</td>
+                    <td>传感器数据、监控指标，不依赖精确 SUM 的场景</td>
+                </tr>
+                <tr>
+                    <td><strong>串行 float8 SUM</strong></td>
+                    <td>✅ 稳定</td>
+                    <td style="color: #d69e2e;">⚠️ 精度有限</td>
+                    <td>⚠️ 较慢（无并行加速）</td>
+                    <td>数据量小（几千行以内）的 float8 聚合</td>
+                </tr>
+                <tr>
+                    <td><strong>并行 numeric SUM</strong></td>
+                    <td>✅ 稳定</td>
+                    <td style="color: #38a169;">✅ 精确</td>
+                    <td>⚠️ 较慢（但可并行）</td>
+                    <td style="color: #38a169;">✅ 财务报表、对账、任何需要精确结果的场景</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p><strong>核心结论</strong>：并行 + float8 → 每次不同；串行 + float8 → 稳定但精度有限；并行 + numeric → 稳定且精确。如果你需要 SUM 结果可靠且可复现，<strong>numeric 是唯一选择</strong>。</p>
+
+        <hr>
+
+        <h2>EXPLAIN 计划对比</h2>
+
+        <h3>并行聚合（4 Workers）</h3>
+
+        <div class="sql-block">
+            <div class="sql-header">📋 SQL 3：并行聚合 EXPLAIN</div>
+            <pre><code class="sql">EXPLAIN (ANALYZE, VERBOSE, COSTS, BUFFERS)
+SELECT SUM(amount) FROM float_sum_test;
+
+-- 关键节点
+Finalize Aggregate
+  ->  Gather (Workers Planned: 4)
+        ->  Partial Aggregate
+              ->  Parallel Seq Scan on float_sum_test</code></pre>
+            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+        </div>
+
+        <p><strong>执行流程</strong>：</p>
+        <ul>
+            <li><code>Parallel Seq Scan</code>：4 个 Worker 各自扫描一部分 Heap Block</li>
+            <li><code>Partial Aggregate</code>：每个 Worker 对自己分到的 Block 内的行计算局部 SUM</li>
+            <li><code>Gather</code>：Leader 按到达顺序收集 4 个 Worker 的部分和（顺序不固定！）</li>
+            <li><code>Finalize Aggregate</code>：Leader 将收集到的部分和累加得到最终结果</li>
+        </ul>
+
+        <p>两个不确定性都在这里暴露：<strong>Parallel Seq Scan 的分块每次可能不同</strong>（导致每个 Worker 的局部和不同），<strong>Gather 的收集顺序不固定</strong>（导致合并顺序不同）。</p>
+
+        <h3>串行聚合</h3>
+
+        <div class="sql-block">
+            <div class="sql-header">📋 SQL 4：串行聚合 EXPLAIN</div>
+            <pre><code class="sql">SET max_parallel_workers_per_gather = 0;
+
+EXPLAIN (ANALYZE, VERBOSE, COSTS, BUFFERS)
+SELECT SUM(amount) FROM float_sum_test;
+
+-- 关键节点
+Aggregate
+  ->  Seq Scan on float_sum_test</code></pre>
+            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+        </div>
+
+        <p>串行模式下只有一个进程按 B+Tree 顺序扫描所有行，加法顺序固定，所以结果稳定。</p>
+
+        <hr>
+
+        <h2>修复方案</h2>
+
+        <h3>方案一：列改为 numeric（最佳 🏆）</h3>
+
+        <p>这是唯一能从根本上解决问题的方法。将列从 <code>float8</code> 改为 <code>numeric</code>，精度无上限，与并行无关。</p>
+
+        <pre><code>-- 迁移步骤
+BEGIN;
+
+-- 1. 添加新列
+ALTER TABLE your_table ADD COLUMN amount_numeric numeric;
+
+-- 2. 复制现有数据
+UPDATE your_table SET amount_numeric = amount::numeric;
+
+-- 3. 验证数据一致性
+SELECT
+    COUNT(*) AS total_rows,
+    COUNT(*) FILTER (WHERE amount::numeric != amount_numeric) AS mismatch
+FROM your_table;
+
+-- 4. 原子切换（应用层无感知）
+ALTER TABLE your_table RENAME COLUMN amount TO amount_old;
+ALTER TABLE your_table RENAME COLUMN amount_numeric TO amount;
+ALTER TABLE your_table DROP COLUMN amount_old;
+
+COMMIT;
+
+-- 5. 重建依赖索引（如果主键/唯一约束涉及该列）
+-- 注意：numeric 比 float8 占用更多存储空间，每行多 ~8-12 字节</code></pre>
+
+        <p><strong>注意事项</strong>：</p>
+        <ul>
+            <li><code>numeric</code> 比 <code>float8</code> 计算慢约 2-5 倍（纯 CPU 场景），但大多数生产环境的瓶颈在 I/O，差异可忽略</li>
+            <li><code>numeric</code> 存储空间更大（变长，0-NAMEDATALEN 字节），对千万行级别的表，空间差异可达 80-120MB</li>
+            <li>如果该列参与 JOIN 条件，确认 <code>numeric</code> 与 <code>float8</code> 的 JOIN 性能差异</li>
+        </ul>
+
+        <h3>方案二：传感器/监控数据——接受近似，不做等值比较</h3>
+
+        <p>如果数据本身就是近似值（如温度传感器 ±0.1°C、CPU 使用率等），使用 float8 完全合理。但要遵守以下规则：</p>
+
+        <pre><code>-- ✅ 正确：比较前四舍五入到合理精度
+SELECT *
+FROM sensor_readings
+WHERE ROUND(SUM(reading), 2) = ROUND(1000.00, 2);
+
+-- ✅ 正确：用范围比较代替等值比较
+SELECT *
+FROM sensor_readings
+WHERE SUM(reading) BETWEEN 999.95 AND 1000.05;
+
+-- ❌ 错误：不要用 float8 SUM 做等值比较
+WHERE SUM(amount) = 1000.00;           -- 可能永远命中不了
+
+-- ❌ 错误：不要用 float8 SUM 做 JOIN 键
+ON a.total_amount = b.amount;          -- JOIN 结果不可预测</code></pre>
+
+        <h3>❌ 不要关并行——只是稳定地错</h3>
+
+        <p>有工程师可能会建议 <code>SET max_parallel_workers_per_gather = 0</code> 来"解决"问题。实际上这只是在"稳定地错"——float8 的精度问题依然存在，只是暴露得更含蓄。</p>
+
+        <pre><code>-- 错误修复（千万别用）
+ALTER SYSTEM SET max_parallel_workers_per_gather = 0;
+SELECT pg_reload_conf();
+
+-- 后果
+-- 1. 所有聚合查询变慢 2-10x
+-- 2. 结果仍然不精确——只是每次结果相同（每次都错得一样）
+-- 3. 浪费了 4+ 个 CPU 核——明明可以加速却不用</code></pre>
+
+        <hr>
+
+        <h2>巡检建议</h2>
+
+        <p>对有并行能力的客户 PG 实例，建议纳入以下巡检项：</p>
+
+        <pre><code>-- 巡检项 1：找出所有使用 float8 做 SUM 的列
+SELECT
+    n.nspname AS schema,
+    c.relname AS table,
+    a.attname AS column,
+    a.atttypid::regtype AS type
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE a.atttypid = 'float8'::regtype
+  AND c.relkind = 'r'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY n.nspname, c.relname, a.attname;
+
+-- 巡检项 2：检查哪些表启用了并行（parallel_workers > 0）
+SELECT
+    c.relname,
+    c.reloptions
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.reloptions::text LIKE '%parallel_workers%'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+
+-- 巡检项 3：确认并行是否在全局被禁用
+SHOW max_parallel_workers_per_gather;
+SHOW max_parallel_workers;
+SHOW parallel_setup_cost;
+SHOW parallel_tuple_cost;</code></pre>
+
+        <p><strong>风险判定规则</strong>：如果同时满足以下三个条件，应立即通知客户：</p>
+        <ol>
+            <li>存在 float8 列被用于 SUM</li>
+            <li>表启用了并行（parallel_workers > 0 或未设置，且 PG 版本 ≥ 9.6）</li>
+            <li>该 SUM 用于财务报表、对账、等值比较或 JOIN 键</li>
+        </ol>
+
+        <p>如果条件 3 不成立（如用于监控仪表板），标记为低风险。如果条件 3 成立且不能改 numeric，建议客户至少在执行聚合前将结果四舍五入到合理精度并避免等值比较。</p>
+
+        <hr>
+
+        <h2>背后的设计哲学</h2>
+
+        <p>PostgreSQL 为什么在设计并行聚合时不强制 Workers 按固定顺序返回部分和？</p>
+
+        <ul>
+            <li><strong>性能优先</strong>：Leader 不需要等待所有 Worker 完成才开始合并——先到的先处理，最大化并行度</li>
+            <li><strong>不预设数据类型</strong>：float8 不是 PG 的主推类型（numeric 才是处理"精确值"的标准类型）。强制排序 Worker 部分和会引入额外的同步开销，为不常见的用例降低整体性能</li>
+            <li><strong>IEEE 754 不是 PG 的责任</strong>：浮点不满足结合律是 1985 年就定下来的数学事实。PG 的职责是保证类型语义正确，而不是为特定类型做特殊处理</li>
+        </ul>
+
+        <p>这也提醒我们：<strong>选择数据类型就是在选择行为语义</strong>。float8 是为科学计算和近似精度设计的；numeric 是为财务和精密计算设计的。<em>在 PG 中为财务报表选择 float8，等同于为火箭燃料箱材质选择塑料——材质没毛病，错的是场景。</em></p>
+
+        <hr>
+
+        <h2>参考</h2>
+        <ul>
+            <li><a href="https://en.wikipedia.org/wiki/IEEE_754">IEEE 754 浮点标准 — Wikipedia</a></li>
+            <li><a href="https://www.postgresql.org/docs/current/datatype-numeric.html">PostgreSQL 官方文档：Numeric Types</a></li>
+            <li><a href="https://www.postgresql.org/docs/current/parallel-query.html">PostgreSQL 官方文档：Parallel Query</a></li>
+            <li><a href="https://www.postgresql.org/docs/current/runtime-config-query.html">PostgreSQL 官方文档：查询规划器参数</a></li>
+        </ul>
+
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

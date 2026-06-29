@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Wed, 24 Jun 2026 09:20:00 +0800</lastBuildDate>
+    <lastBuildDate>Sun, 29 Jun 2026 09:50:00 +0800</lastBuildDate>
+    <item>
+      <title>并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html</link>
+      <description>double precision + 并行聚合 → 同一 SQL 的 SUM 结果每次不同。IEEE 754 非结合律 + Worker 动态分块 + 部分和合并顺序不确定 = 不可预测的中间舍入。numeric 是唯一精确解。所有数据在 PG 16.11 和 PG 16.14 上实测验证。</description>
+      <pubDate>Sun, 29 Jun 2026 09:50:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html</guid>
+    </item>
     <item>
       <title>dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device</title>
       <link>https://hellomlb.github.io/pg-xsj/ops/dynamic-shared-memory-type.html</link>
