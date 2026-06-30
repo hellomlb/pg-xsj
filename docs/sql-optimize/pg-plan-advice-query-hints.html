@@ -155,7 +155,7 @@ SELECT * FROM my_fact f JOIN my_dim d ON f.dim_id = d.id;</code></pre>
 
         <p>建议语言（Plan Advice Domain Specific Language）共支持以下几类指令：</p>
 
-        <p class="verification-note">以下 Plan Advice DSL 语法在 PG19 Beta 1 实测验证通过（<code>110.41.133.39:10190</code>）。</p>
+        <p class="verification-note">以下 Plan Advice DSL 语法在 PG19 Beta 1 实测验证通过。</p>
 
         <h3>扫描方式</h3>
 
@@ -231,7 +231,7 @@ SET pg_plan_advice.feedback_warnings = true;</code></pre>
 
         <p>当你无法修改应用代码时（第三方 ORM、遗留系统、无法发版），<code>pg_stash_advice</code> 是终极手段——把建议按 <strong>query_id</strong> 持久化到数据库里，按数据库/角色粒度自动生效，应用层完全不感知。</p>
 
-        <p class="verification-note">以下 <code>pg_stash_advice</code> 函数在 PG19 Beta 1 实测验证通过（<code>110.41.133.39:10190</code>）。</p>
+        <p class="verification-note">以下 <code>pg_stash_advice</code> 函数在 PG19 Beta 1 实测验证通过。</p>
 
         <h3>基本工作流</h3>
 
