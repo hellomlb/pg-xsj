@@ -133,7 +133,7 @@ FROM pg_settings WHERE name = 'dynamic_shared_memory_type';
 ----------------------------+---------+--------------------------------------------------------+------------+---------+---------------------
  dynamic_shared_memory_type | posix   | Selects the dynamic shared memory implementation used. | postmaster | enum    | {posix,sysv,mmap}
 (1 row)</code></pre>
-            <div class="sql-verified">✅ PG 16.11 @ 11611 + PG 16.14 @ 11614 双版本实测通过</div>
+            <div class="sql-verified">✅ PG 16.11 + PG 16.14 双版本实测通过</div>
         </div>
 
         <p><strong>关键发现</strong>：<code>windows</code> 和 <code>none</code> 选项只在特定平台暴露。Linux 上的 enumvals 只有 <code>{posix,sysv,mmap}</code>。设置 <code>none</code> 会完全禁用并行查询。</p>
