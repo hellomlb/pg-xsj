@@ -1,9 +1,14 @@
-# 内部脚本 - 不上传 GitHub
-scripts/mm_pg_health_check.sh
-scripts/test_pg_stats_blog.js
+# 只推送 HTML 博客文章和必要配置文件
 
-# 内部知识库 - 不上传 GitHub
-docs/木木的武器库.md
+# 排除完整目录
+scripts/
+tech_news/
+pg_filedump/
+.workbuddy/
+.codebuddy/
+
+# 内部文档 - 排除所有 Markdown
+docs/**/*.md
 
 # 系统文件
 .DS_Store
