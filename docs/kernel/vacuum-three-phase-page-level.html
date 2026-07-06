@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VACUUM 三阶段与行指针生命周期：页面级别深度解析 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="VACUUM 对有索引的表分三个阶段执行：堆扫描修剪（回收元组字节）→索引清理（移除死TID）→堆清理（LP_DEAD→LP_UNUSED 仅回收4字节槽位）。本文通过 PG19 Beta1 pageinspect 直接观测 pd_upper 移动和行指针状态转换，拿到 Phase 1 回收元组字节、Phase 3 仅回收行指针槽位的页面级铁证。">
+    <meta property="og:title" content="VACUUM 三阶段与行指针生命周期：页面级别深度解析">
+    <meta property="og:description" content="Phase 3 只回收4字节行指针槽位，元组数据在 Phase 1 修剪时已回收。PG19 实测验证。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/vacuum-three-phase-page-level.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>VACUUM 三阶段与行指针生命周期：页面级别深度解析</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-06">2026-07-06</time>
+            <span class="post-category kernel">内核研究</span>
+            <span class="post-tags">
+                <span class="tag">VACUUM</span>
+                <span class="tag">page-level</span>
+                <span class="tag">LP_DEAD</span>
+                <span class="tag">heap_page_items</span>
+                <span class="tag">INDEX_CLEANUP</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 19 Beta1 实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>VACUUM 对有索引的表分<strong>三个阶段</strong>执行。最容易被误解的是 Phase 3（堆清理）：它<strong>只回收 4 字节的行指针槽位</strong>，元组数据在 Phase 1 修剪时就已经回收了。<code>VACUUM (INDEX_CLEANUP OFF)</code> 跳过 Phase 2 和 Phase 3，元组空间仍然被回收，但行指针槽位不会释放。</p>
+
+        <hr>
+
+        <h2>VACUUM 三阶段全景</h2>
+
+        <table>
+            <thead>
+                <tr><th>阶段</th><th>操作</th><th>回收内容</th><th>耗时</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Phase 1: 堆扫描</strong><br>Heap Scan</td>
+                    <td>调用 heap_page_prune_and_freeze<br>修剪死元组、整理页面碎片<br>机会性冻结、收集死 TID</td>
+                    <td>✅ <strong>元组字节</strong><br>（pd_upper 移动）<br>✅ 页面碎片整理</td>
+                    <td>与页面数和死元组数成正比</td>
+                </tr>
+                <tr>
+                    <td><strong>Phase 2: 索引清理</strong><br>Index Cleanup</td>
+                    <td>用死 TID 列表扫描每个索引<br>移除指向死元组的索引条目</td>
+                    <td>索引页面空间</td>
+                    <td><strong>最昂贵</strong><br>与索引数成正比</td>
+                </tr>
+                <tr>
+                    <td><strong>Phase 3: 堆清理</strong><br>Heap Cleanup</td>
+                    <td>LP_DEAD → LP_UNUSED(0)<br>设置 visibility map all_visible 位</td>
+                    <td>✅ <strong>仅 4 字节行指针槽位</strong></td>
+                    <td>与死 TID 数成正比</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="post-note">
+            <strong>核心认知修正</strong>：很多人以为 VACUUM 的"回收空间"发生在 Phase 3，实际上元组字节在 Phase 1 的修剪中就已经被释放了。Phase 3 处理的只是那个 4 字节的 ItemPointerData 槽位。
+        </div>
+
+        <hr>
+
+        <h2>行指针状态机</h2>
+
+        <p>每个页面有一个行指针数组（<code>pd_lower</code> 到 <code>pd_upper</code> 之间），每个行指针 4 字节，指向元组在页面中的位置（偏移量 + 长度 + 标志位）。</p>
+
+        <table>
+            <thead>
+                <tr><th>状态</th><th>值</th><th>含义</th><th>触发</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>LP_UNUSED</strong></td>
+                    <td>0</td>
+                    <td>空槽位，可被新 INSERT 复用</td>
+                    <td>VACUUM Phase 3 / 无索引表直接修剪</td>
+                </tr>
+                <tr>
+                    <td><strong>LP_NORMAL</strong></td>
+                    <td>1</td>
+                    <td>指向元组（可能是活元组或已删除的死元组）</td>
+                    <td>INSERT / UPDATE</td>
+                </tr>
+                <tr>
+                    <td><strong>LP_REDIRECT</strong></td>
+                    <td>2</td>
+                    <td>HOT 链头部，指向链中的另一个行指针</td>
+                    <td>HOT 修剪（链头部被剪掉时）</td>
+                </tr>
+                <tr>
+                    <td><strong>LP_DEAD</strong></td>
+                    <td>3</td>
+                    <td>元组数据已回收，但槽位<strong>必须保留</strong><br>因为索引可能仍引用此 TID</td>
+                    <td>VACUUM Phase 1 修剪（有索引表）</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>完整状态转换</h3>
+
+        <pre><code>-- 有索引的表：两阶段回收
+LP_UNUSED(0) ──INSERT──────────────────▶ LP_NORMAL(1)
+LP_NORMAL(1) ──prune (Phase 1)─────────▶ LP_DEAD(3)
+LP_DEAD(3)   ──index cleanup + 2nd scan▶ LP_UNUSED(0)
+
+-- 无索引的表：一次性回收
+LP_UNUSED(0) ──INSERT──────────────────▶ LP_NORMAL(1)
+LP_NORMAL(1) ──prune───────────────────▶ LP_UNUSED(0)  -- 跳过 LP_DEAD！
+
+-- HOT 更新
+LP_NORMAL(1) ──HOT prune (链头部)───────▶ LP_REDIRECT(2)
+LP_NORMAL(1) ──HOT prune (链成员)───────▶ LP_UNUSED(0)
+LP_REDIRECT(2)──VACUUM (目标也死时)─────▶ LP_UNUSED(0)</code></pre>
+
+        <p><strong>关键点</strong>：<code>LP_DEAD</code> 中间状态<strong>是为索引而存在的</strong>。如果表上没有索引，修剪直接把行指针设为 <code>LP_UNUSED(0)</code>，完全跳过 <code>LP_DEAD</code>。</p>
+
+        <hr>
+
+        <h2>实测验证：pageinspect 页面级铁证</h2>
+
+        <p>以下实验在 <strong>PG 19 Beta1</strong> 上执行，用 <code>pageinspect</code> 扩展直接观测页面 0 的物理变化。测试表有一颗主键索引（隐式唯一索引）：</p>
+
+        <h3>测试表准备</h3>
+
+        <pre><code>CREATE EXTENSION pageinspect;
+
+CREATE TABLE vac_test (
+    id serial PRIMARY KEY,   -- 主键 = 隐式唯一索引
+    data text
+) WITH (autovacuum_enabled = off, fillfactor = 100);
+
+-- 插入 50 行（约 88 字节/行，全部在一页内）
+INSERT INTO vac_test (data)
+SELECT 'row_data_' || LPAD(g::text, 10, '0')
+    || '_padding_text_to_make_rows_wide_enough'
+FROM generate_series(1, 50) g;</code></pre>
+
+        <h3>阶段 0：基准（BASELINE）</h3>
+
+        <pre><code>SELECT lower, upper, special, pagesize,
+       pagesize - upper AS tuple_area
+FROM page_header(get_raw_page('vac_test', 0));
+
+--  lower | upper | special | pagesize | tuple_area
+-- ───────┼───────┼─────────┼──────────┼────────────
+--    224 |  3792 |    8192 |     8192 |       4400
+
+SELECT count(*) FILTER (WHERE lp_flags = 0) AS LP_UNUSED,
+       count(*) FILTER (WHERE lp_flags = 1) AS LP_NORMAL,
+       count(*) FILTER (WHERE lp_flags = 3) AS LP_DEAD
+FROM heap_page_items(get_raw_page('vac_test', 0));
+
+--  lp_unused | lp_normal | lp_dead
+-- ───────────┼───────────┼─────────
+--          0 |        50 |       0</code></pre>
+
+        <p><code>pd_upper = 3792</code>，50 个 LP_NORMAL，元组区 4400 字节。干净的一页。</p>
+
+        <h3>阶段 1：DELETE 30 行（id % 5 IN (1,2,3)）</h3>
+
+        <pre><code>DELETE FROM vac_test WHERE id % 5 IN (1,2,3);
+
+SELECT lower, upper FROM page_header(get_raw_page('vac_test', 0));
+--  lower | upper
+-- ───────┼───────
+--    224 |  3792    ← <strong>完全没变！</strong>
+
+-- 行指针状态也没有任何变化：仍然是 50 个 LP_NORMAL
+-- 但 t_xmax != 0 表明这些行已被删除标记</code></pre>
+
+        <p>关键发现：<strong>DELETE 不改变页面布局</strong>。pd_upper 纹丝不动，元组数据仍在原处，行指针全部 LP_NORMAL。唯一的变化是元组头部的 t_xmax 被标记为删除事务 ID。页面空间回收必须等 VACUUM。</p>
+
+        <h3>阶段 2：Phase 1 Only — VACUUM (INDEX_CLEANUP OFF)</h3>
+
+        <p>只执行堆扫描修剪，<strong>跳过 Phase 2 索引清理和 Phase 3 堆清理</strong>：</p>
+
+        <pre><code>VACUUM (INDEX_CLEANUP OFF) vac_test;
+
+SELECT lower, upper,
+       pagesize - upper AS tuple_area,
+       upper - lower AS usable_gap
+FROM page_header(get_raw_page('vac_test', 0));
+
+--  lower | upper | tuple_area | usable_gap
+-- ───────┼───────┼────────────┼────────────
+--    224 |  6432 |       1760 |       6208   ← <strong>pd_upper 从 3792 → 6432！</strong>
+
+SELECT count(*) FILTER (WHERE lp_flags = 0) AS LP_UNUSED,
+       count(*) FILTER (WHERE lp_flags = 1) AS LP_NORMAL,
+       count(*) FILTER (WHERE lp_flags = 3) AS LP_DEAD
+FROM heap_page_items(get_raw_page('vac_test', 0));
+
+--  lp_unused | lp_normal | lp_dead
+-- ───────────┼───────────┼─────────
+--          0 |        20 |      30   ← 30 LP_NORMAL → 30 LP_DEAD
+
+-- 取样观察行指针细节
+SELECT lp, lp_off, lp_flags FROM heap_page_items(get_raw_page('vac_test', 0))
+WHERE lp <= 5;
+
+--  lp | lp_off | lp_flags
+-- ────┼────────┼──────────
+--   1 |      0 |        3    ← LP_DEAD: lp_off=0（不再指向元组）
+--   2 |      0 |        3
+--   3 |      0 |        3
+--   4 |   8104 |        1    ← LP_NORMAL: 仍指向元组
+--   5 |   8016 |        1</code></pre>
+
+        <div class="post-note">
+            <strong>铁证 #1</strong>：pd_upper 从 3792 → 6432，元组区从 4400B 缩小到 1760B，<strong>回收了 2640 字节元组数据（= 30 死元组 × 88 字节）</strong>。同时，30 个行指针从 LP_NORMAL 变为 LP_DEAD（lp_off=0, lp_flags=3），但槽位本身仍然占用 pd_lower 下方的 4 字节空间。
+        </div>
+
+        <h3>阶段 3：Full VACUUM（三阶段完整）</h3>
+
+        <pre><code>VACUUM vac_test;
+
+SELECT lower, upper,
+       pagesize - upper AS tuple_area
+FROM page_header(get_raw_page('vac_test', 0));
+
+--  lower | upper | tuple_area
+-- ───────┼───────┼────────────
+--    224 |  6432 |       1760   ← <strong>pd_upper 纹丝不动！</strong>
+
+SELECT count(*) FILTER (WHERE lp_flags = 0) AS LP_UNUSED,
+       count(*) FILTER (WHERE lp_flags = 1) AS LP_NORMAL,
+       count(*) FILTER (WHERE lp_flags = 3) AS LP_DEAD
+FROM heap_page_items(get_raw_page('vac_test', 0));
+
+--  lp_unused | lp_normal | lp_dead
+-- ───────────┼───────────┼─────────
+--         30 |        20 |       0   ← 30 LP_DEAD → 30 LP_UNUSED
+
+-- 取样确认
+SELECT lp, lp_off, lp_flags FROM heap_page_items(get_raw_page('vac_test', 0))
+WHERE lp <= 5;
+
+--  lp | lp_off | lp_flags
+-- ────┼────────┼──────────
+--   1 |      0 |        0    ← LP_UNUSED: 槽位已释放！
+--   2 |      0 |        0
+--   3 |      0 |        0
+--   4 |   8104 |        1    ← 活行不受影响
+--   5 |   8016 |        1</code></pre>
+
+        <div class="post-note">
+            <strong>铁证 #2</strong>：pd_upper = 6432 → 6432，<strong>完全没有任何变化</strong>。Phase 3 唯一做的事情就是 LP_DEAD → LP_UNUSED（行指针 lp_flags 从 3 变为 0），每个槽位仅回收 <strong>4 字节</strong>（30 × 4 = 120B）。元组数据在 Phase 1 修剪时已经全部回收完毕。
+        </div>
+
+        <h3>阶段 4：INSERT 复用 LP_UNUSED 槽位</h3>
+
+        <pre><code>INSERT INTO vac_test (data)
+SELECT 'reused_' || LPAD(g::text, 10, '0')
+FROM generate_series(1, 5) g;
+
+SELECT lower, upper FROM page_header(get_raw_page('vac_test', 0));
+--  lower | upper
+-- ───────┼───────
+--    224 |  6192    ← pd_upper 从 6432 → 6192（新元组占用 240B）
+
+SELECT count(*) FILTER (WHERE lp_flags = 0) AS LP_UNUSED,
+       count(*) FILTER (WHERE lp_flags = 1) AS LP_NORMAL
+FROM heap_page_items(get_raw_page('vac_test', 0));
+
+--  lp_unused | lp_normal
+-- ───────────┼───────────
+--         25 |        25    ← 5 LP_UNUSED 被新 INSERT 复用</code></pre>
+
+        <p>新 INSERT 优先复用 LP_UNUSED 槽位，而非在 pd_lower 下方分配新行指针。pd_upper 从 6432 下移到 6192（新元组数据 240B = 5 × 48B），行指针总数保持 50 不变。</p>
+
+        <hr>
+
+        <h2>四个阶段完整数据对比</h2>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>0_BASELINE</th><th>1_AFTER_DELETE</th><th>2_PHASE1_ONLY</th><th>3_FULL_VACUUM</th><th>4_AFTER_REINSERT</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>pd_lower</strong></td><td>224</td><td>224</td><td>224</td><td>224</td><td>224</td></tr>
+                <tr><td><strong>pd_upper</strong></td><td>3792</td><td><span style="color:#888">3792</span></td><td><strong style="color:#e74c3c">6432 ⬆</strong></td><td><span style="color:#888">6432</span></td><td>6192</td></tr>
+                <tr><td>元组区 (8192-upper)</td><td>4400B</td><td>4400B</td><td><strong style="color:#e74c3c">1760B</strong></td><td>1760B</td><td>2000B</td></tr>
+                <tr><td><strong>回收字节</strong></td><td>—</td><td>0</td><td><strong style="color:#e74c3c">2640B</strong></td><td>0</td><td>—</td></tr>
+                <tr><td>LP_NORMAL</td><td>50</td><td>50</td><td>20</td><td>20</td><td><strong>25</strong></td></tr>
+                <tr><td>LP_DEAD</td><td>0</td><td>0</td><td><strong style="color:#e74c3c">30</strong></td><td><strong style="color:#27ae60">0 →</strong></td><td>0</td></tr>
+                <tr><td>LP_UNUSED</td><td>0</td><td>0</td><td>0</td><td><strong style="color:#27ae60">30</strong></td><td>25</td></tr>
+                <tr><td><strong>结论</strong></td><td>干净页面</td><td>DELETE 不改布局</td><td>✅ 回收元组字节<br>标志 LP_DEAD</td><td>✅ 释放行指针槽位<br>pd_upper 不动</td><td>LP_UNUSED 复用</td></tr>
+            </tbody>
+        </table>
+
+        <p>两个不可辩驳的铁证：</p>
+        <ol>
+            <li><strong>Phase 1 回收元组字节</strong>：pd_upper 从 3792 → 6432（2640B = 30 × 88B），行指针 LP_NORMAL → LP_DEAD（lp_off=0）</li>
+            <li><strong>Phase 3 只回收行指针槽位</strong>：pd_upper 6432 → 6432（<strong>纹丝不动</strong>），唯一变化是 lp_flags 从 3 → 0（每槽位 4 字节）</li>
+        </ol>
+
+        <hr>
+
+        <h2>INDEX_CLEANUP OFF 的代价</h2>
+
+        <p><code>VACUUM (INDEX_CLEANUP OFF)</code> 跳过了 Phase 2 和 Phase 3，这会带来：</p>
+
+        <table>
+            <thead>
+                <tr><th>好处</th><th>代价</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>✅ 跳过索引扫描（最昂贵阶段）</td>
+                    <td>❌ 死索引条目<strong>永久累积</strong>→ 索引膨胀</td>
+                </tr>
+                <tr>
+                    <td>✅ 元组空间仍被回收</td>
+                    <td>❌ <code>LP_DEAD</code> 槽位永不释放</td>
+                </tr>
+                <tr>
+                    <td>✅ 快速完成</td>
+                    <td>❌ 索引扫描越来越慢（死条目越来越多）</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="post-note">
+            <strong>紧急场景可用，但不要设为默认</strong>。如果表有大量索引且 VACUUM 时间不可接受，可以先 <code>INDEX_CLEANUP OFF</code> 快速回收空间，然后在低峰期跑完整 VACUUM。<strong>永远不要长期跳过索引清理。</strong>
+        </div>
+
+        <hr>
+
+        <h2>惰性 VACUUM vs VACUUM FULL</h2>
+
+        <table>
+            <thead>
+                <tr><th>维度</th><th>惰性 VACUUM（常规）</th><th>VACUUM FULL</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>锁级别</strong></td><td>ShareUpdateExclusiveLock<br>✅ 不阻塞读写</td><td>AccessExclusiveLock<br>❌ 阻塞所有访问</td></tr>
+                <tr><td><strong>能力</strong></td><td>回收页面内空间 → 新 INSERT 可复用<br>截断末尾空页 → 归还 OS</td><td>整个表重写 → 紧密打包存活行<br>回收所有内部空闲空间</td></tr>
+                <tr><td><strong>文件收缩</strong></td><td>仅末尾连续空页</td><td>整个表文件</td></tr>
+                <tr><td><strong>生产替代</strong></td><td>—</td><td>pg_repack / pg_squeeze（在线）</td></tr>
+            </tbody>
+        </table>
+
+        <p>核心区别：惰性 VACUUM 使空间<strong>可复用</strong>（表达到稳态大小后不再增长），VACUUM FULL 将内部空闲空间<strong>压缩出文件</strong>（但代价高昂）。</p>
+
+        <hr>
+
+        <h2>完整生命周期追踪（实测数值版）</h2>
+
+        <pre><code>INSERT（50 行，约 88B/行）:
+  pd_lower: 24 → 224（+200B = 50 × 4B 行指针）
+  pd_upper: 8192 → 3792（-4400B = 50 × 88B 元组数据）
+  行指针: 0 LP_UNUSED / 50 LP_NORMAL / 0 LP_DEAD
+
+DELETE（30 行，id % 5 IN (1,2,3)）:
+  t_xmax = 880（删除事务 XID）
+  pd_lower: 224 → 224  ← 不变
+  pd_upper: 3792 → 3792 ← 不变！
+  行指针: 0 LP_UNUSED / 50 LP_NORMAL / 0 LP_DEAD ← 全部不变！
+  → DELETE 只是标记元组头部，不碰页面布局
+
+VACUUM Phase 1 — VACUUM (INDEX_CLEANUP OFF):
+  ✅ 修剪死元组 → pd_upper: 3792 → 6432（回收 2640B = 30 × 88B）
+  ✅ FSM 注册回收空间 → INSERT 可立即复用
+  行指针: 0 LP_UNUSED / 20 LP_NORMAL / 30 LP_DEAD
+  → LP_DEAD: lp_off=0, lp_flags=3, xmin/xmax 已清除
+  → pd_lower 不变（224），行指针数组大小不变
+
+VACUUM Phase 2（索引清理）:
+  ✅ 扫描 pkey 索引，移除 30 个死 TID 的索引条目
+  → 堆页面 pd_lower/upper/行指针状态完全不变化
+
+VACUUM Phase 3（堆清理）:
+  ✅ LP_DEAD → LP_UNUSED: lp_flags 3→0（30 个槽位 × 4B = 120B）
+  行指针: 30 LP_UNUSED / 20 LP_NORMAL / 0 LP_DEAD
+  ✅ VM all_visible 位设置
+  → pd_upper: 6432 → 6432 ← <strong>纹丝不动！元组数据 Phase 1 已回收</strong>
+
+INSERT 5 行（复用 LP_UNUSED 槽位）:
+  pd_upper: 6432 → 6192（新元组 240B = 5 × 48B）
+  行指针: 25 LP_UNUSED / 25 LP_NORMAL / 0 LP_DEAD
+  → 5 个 LP_UNUSED 槽位被复用，无需新行指针</code></pre>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成，所有 SQL 均在 PG 19 Beta1 上实际执行验证通过。验证方法：pageinspect 扩展直接观测页面 0 的 pd_upper/lower 和 heap_page_items 行指针状态，四个阶段对比拿到两个铁证。页面级别分析深度受益于 Radim Marek 在 boringsql.com 的 "VACUUM at the Page Level" 文章。技术审校：小木（AI）。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

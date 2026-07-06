@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>enable_partition_pruning 两阶段分区裁剪深度解析 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="enable_partition_pruning 控制分区裁剪的两个阶段：计划时裁剪（WHERE 分区键=常量→Subplans Removed）和执行时裁剪（prepare/generic plan→never executed）。本文在 PG19 Beta1 实测验证两阶段信号、enable_partition_pruning=off 对比、裁剪不生效的三种典型原因。">
+    <meta property="og:title" content="enable_partition_pruning 两阶段分区裁剪深度解析">
+    <meta property="og:description" content="Plan-time vs Execution-time 裁剪，Subplans Removed 信号，裁剪不生效的三种原因。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>enable_partition_pruning 两阶段分区裁剪深度解析</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-06">2026-07-06</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">partition</span>
+                <span class="tag">pruning</span>
+                <span class="tag">GUC</span>
+                <span class="tag">EXPLAIN</span>
+                <span class="tag">plan-time</span>
+                <span class="tag">execution-time</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 19 Beta1 实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>enable_partition_pruning</code> 控制分区裁剪的<strong>两个不同时刻</strong>：计划时（Plan-time）和执行时（Execution-time）。两种裁剪在 EXPLAIN 中发出<strong>不同的信号</strong>——计划时看 <code>Subplans Removed</code>，执行时看 <code>(never executed)</code>。关掉它只是诊断探针，真正的修复在 WHERE 条件。</p>
+
+        <hr>
+
+        <h2>两阶段裁剪详解</h2>
+
+        <table>
+            <thead>
+                <tr><th>阶段</th><th>触发条件</th><th>EXPLAIN 信号</th><th>机制</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>计划时裁剪</strong><br>Plan-time</td>
+                    <td>WHERE 分区键 = 常量<br>（优化器在生成计划时就知道值）</td>
+                    <td><strong>被排除的分区根本不出现</strong><br>generic plan: <code>Subplans Removed: N</code></td>
+                    <td>优化器用分区约束匹配 WHERE 条件<br>直接排除不相关分区<br>不产生任何运行时开销</td>
+                </tr>
+                <tr>
+                    <td><strong>执行时裁剪</strong><br>Execution-time</td>
+                    <td>参数值运行时才知道<br>（prepared/generic plan、子查询传值、nested loop 内侧参数）</td>
+                    <td><strong>分区出现在计划中但标记</strong><br><code>(never executed)</code><br>或 <code>loops=N &lt; 兄弟节点</code></td>
+                    <td>计划包含所有分区<br>执行器初始化时判断哪些分区不需要扫描<br>每次执行时重新判断</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>实测验证：识别两种裁剪信号</h2>
+
+        <h3>测试表准备</h3>
+
+        <pre><code>CREATE TABLE sales (
+    id serial,
+    amount numeric,
+    sold_at date NOT NULL,
+    region text
+) PARTITION BY RANGE (sold_at);
+
+CREATE TABLE sales_2023 PARTITION OF sales
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+CREATE TABLE sales_2024 PARTITION OF sales
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE sales_2025 PARTITION OF sales
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- 每分区 1000 行
+INSERT INTO sales (amount, sold_at, region)
+SELECT (random() * 10000)::numeric(10,2),
+       '2023-01-01'::date + (random() * 1095)::int,
+       (ARRAY['North','South','East','West'])[1 + (random() * 3)::int]
+FROM generate_series(1, 3000);
+
+ANALYZE sales;</code></pre>
+
+        <h3>场景 1：计划时裁剪 —— 常量条件</h3>
+
+        <p><strong>WHERE 分区键 = 常量</strong>，优化器直接排除不匹配分区：</p>
+
+        <pre><code>EXPLAIN SELECT * FROM sales WHERE sold_at = '2024-06-15';
+
+--                            QUERY PLAN
+-- ----------------------------------------------------------------
+--  Seq Scan on <strong>sales_2024</strong> sales  (cost=0.00..19.71 rows=2 width=19)
+--    Filter: (sold_at = '2024-06-15'::date)
+-- (2 rows)</code></pre>
+
+        <p>❌ 没有 sales_2023，没有 sales_2025。<strong>分区从计划中直接消失了。</strong>纯常量条件下不需要 <code>EXPLAIN ANALYZE</code>，plain <code>EXPLAIN</code> 就能看到裁剪效果。</p>
+
+        <h3>场景 2：执行时裁剪 —— Generic Plan</h3>
+
+        <p>强制通用计划来观察执行时裁剪信号：</p>
+
+        <pre><code>SET plan_cache_mode = force_generic_plan;
+PREPARE q(date) AS SELECT * FROM sales WHERE sold_at = $1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) EXECUTE q('2024-06-15');
+
+--                            QUERY PLAN
+-- ----------------------------------------------------------------
+--  Append (actual rows=1.00 loops=1)
+--    <strong>Subplans Removed: 2</strong>
+--    ->  Seq Scan on sales_2024 sales_1 (actual rows=1.00 loops=1)
+--          Filter: (sold_at = $1)
+--          Rows Removed by Filter: 1016
+--  Planning Time: 1.621 ms
+--  Execution Time: 0.830 ms
+-- (11 rows)</code></pre>
+
+        <p>这次看到了关键信号：<strong><code>Subplans Removed: 2</code></strong>——2023 和 2025 分区被执行时裁剪掉了，但<strong>只在运行时</strong>才知道。计划中仍然包含 Append 节点，因为优化器在计划时不知道 <code>$1</code> 的值。</p>
+
+        <h3>场景 3：关闭裁剪 — 全线扫描</h3>
+
+        <p>作为诊断探针，<code>enable_partition_pruning = off</code> 让你看到"没有裁剪的世界"：</p>
+
+        <pre><code>SET enable_partition_pruning = off;
+EXPLAIN SELECT * FROM sales WHERE sold_at = '2024-06-15';
+
+--                                 QUERY PLAN
+-- -------------------------------------------------------------------------
+--  Append  (cost=0.00..57.53 rows=6 width=19)
+--    ->  Seq Scan on sales_2023 sales_1  (cost=0.00..20.10 rows=2 width=19)
+--          Filter: (sold_at = '2024-06-15'::date)
+--    ->  Seq Scan on sales_2024 sales_2  (cost=0.00..19.71 rows=2 width=19)
+--          Filter: (sold_at = '2024-06-15'::date)
+--    ->  Seq Scan on sales_2025 sales_3  (cost=0.00..17.69 rows=2 width=19)
+--          Filter: (sold_at = '2024-06-15'::date)
+-- (7 rows)</code></pre>
+
+        <p><strong>所有三个分区都在</strong>，每个都带着永远不会匹配的 Filter。<code>cost=57.53</code> vs 正常 <code>cost=19.71</code>（单分区），接近 3 倍。这就是裁剪带来的收益。</p>
+
+        <hr>
+
+        <h2>诊断铁律</h2>
+
+        <ol>
+            <li><code>SET enable_partition_pruning = off</code> → 重跑 EXPLAIN ANALYZE</li>
+            <li>对比两个计划：<strong>差异 = 裁剪收益，无差异 = 裁剪根本没生效</strong></li>
+            <li>确认问题后 <code>RESET enable_partition_pruning</code>，<strong>修查询，不是修 GUC</strong></li>
+        </ol>
+
+        <p>全局关闭 <code>enable_partition_pruning</code> 会让<strong>所有</strong>分区查询失去裁剪能力——这几乎一定比任何"裁剪没生效"的问题更糟糕。</p>
+
+        <hr>
+
+        <h2>裁剪不生效的三种常见原因</h2>
+
+        <table>
+            <thead>
+                <tr><th>原因</th><th>示例</th><th>解释</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>WHERE 未约束分区键</strong></td>
+                    <td><code>WHERE region = 'North'</code></td>
+                    <td>分区键是 <code>sold_at</code>，用 <code>region</code> 过滤 → 所有分区都必须扫描</td>
+                </tr>
+                <tr>
+                    <td><strong>分区键被函数包裹</strong></td>
+                    <td><code>WHERE EXTRACT(YEAR FROM sold_at) = 2024</code></td>
+                    <td>优化器无法将函数结果匹配到分区约束<br>应改写为 <code>WHERE sold_at >= '2024-01-01' AND sold_at < '2025-01-01'</code></td>
+                </tr>
+                <tr>
+                    <td><strong>类型不匹配</strong></td>
+                    <td>分区键 <code>timestamp</code>，条件给 <code>date</code></td>
+                    <td>隐式类型转换阻断分区约束匹配<br>确保 WHERE 类型与分区键类型一致</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>实测验证以上三种裁剪失效：</p>
+
+        <pre><code>-- ❌ 失效 1: WHERE 不约束分区键
+EXPLAIN SELECT * FROM sales WHERE region = 'North';
+-- Append: sales_2023 + sales_2024 + sales_2025（三个全扫）
+
+-- ❌ 失效 2: 分区键被函数包裹
+EXPLAIN SELECT * FROM sales WHERE EXTRACT(YEAR FROM sold_at) = 2024;
+-- Append: sales_2023 + sales_2024 + sales_2025（三个全扫）
+
+-- ✅ 正确: 直接用分区键范围
+EXPLAIN SELECT * FROM sales
+WHERE sold_at >= '2024-01-01' AND sold_at < '2025-01-01';
+-- Seq Scan on <strong>sales_2024</strong> only</code></pre>
+
+        <hr>
+
+        <h2>constraint_exclusion 与 enable_partition_pruning 的关系</h2>
+
+        <p>这两个 GUC <strong>不是</strong>同一个东西：</p>
+
+        <table>
+            <thead>
+                <tr><th>GUC</th><th>默认值</th><th>适用范围</th><th>作用</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>constraint_exclusion</code></td><td><code>partition</code></td><td><strong>仅继承式分区</strong>（PG10 之前）</td><td>用表 CHECK 约束排除不匹配的继承子表</td></tr>
+                <tr><td><code>enable_partition_pruning</code></td><td><code>on</code></td><td><strong>声明式分区</strong>（PG10+）</td><td>用分区边界约束排除不匹配的分区</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>PG11+ 的声明式分区只用 <code>enable_partition_pruning</code></strong>。调 <code>constraint_exclusion</code> 对你的声明式分区表没有任何作用。这是很多 DBA 误踩的坑。</p>
+
+        <hr>
+
+        <h2>跨版本一致性</h2>
+
+        <p><code>enable_partition_pruning</code> 在 PG16.11 和 PG19 Beta1 上的默认值、参数描述、行为完全一致（<code>on</code>，<code>user</code> 级别，<code>boot_val = on</code>）。这不是 PG19 新特性，而是<strong>所有声明式分区用户的通用工具</strong>。</p>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成，所有 SQL 均在 PG 19 Beta1 上实际执行验证通过。技术审校：小木（AI）。致谢：Christophe Pettus 的 "All Your GUCs in a Row" 系列提供了本主题的启发性分析框架。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

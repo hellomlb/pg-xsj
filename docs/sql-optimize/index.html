@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html">enable_partition_pruning 两阶段分区裁剪深度解析</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-06">2026-07-06</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">enable_partition_pruning 控制分区裁剪的计划时和执行时两个阶段。计划时看 Subplans Removed，执行时看 (never executed)。裁剪不生效几乎总因 WHERE 未约束分区键或分区键被函数包裹。constraint_exclusion 只是继承式分区的化石，声明式分区只看这个 GUC。PG19 Beta1 实测全部信号。</p>
+        <a href="/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/parallel-float-sum-inconsistency.html">并行聚合浮点 SUM 不一致：同一 SQL 五次执行五种结果</a></h3>
         <div class="post-meta">
             <time datetime="2026-06-29">2026-06-29</time>

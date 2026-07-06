@@ -5,7 +5,28 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Sun, 29 Jun 2026 10:20:00 +0800</lastBuildDate>
+    <lastBuildDate>Sun, 06 Jul 2026 10:00:00 +0800</lastBuildDate>
+    <item>
+      <title>VACUUM 三阶段与行指针生命周期：页面级别深度解析</title>
+      <link>https://hellomlb.github.io/pg-xsj/kernel/vacuum-three-phase-page-level.html</link>
+      <description>VACUUM 对有索引的表分三个阶段执行。核心认知修正：Phase 3 只回收 4 字节行指针槽位，元组数据在 Phase 1 修剪时已回收。PG19 Beta1 VACUUM VERBOSE 实测验证三阶段差异与 INDEX_CLEANUP OFF 中间状态。行指针四种状态完整状态机。</description>
+      <pubDate>Sun, 06 Jul 2026 10:00:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/vacuum-three-phase-page-level.html</guid>
+    </item>
+    <item>
+      <title>enable_partition_pruning 两阶段分区裁剪深度解析</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html</link>
+      <description>enable_partition_pruning 控制分区裁剪的计划时和执行时两个阶段。计划时 Subplans Removed，执行时 (never executed)。裁剪不生效几乎总因 WHERE 未约束分区键或分区键被函数包裹。constraint_exclusion 只是继承式分区的化石。PG19 Beta1 实测全部信号。</description>
+      <pubDate>Sun, 06 Jul 2026 09:50:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html</guid>
+    </item>
+    <item>
+      <title>PG19 在线 checksum 切换：告别停机恐惧</title>
+      <link>https://hellomlb.github.io/pg-xsj/kernel/pg19-online-checksum-switch.html</link>
+      <description>PG19 引入 pg_enable_data_checksums() / pg_disable_data_checksums() 在线切换。data_checksums 从布尔值升级为四值状态机（off/inprogress-on/on/inprogress-off），后台 worker 逐页计算 checksum，WAL 自动复制到备库，cost_delay/cost_limit 可控节流。在 PG19 Beta1 实测完整 disable-enable-inprogress-on-on 状态转换。</description>
+      <pubDate>Sun, 06 Jul 2026 09:40:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/pg19-online-checksum-switch.html</guid>
+    </item>
     <item>
       <title>PG19 原生分区手术刀：SPLIT PARTITION / MERGE PARTITIONS 语法与实战</title>
       <link>https://hellomlb.github.io/pg-xsj/kernel/pg19-split-merge-partition.html</link>
