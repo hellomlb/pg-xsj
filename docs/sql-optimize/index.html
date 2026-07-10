@@ -38,6 +38,15 @@
         <a href="/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html" class="read-more">阅读全文 →</a>
     </article>
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/enable-partitionwise-join-deep-dive.html">enable_partitionwise_join：分区对 Join 的性能提升与 M:N 爆炸陷阱</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-08">2026-07-08</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">enable_partitionwise_join 默认 off，开启后把两个分区表的大 Join 拆成按分区对的 N 个小 Join，每对独立选最优算法。前提严格（两表按同一分区键分区 + 连接条件包含全部分区键），且有一个致命陷阱：只按分区键 Join 会触发 M:N 爆炸，产生数亿行中间结果。所有 SQL 在 PG 16.11 + 16.14 双版本实测。</p>
+        <a href="/pg-xsj/sql-optimize/enable-partitionwise-join-deep-dive.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html">enable_partition_pruning 两阶段分区裁剪深度解析</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-06">2026-07-06</time>

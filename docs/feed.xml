@@ -14,9 +14,9 @@
       <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/graph/pg19-property-graph.html</guid>
     </item>
     <item>
-      <title>PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理</title>
+      <title>PG18 三大性能增强实测：Skip Scan、自连接消除、Autovacuum 大表治理</title>
       <link>https://hellomlb.github.io/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html</link>
-      <description>在真实 PG18.4 上实测 AWS 宣称的三大 PG18 性能增强：Skip Scan（复合索引跳过前导列，同机 8.3ms vs 641ms 约 80× 提速）、Self-Join Elimination（主键自连接消除，同机 3.4× 提速且避免 hash 溢出磁盘）、Autovacuum 三个新 GUC（max_threshold/worker_slots/vacuum_truncate）。PG16.11 + PG16.14 双版本反例对照，全部执行计划真实抓取。附同机 on/off 公平基准方法论声明。</description>
+      <description>在真实 PG18.4 上实测 AWS 宣称的三大 PG18 性能增强：Skip Scan（复合索引跳过前导列，执行计划出现 Index Searches 分段搜索标志）、Self-Join Elimination（主键自连接消除为单表扫描，避免 Hash Join 双扫与临时文件溢出）、Autovacuum 三个新 GUC（max_threshold/worker_slots/vacuum_truncate）。PG16.11 + PG16.14 双版本反例对照，仅对比执行计划与读取块数（与机器性能无关）。</description>
       <pubDate>Fri, 10 Jul 2026 10:30:00 +0800</pubDate>
       <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html</guid>
     </item>
