@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PG19 Property Graph 实战：在关系表上声明式叠图，以及三个必须知道的坑 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PG19 新增 SQL/PGQ Property Graph：在外键结构上用 CREATE PROPERTY GRAPH 声明式叠图，不搬数据，查询编译成普通 JOIN。本文在 PG19 Beta1 实测建图、GRAPH_TABLE 查询、三个真实限制（KEY 列不可查、变长路径不支持、同名列类型冲突），并给出避坑方案与元数据视图用法。">
+    <meta property="og:title" content="PG19 Property Graph 实战：在关系表上声明式叠图，以及三个必须知道的坑">
+    <meta property="og:description" content="PG19 原生图查询实测：建图 + GRAPH_TABLE 查询 + 三坑精确复现 + 避坑方案。仅 PG19 支持。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/graph/pg19-property-graph.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>PG19 Property Graph 实战：在关系表上声明式叠图，以及三个必须知道的坑</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-10">2026-07-10</time>
+            <span class="post-category graph">图查询</span>
+            <span class="post-tags">
+                <span class="tag">PG19</span>
+                <span class="tag">Property Graph</span>
+                <span class="tag">SQL/PGQ</span>
+                <span class="tag">GRAPH_TABLE</span>
+                <span class="tag">图数据库</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 19 Beta1 实测（单版本：本特性为 PG19 独占）</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>PG19 把 <strong>Property Graph</strong> 作为一等公民塞进了 SQL：你不用搬数据、不用装图数据库，只要在现有外键表上用 <code>CREATE PROPERTY GRAPH</code> 声明"哪张表是顶点、哪张表是边"，就能用 <code>GRAPH_TABLE(... MATCH ...)</code> 写类 Cypher 的图查询。它<strong>编译成普通 JOIN</strong>，复用优化器/索引/统计——价值在表达力 + SQL/PGQ 标准兼容，不是性能。但有三个真实限制必须知道，否则上线就踩。</p>
+
+        <hr>
+
+        <h2>背景：Property Graph 到底是什么</h2>
+
+        <p>Property Graph 是一种图数据模型：<strong>节点（vertex）</strong>带 key-value 属性，<strong>边（edge）</strong>有方向、也带属性。它实现的是 ISO 的 <strong>SQL/PGQ（Property Graph Queries）</strong> 标准，不是 PG 私有语法。</p>
+
+        <p>关键认知——它不是"另起炉灶的图数据库"：</p>
+
+        <ul>
+            <li><strong>Overlay（叠加层）</strong>：不搬数据，只在已有表上声明。维度表→顶点，纯连接表→边，事实表→顶点+别名边。</li>
+            <li><strong>声明式</strong>：不用手写 JOIN 链，写 <code>MATCH (a)-[e]->(b)</code> 描述"找什么"，PG 编译成 JOIN。</li>
+            <li><strong>标准对齐</strong>：SQL/PGQ 是跨库标准，写法可移植。</li>
+        </ul>
+
+        <blockquote>
+            <p><strong>带回去想的问题</strong>：既然 property graph 最终编译成 JOIN、且变长路径还得退回递归 CTE，它的真正价值是"性能"还是"表达力 + 标准兼容"？想清楚这个，给客户讲的时候一句话就能戳中要害。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>验证环境</h2>
+
+        <table>
+            <thead><tr><th>实例</th><th>版本</th><th>状态</th></tr></thead>
+            <tbody>
+                <tr><td>远程测试实例</td><td>PostgreSQL 19 Beta1</td><td>✅ 已连，完整验证通过</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>验证范围说明</strong>：本特性为 PG19 独占，16.x 及更早版本根本不存在该语法，因此按验证指令<strong>仅在 19 Beta1 单版本做完整验证</strong>，不在旧版本重复证伪（无意义）。下文每条 SQL 均在 19 Beta1 真跑，输出为实测结果。</p>
+
+        <hr>
+
+        <h2>一、建表 + 建图 + 正确查询</h2>
+
+        <p>准备员工/公司/任职三张表（任职表带主键，让 edge key 可由主键推断）：</p>
+
+        <pre><code>CREATE TABLE pg_person  (id int primary key, name text, age int);
+CREATE TABLE pg_company (id int primary key, cname text);
+CREATE TABLE pg_works_at(person_id int, company_id int, since int,
+                         primary key(person_id, company_id));
+INSERT INTO pg_person  VALUES (1,'Alice',30),(2,'Bob',40);
+INSERT INTO pg_company VALUES (10,'Acme'),(20,'Globex');
+INSERT INTO pg_works_at VALUES (1,10,2020),(2,20,2019);
+
+CREATE PROPERTY GRAPH pg_graph
+  VERTEX TABLES (
+    pg_person  KEY (id) LABEL person  PROPERTIES (id, name, age),
+    pg_company KEY (id) LABEL company PROPERTIES (id, cname)
+  )
+  EDGE TABLES (
+    pg_works_at
+      SOURCE KEY (person_id) REFERENCES pg_person (id)
+      DESTINATION KEY (company_id) REFERENCES pg_company (id)
+      LABEL works_at
+  );</code></pre>
+
+        <p>查询谁在哪家公司、何时入职：</p>
+
+        <pre><code>SELECT * FROM GRAPH_TABLE (pg_graph
+  MATCH (p IS person)-[w IS works_at]->(c IS company)
+  COLUMNS (p.name AS person, c.cname AS company, w.since AS since));</code></pre>
+
+        <p><strong>实测输出</strong>：</p>
+
+        <pre><code> person | company | since
+--------+---------+-------
+ Alice  | Acme    |  2020
+ Bob    | Globex  |  2019
+(2 rows)</code></pre>
+
+        <blockquote>
+            <p><strong>关键语法点</strong>：<code>EDGE TABLES</code> <strong>不需要</strong> <code>KEY</code> 子句，只写 <code>SOURCE KEY</code> / <code>DESTINATION KEY</code>，edge key 由边表主键自动推断。给边表加主键后即无需显式 <code>KEY</code>。首次建图失败（报 <code>no key specified</code>）的真正原因是边表没建主键，不是特性限制。</p>
+        </blockquote>
+
+        <hr>
+
+        <h2>二、坑一：KEY 列不自动可查 —— 但能修</h2>
+
+        <p>建图时如果只写 <code>KEY(id)</code> 却<strong>没把 <code>id</code> 列进 <code>PROPERTIES</code></strong>，那 <code>id</code> 就不能在 <code>MATCH</code> 里过滤/投影：</p>
+
+        <pre><code>CREATE PROPERTY GRAPH pg_graph_k
+  VERTEX TABLES (
+    pg_person  KEY (id) LABEL person  PROPERTIES (name, age),  -- 故意不含 id
+    pg_company KEY (id) LABEL company PROPERTIES (cname)
+  )
+  EDGE TABLES ( /* 同上 */ );
+
+SELECT * FROM GRAPH_TABLE (pg_graph_k
+  MATCH (p IS person WHERE p.id = 1) COLUMNS (p.name AS n));</code></pre>
+
+        <p><strong>实测报错</strong>：</p>
+
+        <pre><code>ERROR:  property "id" does not exist</code></pre>
+
+        <p><strong>避坑方案（实测有效）</strong>：把 <code>id</code> 显式写进 <code>PROPERTIES</code>，<code>WHERE p.id=1</code> 立刻成功：</p>
+
+        <pre><code>SELECT * FROM GRAPH_TABLE (pg_graph      -- 注意 pg_graph 的 person 已 PROPERTIES (id, name, age)
+  MATCH (p IS person)-[w IS works_at]->(c IS company)
+  WHERE p.id = 1
+  COLUMNS (p.name AS person, c.cname AS company));</code></pre>
+
+        <p><strong>实测输出</strong>：</p>
+
+        <pre><code> person | company
+--------+---------
+ Alice  | Acme
+(1 row)</code></pre>
+
+        <p class="tip">白话：KEY 定义"边怎么连"，PROPERTIES 定义"能查什么"。想用某列做条件/投影，它就必须在 <code>PROPERTIES</code> 里——这是声明要求，不是缺陷。</p>
+
+        <hr>
+
+        <h2>三、坑二：变长路径不支持</h2>
+
+        <p>想写"跟随 1~3 跳"这类变长路径？直接报错：</p>
+
+        <pre><code>SELECT * FROM GRAPH_TABLE (pg_graph
+  MATCH (p IS person)-[w IS works_at]*->(c IS company) COLUMNS (p.name AS n));</code></pre>
+
+        <p><strong>实测报错</strong>：</p>
+
+        <pre><code>ERROR:  syntax error at or near "*->"
+LINE 2:   MATCH (p IS person)-[w IS works_at]*->(c IS company) COLUMNS (p.name AS n));
+                                             ^</code></pre>
+
+        <p>PG19 在<strong>解析阶段</strong>就把量词 <code>*</code> / <code>+</code> 拒了。变通：手写每跳，或退回递归 CTE 做任意深度遍历。</p>
+
+        <hr>
+
+        <h2>四、坑三：同名列类型冲突</h2>
+
+        <p>两张顶点表有<strong>同名列但不同类型</strong>，且都不写 <code>PROPERTIES</code>（PG19 默认把所有列当 property），直接冲突：</p>
+
+        <pre><code>CREATE TABLE pg_v1(id int primary key, code int);
+CREATE TABLE pg_v2(id int primary key, code text);
+-- 边表略
+
+CREATE PROPERTY GRAPH pg_graph_c
+  VERTEX TABLES ( pg_v1 KEY (id) LABEL v1, pg_v2 KEY (id) LABEL v2 )
+  EDGE TABLES ( /* 同上 */ );
+
+SELECT * FROM GRAPH_TABLE (pg_graph_c
+  MATCH (a IS v1), (b IS v2)
+  COLUMNS (a.code AS ac, b.code AS bc));</code></pre>
+
+        <p><strong>实测报错</strong>：</p>
+
+        <pre><code>ERROR:  property "code" data type mismatch: integer vs. text
+DETAIL:  In a property graph, a property of the same name has to have the same data type in each label.</code></pre>
+
+        <p class="tip">避坑：用 <code>PROPERTIES (...)</code> 白名单让两表暴露<strong>不同的 property 名</strong>（如 <code>PROPERTIES (code AS v1_code)</code>），互不干涉。或者统一列类型。</p>
+
+        <hr>
+
+        <h2>五、元数据：怎么看已建的图</h2>
+
+        <p>⚠️ <strong>纠正一个常见错误</strong>：目录视图<strong>不是</strong> <code>pg_property_graphs</code>（查它会 <code>relation "pg_property_graphs" does not exist</code>）。正确名称是 <strong><code>information_schema.property_graphs</code></strong>，列名为 <strong><code>property_graph_name</code></strong>（information_schema 命名风格）：</p>
+
+        <pre><code>SELECT property_graph_name FROM information_schema.property_graphs;</code></pre>
+
+        <p><strong>实测输出</strong>：</p>
+
+        <pre><code> property_graph_name
+---------------------
+ m_g
+(1 row)</code></pre>
+
+        <p>底层系统目录在 <code>pg_catalog.pg_propgraph_*</code> 一族，日常查看用上面那个 information_schema 视图即可。</p>
+
+        <hr>
+
+        <h2>六、与原始文章的差异（诚实标注）</h2>
+
+        <p>本文三坑结论是<strong>自己实测</strong>复现的，参考了 neovintage 的文章场景，但有几点实测与原文措辞不同，如实记录：</p>
+
+        <table>
+            <thead><tr><th>坑</th><th>原文描述</th><th>PG19 实测</th><th>是否一致</th></tr></thead>
+            <tbody>
+                <tr><td>坑一</td><td>"it fails, because driver_id is not queryable"（无 ERROR 文本）</td><td><code>property "id" does not exist</code></td><td>本质一致，本文给了精确文本</td></tr>
+                <tr><td>坑二</td><td>"element pattern quantifier is not supported"</td><td><code>syntax error at or near "*->"</code></td><td>现象一致，PG19 在解析阶段即报语法错</td></tr>
+                <tr><td>坑三</td><td><code>property "number" data type mismatch: double precision vs. bigint</code></td><td><code>property "code" data type mismatch: integer vs. text</code></td><td>模式与 DETAIL 文案完全一致，仅列名/类型随测试数据不同</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>七、给客户的一句话</h2>
+
+        <ul>
+            <li>Property Graph 是<strong>叠加层</strong>，不搬数据；语法编译成 JOIN，复用优化器/索引/统计。</li>
+            <li>价值在<strong>表达力 + SQL/PGQ 标准兼容</strong>，不是性能——别当真图数据库吹。</li>
+            <li><strong>变长路径暂不支持</strong>，深图遍历退回递归 CTE。</li>
+            <li>KEY 列须显式进 <code>PROPERTIES</code> 才可查；同名列须同型或用 <code>PROPERTIES</code> 白名单隔离。</li>
+            <li>适用版本：<strong>PG19+</strong>。升级前别在 16.x 上试，语法直接报错。</li>
+        </ul>
+
+        <hr>
+
+        <h2>AI 辅助声明</h2>
+
+        <p>本文的<strong>验证环节（SQL 设计、执行、报错复现、输出记录）全部由人工在 PostgreSQL 19 Beta1 真机完成</strong>；核心段落的文字组织与表格整理由 AI 辅助生成，所有 SQL 与报错文本均来自实测，未做臆测。如需复现，脚本见仓库 <code>tech_news/case-library/PG19-property-graph-verify.md</code>。</p>
+
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
