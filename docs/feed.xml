@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Fri, 10 Jul 2026 10:30:00 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 10 Jul 2026 10:52:00 +0800</lastBuildDate>
+    <item>
+      <title>PG19 Property Graph 实战：在关系表上声明式叠图，以及三个必须知道的坑</title>
+      <link>https://hellomlb.github.io/pg-xsj/graph/pg19-property-graph.html</link>
+      <description>PostgreSQL 19 新增 property graph（SQL/PGQ 标准），在现有关系表上声明式叠图，编译为普通 JOIN 复用优化器。19beta1 真机实测建图、GRAPH_TABLE 查询，并精确复现三个坑：KEY 不进 PROPERTIES 不可查、变长路径不支持、同名列异型 data type mismatch。附避坑修复对照与 metadata 视图纠正（information_schema.property_graphs）。</description>
+      <pubDate>Fri, 10 Jul 2026 10:52:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/graph/pg19-property-graph.html</guid>
+    </item>
     <item>
       <title>PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理</title>
       <link>https://hellomlb.github.io/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html</link>
