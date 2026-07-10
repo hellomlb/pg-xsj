@@ -29,15 +29,6 @@
 
 <div class="post-list">
     <article class="post-card">
-        <h3><a href="/pg-xsj/ops/log-statement-max-length-execute-detail-fix.html">log_statement_max_length 的漏网之鱼：EXECUTE 的 DETAIL 绕过长度限制</a></h3>
-        <div class="post-meta">
-            <time datetime="2026-07-10">2026-07-10</time>
-            <span class="post-category ops">日常运维</span>
-        </div>
-        <p class="post-excerpt">log_statement_max_length 是 2026-07-10 才合入 master 的全新 GUC。此前 EXECUTE 的 DETAIL 中 prepared 原文不受该参数限制，能绕过长度截断泄露完整 SQL。Jim Jones / Fujii 的 999a841 + 5594f20 修复后统一截断追加 '...'。参数存在性三版本核查、截断机制 16.11 + 16.14 双版本实测。</p>
-        <a href="/pg-xsj/ops/log-statement-max-length-execute-detail-fix.html" class="read-more">阅读全文 →</a>
-    </article>
-    <article class="post-card">
         <h3><a href="/pg-xsj/ops/dynamic-shared-memory-type.html">dynamic_shared_memory_type：Docker 容器的 64MB 陷阱 —— 并行查询 No space left on device</a></h3>
         <div class="post-meta">
             <time datetime="2026-06-24">2026-06-24</time>
