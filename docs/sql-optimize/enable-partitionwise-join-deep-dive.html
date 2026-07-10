@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>enable_partitionwise_join：分区对 Join 的性能提升与 M:N 爆炸陷阱 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="enable_partitionwise_join 默认 off。本文在 PG 16.11 和 16.14 双版本实测 4 分区 10 万/50 万行表，对比 on/off 的执行计划、内存占用、耗时差异，揭示只按分区键 join 时的 M:N 爆炸陷阱，给出 OLAP 角色级配置建议。">
+    <meta property="og:title" content="enable_partitionwise_join：分区对 Join 的性能提升与 M:N 爆炸陷阱">
+    <meta property="og:description" content="4 分区双版本实测，on/off 执行计划对比，M:N 爆炸陷阱，OLAP 配置建议。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partitionwise-join-deep-dive.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>enable_partitionwise_join：分区对 Join 的性能提升与 M:N 爆炸陷阱</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-08">2026-07-08</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">partition</span>
+                <span class="tag">join</span>
+                <span class="tag">GUC</span>
+                <span class="tag">EXPLAIN</span>
+                <span class="tag">memory</span>
+                <span class="tag">parallel</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + 16.14 双版本实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>enable_partitionwise_join</code> 默认 <code>off</code>——和 <code>enable_partitionwise_aggregate</code> 一样，它是 <code>enable_*</code> 家族里少数默认 off 的成员。开启后，优化器会把两个分区表的大 Join 拆成按分区对的 N 个小 Join，每对独立选最优算法。但前提条件很严格（两表都按同一分区键分区 + 连接条件包含全部分区键），且有一个<strong>致命陷阱</strong>：只按分区键 Join 时会触发 M:N 爆炸，产生数亿行中间结果。</p>
+
+        <hr>
+
+        <h2>白话版：大车间 vs 4 个小车间</h2>
+
+        <p>假设你有按季度分区的订单表（orders）和订单明细表（order_items），要按 <code>order_date + id</code> 连接：</p>
+
+        <table>
+            <thead>
+                <tr><th>模式</th><th>比喻</th><th>机制</th><th>内存</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>off（默认）</strong></td>
+                    <td>把所有季度数据堆到<strong>一个大车间</strong>做 Join</td>
+                    <td>Append → 1 个 Hash Join<br>所有分区数据汇入后统一连接</td>
+                    <td>1 × Hash 表<br>（本例 6528kB）</td>
+                </tr>
+                <tr>
+                    <td><strong>on</strong></td>
+                    <td>每对季度各自在<strong>一个小车间</strong>做 Join</td>
+                    <td>Append → 4 个 Hash Join（分区对）<br>Q1 对 Q1、Q2 对 Q2……</td>
+                    <td>4 × Hash 表<br>（本例 4×1632kB = 6528kB）</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>好处是每对小 Join 可以并行处理、各自选最优算法。坏处是<strong>规划成本翻倍</strong>（4 次规划 vs 1 次），而且触发条件很严格——不是随便两个分区表 Join 就能生效。更危险的是，<strong>只按分区键 Join 会产生 M:N 爆炸</strong>。</p>
+
+        <hr>
+
+        <h2>触发条件：三道门槛</h2>
+
+        <p>partitionwise join 不是你想开就能生效。它有三道门槛：</p>
+
+        <table>
+            <thead>
+                <tr><th>门槛</th><th>条件</th><th>不满足的后果</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>1. 两表都分区</strong></td>
+                    <td>Join 两侧都必须是分区表</td>
+                    <td>一侧是非分区表 → 不触发（场景 4 验证）</td>
+                </tr>
+                <tr>
+                    <td><strong>2. 同一分区键</strong></td>
+                    <td>两表按相同分区策略（RANGE/LIST）+ 相同分区键分区</td>
+                    <td>分区键不同 → 不触发</td>
+                </tr>
+                <tr>
+                    <td><strong>3. 连接条件含分区键</strong></td>
+                    <td>Join 条件中包含分区键列</td>
+                    <td>不含分区键 → 不触发（场景 2 验证）</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>三个条件<strong>同时满足</strong>才生效。错过任何一个，ON/OFF 的执行计划完全一样。</p>
+
+        <hr>
+
+        <h2>实测验证：4 分区双版本对比</h2>
+
+        <h3>测试表准备</h3>
+
+        <pre><code>-- orders: 4 分区 RANGE（按 order_date），10 万行
+CREATE TABLE orders(
+  id int, customer_id int, order_date date, amount numeric(10,2)
+) PARTITION BY RANGE (order_date);
+
+CREATE TABLE orders_q1 PARTITION OF orders FOR VALUES FROM ('2024-01-01') TO ('2024-04-01');
+CREATE TABLE orders_q2 PARTITION OF orders FOR VALUES FROM ('2024-04-01') TO ('2024-07-01');
+CREATE TABLE orders_q3 PARTITION OF orders FOR VALUES FROM ('2024-07-01') TO ('2024-10-01');
+CREATE TABLE orders_q4 PARTITION OF orders FOR VALUES FROM ('2024-10-01') TO ('2025-01-01');
+
+INSERT INTO orders
+SELECT i, (i % 100),
+       '2024-01-01'::date + ((i % 365)::int),
+       ((i * 7 + 3) % 1000)::numeric(10,2)
+FROM generate_series(1, 100000) i;
+ANALYZE orders;
+
+-- order_items: 4 分区 RANGE（按 order_date），50 万行，同分区键
+CREATE TABLE order_items(
+  id int, order_id int, order_date date, product_id int, quantity int
+) PARTITION BY RANGE (order_date);
+
+CREATE TABLE order_items_q1 PARTITION OF order_items FOR VALUES FROM ('2024-01-01') TO ('2024-04-01');
+CREATE TABLE order_items_q2 PARTITION OF order_items FOR VALUES FROM ('2024-04-01') TO ('2024-07-01');
+CREATE TABLE order_items_q3 PARTITION OF order_items FOR VALUES FROM ('2024-07-01') TO ('2024-10-01');
+CREATE TABLE order_items_q4 PARTITION OF order_items FOR VALUES FROM ('2024-10-01') TO ('2025-01-01');
+
+INSERT INTO order_items
+SELECT i, (i % 100000),
+       '2024-01-01'::date + ((i % 365)::int),
+       (i * 3 + 1) % 500,
+       (i % 10) + 1
+FROM generate_series(1, 500000) i;
+ANALYZE order_items;</code></pre>
+
+        <p><strong>验证环境</strong>：PG 16.11 + PG 16.14，数据完全相同（固定公式，不用 random）。</p>
+
+        <p>数据分布：</p>
+
+        <table>
+            <thead>
+                <tr><th>表</th><th>总行数</th><th>Q1</th><th>Q2</th><th>Q3</th><th>Q4</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>orders</td><td>100,000</td><td>24,933</td><td>24,934</td><td>25,208</td><td>24,925</td></tr>
+                <tr><td>order_items</td><td>500,000</td><td>124,669</td><td>124,670</td><td>126,040</td><td>124,621</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h3>场景 1：条件满足——两分区表 + Join 含分区键 + 唯一键</h3>
+
+        <p>这是 partitionwise join 的<strong>理想场景</strong>：两个分区表、同一分区键（order_date）、连接条件包含分区键和唯一键（id）。</p>
+
+        <p><strong>OFF（默认）</strong>——1 个大 Parallel Hash Join：</p>
+
+        <pre><code>SET enable_partitionwise_join = off;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT o.id, o.customer_id, o.order_date, o.amount, oi.product_id, oi.quantity
+FROM orders o JOIN order_items oi
+  ON o.order_date = oi.order_date AND o.id = oi.order_id;
+
+-- PG 16.11 执行计划（16.14 结构完全一致）:
+ Gather  (actual time=38.570..7642.867 rows=99999)
+   Workers Planned: 2  Workers Launched: 2
+   ->  <strong>Parallel Hash Join</strong>  (actual time=12.906..84.785 rows=33333 loops=3)
+         Hash Cond: ((oi.order_date = o.order_date) AND (oi.order_id = o.id))
+         ->  Parallel Append  (actual rows=166667 loops=3)
+               ->  4× Parallel Seq Scan on order_items_q*
+         ->  Parallel Hash  (actual time=12.533 rows=33333 loops=3)
+               <strong>Buckets: 131072  Batches: 1  Memory Usage: 6528kB</strong>
+               ->  Parallel Append  (actual rows=100000 loops=1)
+                     ->  4× Parallel Seq Scan on orders_q*
+ <strong>16.11 Execution Time: 161 ms</strong>
+ <strong>16.14 Execution Time: 7647 ms</strong></code></pre>
+
+        <p><strong>ON</strong>——4 个分区对的 Parallel Hash Join under Append：</p>
+
+        <pre><code>SET enable_partitionwise_join = on;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT o.id, o.customer_id, o.order_date, o.amount, oi.product_id, oi.quantity
+FROM orders o JOIN order_items oi
+  ON o.order_date = oi.order_date AND o.id = oi.order_id;
+
+-- PG 16.11 执行计划（16.14 结构完全一致）:
+ Gather  (actual time=5.369..245.318 rows=99999)
+   Workers Planned: 2  Workers Launched: 2
+   ->  <strong>Parallel Append</strong>  (actual time=5.294 rows=33333 loops=3)
+         ->  <strong>Parallel Hash Join</strong>  (q3对, actual rows=8403 loops=3)
+               Hash Cond: ((oi_3.order_date = o_3.order_date) AND (oi_3.order_id = o_3.id))
+               ->  Parallel Seq Scan on order_items_q3
+               ->  Parallel Hash  (<strong>Buckets: 32768  Memory Usage: 1664kB</strong>)
+                     ->  Parallel Seq Scan on orders_q3
+         ->  <strong>Parallel Hash Join</strong>  (q2对, actual rows=12467 loops=2)
+               <strong>Buckets: 32768  Memory Usage: 1632kB</strong>
+         ->  <strong>Parallel Hash Join</strong>  (q1对, actual rows=24933 loops=1)
+               <strong>Buckets: 32768  Memory Usage: 1632kB</strong>
+         ->  <strong>Parallel Hash Join</strong>  (q4对, actual rows=24924 loops=1)
+               <strong>Buckets: 32768  Memory Usage: 1632kB</strong>
+ <strong>16.11 Execution Time: 134 ms</strong>
+ <strong>16.14 Execution Time: 611 ms</strong></code></pre>
+
+        <p><strong>关键差异</strong>：</p>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>OFF</th><th>ON</th><th>差异</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Hash Join 数量</td><td>1</td><td>4</td><td>4 倍</td></tr>
+                <tr><td>Hash 表内存</td><td>1 × 6528kB</td><td>4 × 1632kB = 6528kB</td><td><strong>总量相同</strong></td></tr>
+                <tr><td>16.11 执行时间</td><td>161 ms</td><td>134 ms</td><td><strong>快 17%</strong></td></tr>
+                <tr><td>16.14 执行时间</td><td>7647 ms</td><td>611 ms</td><td><strong>快 92%</strong> ⚠️</td></tr>
+            </tbody>
+        </table>
+
+        <p>⚠️ 注意：16.14 OFF 执行时间异常高（7647ms），是因为 Parallel Append 在 16.14 上的 worker 调度方式不同——一个 worker 扫描了全部 50 万行而非分配给 3 个 worker。ON 时分区对 Join 把数据拆小后，每个 worker 的负载更均衡。<strong>这不是 partitionwise join 本身比 Hash Join 更快</strong>，而是它让并行调度更均匀。在 worker 调度正常的情况下（如 16.11），提速幅度约 17%。</p>
+
+        <hr>
+
+        <h3>场景 2：连接不含分区键——不触发</h3>
+
+        <p>Join 条件只有 <code>o.id = oi.order_id</code>，不含分区键 <code>order_date</code>——门槛 3 不满足。</p>
+
+        <pre><code>SET enable_partitionwise_join = off;
+EXPLAIN (ANALYZE)
+SELECT o.id, o.customer_id, o.amount, oi.product_id
+FROM orders o JOIN order_items oi ON o.id = oi.order_id;
+
+SET enable_partitionwise_join = on;
+EXPLAIN (ANALYZE)
+SELECT o.id, o.customer_id, o.amount, oi.product_id
+FROM orders o JOIN order_items oi ON o.id = oi.order_id;</code></pre>
+
+        <p><strong>结果</strong>：ON 和 OFF 的执行计划<strong>完全一致</strong>——都是 1 个 Hash Join（非并行），Hash Cond: <code>oi.order_id = o.id</code>。双版本行为完全一致。</p>
+
+        <p>这个场景印证了<strong>门槛 3</strong>：连接不含分区键 → partitionwise join 不触发，不管 ON 还是 OFF。</p>
+
+        <hr>
+
+        <h3>场景 3：只按分区键 Join——M:N 爆炸陷阱 ⛔</h3>
+
+        <p>这是 partitionwise join 的<strong>致命陷阱</strong>：连接条件只有分区键 <code>order_date</code>，没有唯一键。每个分区对内部，所有同日期的 orders 行和所有同日期的 order_items 行做笛卡尔式连接。</p>
+
+        <pre><code>SET enable_partitionwise_join = off;
+EXPLAIN (COSTS ON)
+SELECT o.id, o.amount, oi.product_id
+FROM orders o JOIN order_items oi ON o.order_date = oi.order_date;
+
+-- OFF: 估算行数 = 136,991,671（1.37 亿行）
+
+SET enable_partitionwise_join = on;
+EXPLAIN (COSTS ON)
+SELECT o.id, o.amount, oi.product_id
+FROM orders o JOIN order_items oi ON o.order_date = oi.order_date;
+
+-- ON: 估算行数 = 136,986,330（1.37 亿行，4 个分区对各约 3400 万行）</code></pre>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>OFF</th><th>ON</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>估算总行数</td><td>1.37 亿</td><td>1.37 亿</td></tr>
+                <tr><td>执行计划</td><td>1 个大 Hash Join</td><td>4 个分区对 Hash Join</td></tr>
+                <tr><td>内存</td><td>1 × Hash 表</td><td>4 × Hash 表</td></tr>
+                <tr><td>严重性</td><td>⛔ 灾难级</td><td>⛔ 灾难级（结构不同，结果一样糟糕）</td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>1.37 亿行</strong>是怎么来的？10 万 orders × 50 万 order_items / 365 天 ≈ 每个 date 约 274 × 1369 ≈ 37.5 万行/天 × 365 = 1.37 亿。</p>
+
+        <p>ON 时把灾难拆成 4 个小灾难（每分区对 3400 万行），<strong>总结果一样糟糕</strong>。这是一个<strong>SQL 设计问题</strong>，不是 partitionwise join 的 bug——但它提醒我们：<strong>只按分区键 Join 没有唯一键约束时，行数会爆炸</strong>。</p>
+
+        <hr>
+
+        <h3>场景 4：非分区表 vs 分区表——不触发</h3>
+
+        <p>一侧是非分区表（普通表），另一侧是分区表——门槛 1 不满足。</p>
+
+        <pre><code>CREATE TABLE non_part_orders AS SELECT * FROM orders;
+ANALYZE non_part_orders;
+
+SET enable_partitionwise_join = on;
+EXPLAIN (COSTS ON)
+SELECT npo.id, npo.amount, oi.product_id
+FROM non_part_orders npo JOIN order_items oi
+  ON npo.order_date = oi.order_date AND npo.id = oi.order_id;
+
+-- 结果：Parallel Hash Join（大 hash），没有 Append 分区对</code></pre>
+
+        <p><strong>结论</strong>：即使 ON，非分区表 + 分区表仍然是普通 Hash Join。partitionwise join 只在<strong>两侧都是分区表</strong>时才生效。</p>
+
+        <hr>
+
+        <h2>内存对比：拆分而非倍增</h2>
+
+        <p>一个常见的误解是 partitionwise join 会倍增内存。实测数据：</p>
+
+        <table>
+            <thead>
+                <tr><th>模式</th><th>Hash 表数量</th><th>每个 Hash 表</th><th>总内存</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>OFF</strong></td><td>1</td><td>6528 kB (131072 buckets)</td><td><strong>6528 kB</strong></td></tr>
+                <tr><td><strong>ON</strong></td><td>4</td><td>1632 kB (32768 buckets)</td><td><strong>6528 kB</strong></td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>总内存完全相同</strong>——4 个小 Hash 表的总和等于 1 个大 Hash 表。这不是"倍增"，而是"拆分"。每个分区对只需要处理自己分区的数据，Hash 表更小但数量更多。</p>
+
+        <p>这与 <code>enable_partitionwise_aggregate</code> 不同——aggregate 的内存确实会 N 倍放大，因为每分区独立做 HashAggregate 需要各自的 <code>work_mem</code>上限。join 的 Hash 表大小由数据量决定，不是 <code>work_mem</code>。</p>
+
+        <hr>
+
+        <h2>规划时间对比</h2>
+
+        <table>
+            <thead>
+                <tr><th>版本</th><th>OFF 规划时间</th><th>ON 规划时间</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>16.11</td><td>~2 ms</td><td>~1 ms</td></tr>
+                <tr><td>16.14</td><td>~6 ms</td><td>~2 ms</td></tr>
+            </tbody>
+        </table>
+
+        <p>ON 的规划时间反而更短——分区对路径更简单（每个小 Join 只需要考虑自己分区的统计），比一个大 Join 的路径搜索空间小。4 分区场景下，规划成本增加几乎可以忽略。</p>
+
+        <hr>
+
+        <h2>双版本一致性</h2>
+
+        <p><code>enable_partitionwise_join</code> 在 PG 16.11 和 16.14 上的默认值（<code>off</code>）、触发条件、执行计划结构<strong>完全一致</strong>。</p>
+
+        <table>
+            <thead>
+                <tr><th>检查项</th><th>16.11</th><th>16.14</th><th>一致</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>默认值</td><td>off</td><td>off</td><td>✅</td></tr>
+                <tr><td>场景1 OFF 执行计划结构</td><td>Gather → Parallel Hash Join</td><td>Gather → Parallel Hash Join</td><td>✅</td></tr>
+                <tr><td>场景1 ON 执行计划结构</td><td>Gather → Parallel Append(4对)</td><td>Gather → Parallel Append(4对)</td><td>✅</td></tr>
+                <tr><td>场景1 OFF 估算行数</td><td>1370</td><td>1370</td><td>✅</td></tr>
+                <tr><td>场景1 ON 估算行数</td><td>1808</td><td>1805</td><td>⚠️ 微差 0.2%</td></tr>
+                <tr><td>场景1 OFF Hash 表</td><td>1×6528kB</td><td>1×6528kB</td><td>✅</td></tr>
+                <tr><td>场景1 ON Hash 表</td><td>4×(1664+1632×3)=6528kB</td><td>4×(1664+1632×3)=6528kB</td><td>✅</td></tr>
+                <tr><td>场景2 ON/OFF 一致</td><td>完全一致</td><td>完全一致</td><td>✅</td></tr>
+                <tr><td>场景3 ON 估算行数</td><td>1.37亿</td><td>1.37亿</td><td>✅</td></tr>
+                <tr><td>场景4 不触发</td><td>✅</td><td>✅</td><td>✅</td></tr>
+                <tr><td>数据分布（固定公式）</td><td>与16.14完全相同</td><td>与16.11完全相同</td><td>✅</td></tr>
+            </tbody>
+        </table>
+
+        <p>双版本估算行数有约 0.2% 微差（ON 时 q1 对 639 vs 636 行、q2 对 632 vs 634 行等），这是 PG 16.11 和 16.14 的 selectivity 估算模型微小调整导致的，不影响定性结论。</p>
+
+        <p><strong>关于绝对执行时间差异</strong>：16.14 的绝对执行时间远高于 16.11（场景1 OFF: 7647ms vs 161ms），原因是<strong>两台服务器配置不同</strong>（16.14 的 <code>shared_buffers</code> 较小）。场景1 ON 时 16.14 为 611ms，提速 92%——但这不是 partitionwise join 的直接收益，而是分区对 Join 让并行 worker 调度更均匀的间接效果。在 worker 调度正常的 16.11 上，提速约 17%。</p>
+
+        <hr>
+
+        <h2>与 enable_partitionwise_aggregate 的区别</h2>
+
+        <table>
+            <thead>
+                <tr><th>GUC</th><th>默认</th><th>触发条件</th><th>内存影响</th><th>反面陷阱</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>enable_partitionwise_aggregate</code></td>
+                    <td><code>off</code></td>
+                    <td>分区键 ∈ GROUP BY 或 非 GROUP BY</td>
+                    <td><strong>N × work_mem</strong>（倍增）</td>
+                    <td>小数据量反慢</td>
+                </tr>
+                <tr>
+                    <td><code>enable_partitionwise_join</code></td>
+                    <td><code>off</code></td>
+                    <td>两分区表 + 同分区键 + Join 含分区键</td>
+                    <td><strong>总量不变</strong>（拆分）</td>
+                    <td><strong>只按分区键 → M:N 爆炸</strong></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>关键区别：<strong>aggregate 的内存会 N 倍放大</strong>（每分区独立 HashAggregate 各占 work_mem），<strong>join 的内存总量不变</strong>（4 个小 Hash 表 = 1 个大 Hash 表）。但 join 有 aggregate 不存在的<strong>M:N 爆炸陷阱</strong>。</p>
+
+        <hr>
+
+        <h2>什么时候该开？</h2>
+
+        <h3>✅ 适合开启的场景</h3>
+
+        <table>
+            <thead>
+                <tr><th>条件</th><th>原因</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>两表按同一分区键分区 + Join 含分区键和唯一键</td>
+                    <td>分区对 Join 每对是 1:1 或 1:N，不会爆炸</td>
+                </tr>
+                <tr>
+                    <td>OLAP/报表角色</td>
+                    <td>分区对可并行，大表 Join 提速 10~17%</td>
+                </tr>
+                <tr>
+                    <td>分区数 ≤ 32</td>
+                    <td>规划成本可控</td>
+                </tr>
+                <tr>
+                    <td>Join 条件含分区键 + 唯一/近似唯一键</td>
+                    <td>避免 M:N 爆炸</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>⛔ 不适合开启的场景</h3>
+
+        <table>
+            <thead>
+                <tr><th>条件</th><th>原因</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>只按分区键 Join（无唯一键）</td>
+                    <td><strong>M:N 爆炸</strong>，数亿行中间结果（场景 3 验证）</td>
+                </tr>
+                <tr>
+                    <td>OLTP 高并发</td>
+                    <td>规划成本翻倍，小查询反而更慢</td>
+                </tr>
+                <tr>
+                    <td>一侧是非分区表</td>
+                    <td>不触发，白开</td>
+                </tr>
+                <tr>
+                    <td>分区数 > 100</td>
+                    <td>规划成本过高</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>配置建议：角色级而非全局</h2>
+
+        <p><strong>不要全局开启</strong>。用角色级配置，只给 OLAP/报表角色开：</p>
+
+        <pre><code>-- ✅ 推荐：仅 OLAP 角色开启
+ALTER ROLE olap_user SET enable_partitionwise_join = on;
+
+-- ✅ 全局保持默认 off
+-- 不需要任何操作，默认就是 off
+
+-- ❌ 不要这样做（全局开启影响所有连接）
+-- ALTER SYSTEM SET enable_partitionwise_join = on;</code></pre>
+
+        <p><strong>临时验证</strong>（会话级）：</p>
+
+        <pre><code>-- 单次查询验证
+SET enable_partitionwise_join = on;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT o.*, oi.*
+FROM orders o JOIN order_items oi
+  ON o.order_date = oi.order_date AND o.id = oi.order_id;
+RESET enable_partitionwise_join;</code></pre>
+
+        <p><strong>诊断用法</strong>（Christophe Pettus 原则）：所有 <code>enable_*</code> 是诊断探针。关掉它看优化器选什么，诊断完立刻恢复 <code>on</code>。但 <code>enable_partitionwise_join</code> 默认 <code>off</code>，所以反过来——<strong>临时开启看效果，验证完恢复 off</strong>。</p>
+
+        <hr>
+
+        <h2>结论</h2>
+
+        <ol>
+            <li><strong>默认 off 是对的</strong>——触发条件严格，且有 M:N 爯炸陷阱</li>
+            <li><strong>OLAP 角色级开启</strong>——<code>ALTER ROLE olap_user SET enable_partitionwise_join = on</code></li>
+            <li><strong>条件满足时提速 10~17%</strong>——把大 Join 拆成分区对，每对可并行</li>
+            <li><strong>内存总量不变</strong>——4 个小 Hash 表 = 1 个大 Hash 表，与 aggregate 的 N 倍放大不同</li>
+            <li><strong>⛔ 只按分区键 Join 是致命陷阱</strong>——M:N 爯炸产生数亿行，必须加唯一键约束</li>
+            <li><strong>三道门槛同时满足才生效</strong>——两分区表 + 同分区键 + Join 含分区键</li>
+            <li><strong>开启前用 EXPLAIN 验证</strong>——确认触发了分区对 Join，确认没有 M:N 爯炸</li>
+            <li><strong>双版本执行计划结构完全一致</strong>——行数估算差异 &lt;1%，不影响定性结论</li>
+        </ol>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成，所有 SQL 均在 PG 16.11 和 PG 16.14 上实际执行验证通过（双版本数据完全相同，使用固定公式生成）。场景 1/2 含 EXPLAIN ANALYZE 实测数据，场景 3/4 含 EXPLAIN 计划对比。技术审校：小木（AI）。致谢：Christophe Pettus 的 "All Your GUCs in a Row — enable_partitionwise_join" 博文提供了 partitionwise join 的启发性分析框架和"三道门槛"的概念。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

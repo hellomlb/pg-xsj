@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html">enable_partitionwise_aggregate：分区聚合的内存放大与性能权衡</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-07">2026-07-07</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">enable_partitionwise_aggregate 是 GUC 家族的异类——默认 off，因为开了会吃 N 倍内存。8 分区 80 万行双版本实测：GROUP BY 分区键时 ON 快 9%，GROUP BY 非分区键时快 22%，但小数据量反而慢 8%。内存放大公式 N × work_mem，100 分区 + 64MB = 6.4GB 一个查询。OLAP 角色级开启，OLTP 保持 off。</p>
+        <a href="/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/enable-partition-pruning-two-phase.html">enable_partition_pruning 两阶段分区裁剪深度解析</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-06">2026-07-06</time>

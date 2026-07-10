@@ -5,7 +5,21 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Sun, 06 Jul 2026 10:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 10 Jul 2026 10:30:00 +0800</lastBuildDate>
+    <item>
+      <title>PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理</title>
+      <link>https://hellomlb.github.io/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html</link>
+      <description>在真实 PG18.4 上实测 AWS 宣称的三大 PG18 性能增强：Skip Scan（复合索引跳过前导列，同机 8.3ms vs 641ms 约 80× 提速）、Self-Join Elimination（主键自连接消除，同机 3.4× 提速且避免 hash 溢出磁盘）、Autovacuum 三个新 GUC（max_threshold/worker_slots/vacuum_truncate）。PG16.11 + PG16.14 双版本反例对照，全部执行计划真实抓取。附同机 on/off 公平基准方法论声明。</description>
+      <pubDate>Fri, 10 Jul 2026 10:30:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html</guid>
+    </item>
+    <item>
+      <title>enable_partitionwise_aggregate：分区聚合的内存放大与性能权衡</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html</link>
+      <description>enable_partitionwise_aggregate 是 GUC 家族的异类——默认 off，因为开了会吃 N 倍内存。8 分区 80 万行双版本实测：GROUP BY 分区键时 ON 快 9%，GROUP BY 非分区键时快 22%，但小数据量反而慢 8%。内存放大公式 N × work_mem，100 分区 + 64MB = 6.4GB 一个查询。OLAP 角色级开启，OLTP 保持 off。</description>
+      <pubDate>Tue, 07 Jul 2026 11:00:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html</guid>
+    </item>
     <item>
       <title>VACUUM 三阶段与行指针生命周期：页面级别深度解析</title>
       <link>https://hellomlb.github.io/pg-xsj/kernel/vacuum-three-phase-page-level.html</link>

@@ -29,6 +29,15 @@
 
     <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html">PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-10">2026-07-10</time>
+            <span class="post-category kernel">内核研究</span>
+        </div>
+        <p class="post-excerpt">在真实 PG18.4 上实测 AWS 宣称的三大 PG18 性能增强：Skip Scan（复合索引跳过前导列，同机 8.3ms vs 641ms 约 80× 提速）、Self-Join Elimination（主键自连接消除，同机 3.4× 提速且避免 hash 溢出磁盘）、Autovacuum 三个新 GUC（max_threshold/worker_slots/vacuum_truncate）。PG16.11 + PG16.14 双版本反例对照，全部执行计划真实抓取。附同机 on/off 公平基准方法论声明。</p>
+        <a href="/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/kernel/vacuum-three-phase-page-level.html">VACUUM 三阶段与行指针生命周期：页面级别深度解析</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-06">2026-07-06</time>

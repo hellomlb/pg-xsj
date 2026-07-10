@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>log_statement_max_length 的漏网之鱼：EXECUTE 的 DETAIL 绕过长度限制 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="PostgreSQL 日志截断的一个小漏洞：EXECUTE 命令的 DETAIL 消息里打印的 prepared statement 原文不遵守 log_statement_max_length 长度限制，上游 2026-07-10 合入补丁修复。我们在 16.11/16.14/19beta1 真实环境验证参数存在性，并用 log_parameter_max_length 双版本实测截断机制。">
+    <meta property="og:title" content="log_statement_max_length 的漏网之鱼：EXECUTE 的 DETAIL 绕过长度限制">
+    <meta property="og:description" content="EXECUTE 的 DETAIL 绕过 log_statement_max_length 不截断，上游 2026-07-10 修复（999a841 + 5594f20）。三版本验证参数不存在，log_parameter_max_length 双版本实测确凿。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/ops/log-statement-max-length-execute-detail-fix.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>log_statement_max_length 的漏网之鱼：EXECUTE 的 DETAIL 绕过长度限制</h1>
+        <div class="post-meta">
+            <span class="badge badge-verified" title="SQL 已在真实 PostgreSQL 环境中验证">✅ SQL 验证通过</span>
+            <time datetime="2026-07-10">2026-07-10</time>
+            <span class="post-category ops">日常运维</span>
+            <span class="post-tags">
+                <span class="tag">log_statement_max_length</span>
+                <span class="tag">log_parameter_max_length</span>
+                <span class="tag">日志截断</span>
+                <span class="tag">EXECUTE</span>
+                <span class="tag">prepared statement</span>
+                <span class="tag">GUC</span>
+                <span class="tag">上游补丁</span>
+            </span>
+        </div>
+    </header>
+
+    <div class="post-content">
+        <div class="highlight">
+            <p>⚠️ <strong>验证范围说明</strong>：<code>log_statement_max_length</code> 是我们在验证时才发现的——它是 <strong>2026-07-10 才合入 master 的全新 GUC</strong>。我们的 16.11 / 16.14 / 19beta1 实例<strong>都不含这个参数</strong>，因此该 bug 无法在现有版本复现。下文所有 SQL 均为真实环境跑通的结果：参数存在性在三版本核查、截断机制在 16.11 + 16.14 双版本实测。</p>
+        </div>
+
+        <h2>一句话总结</h2>
+        <p><code>log_statement_max_length</code> 用来限制日志里 SQL 文本的最大长度，但 <code>EXECUTE</code> 在 <code>DETAIL</code> 消息里打印的 prepared statement 原文一直没遵守这个限制——直到 2026-07-10 上游合入补丁修复。由于该参数本身很新，我们手头的版本都不受影响，也无法复现。</p>
+
+        <hr>
+
+        <h2>背景：这个参数管什么</h2>
+        <p>PostgreSQL 用一组 GUC 控制"日志里 SQL 能记多长"：</p>
+        <table>
+            <thead>
+                <tr><th>参数</th><th>引入版本</th><th>管什么</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>log_statement_max_length</code></td><td>PG20（2026-07-10 合入 master）</td><td>日志里<strong>语句文本</strong>的最大字节数</td></tr>
+                <tr><td><code>log_parameter_max_length</code></td><td>PG15</td><td>日志里<strong>绑定参数值</strong>的最大字节数</td></tr>
+            </tbody>
+        </table>
+        <p>设成 <code>10</code>，超长的语句在日志里只保留前 10 字节。本文的 bug 出在"语句文本"这一支。</p>
+
+        <h2>问题：EXECUTE 的 DETAIL 漏了</h2>
+        <p>当你 <code>EXECUTE</code> 一个 prepared statement 时，PostgreSQL 会额外在 <code>DETAIL</code> 消息里把 prepared statement 的原文再打印一遍。Fujii Masao 在 review 时发现：这段 DETAIL 文本<strong>根本不走 <code>log_statement_max_length</code> 的截断逻辑</strong>。于是哪怕你把限制设得很小，巨大查询的原文照样完整漏进日志。</p>
+        <pre><code>-- 上游复现（master 修复前）
+=# SET log_statement_max_length TO 10;
+=# EXECUTE test(1);
+LOG:  statement: EXECUTE te
+DETAIL:  prepare: PREPARE test AS SELECT * FROM pgbench_accounts WHERE aid = $1;</code></pre>
+        <p>主语句被截成 <code>EXECUTE te</code>，<code>DETAIL</code> 里的原文却完整无缺——这就是漏网之鱼。</p>
+
+        <h2>上游修复（提一下）</h2>
+        <p>2026-07-10，Jim Jones 提交、Fujii Masao 合入 master 的两个 commit：</p>
+        <ul>
+            <li><code>999a841</code>：让 <code>EXECUTE</code> 的 <code>DETAIL</code> 也走统一截断逻辑，并在被截断处追加 <code>...</code> 标记（与 <code>log_parameter_max_length</code> 风格一致）；<code>0</code> 长度时只输出省略号</li>
+            <li><code>5594f20</code>：简化了调用方的冗余判断</li>
+        </ul>
+        <p>（补丁源码细节此处不展开，想深挖可直接翻上面两个 commit。）</p>
+
+        <hr>
+
+        <h2>我们在真实环境验证</h2>
+
+        <h3>验证一：三个版本都没有这个参数</h3>
+        <p>分别在 PG 16.11、16.14、19beta1 上查 <code>pg_settings</code>：</p>
+        <pre><code>SELECT name
+FROM pg_settings
+WHERE name = 'log_statement_max_length';</code></pre>
+        <p>三版本<strong>均返回空集</strong>。结论：</p>
+        <table>
+            <thead>
+                <tr><th>版本</th><th>log_statement_max_length</th><th>log_parameter_max_length</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>PG 16.11</td><td>不存在</td><td>存在</td></tr>
+                <tr><td>PG 16.14</td><td>不存在</td><td>存在</td></tr>
+                <tr><td>PG 19beta1</td><td>不存在</td><td>存在</td></tr>
+            </tbody>
+        </table>
+        <p>这个参数是当天才随补丁进 master 的新 GUC，19beta1 在它之前就已冻结，16.x 更没有。所以该 bug 在我们维护的所有版本上<strong>既不存在、也无法复现</strong>（因为特性本身尚不存在）。</p>
+
+        <h3>验证二：截断 + <code>...</code> 标记机制本身是真的（双版本）</h3>
+        <p>虽然 <code>log_statement_max_length</code> 没有，但它的近亲 <code>log_parameter_max_length</code>（PG15+）在我们三个版本都在。我们在 <strong>16.11 和 16.14</strong> 上用 extended protocol 实测了它的截断行为：</p>
+        <pre><code>SET log_statement = 'all';
+SET log_parameter_max_length = 5;
+SELECT $1 AS v \bind 'abcdefghijk' \g</code></pre>
+        <p>两版本日志均出现：</p>
+        <pre><code>LOG:  execute &lt;unnamed&gt;: SELECT $1 AS v
+DETAIL:  parameters: $1 = 'abcde...'</code></pre>
+        <p><code>abcdefghijk</code>（11 字节）被截成 <code>abcde</code>（5 字节）并追加 <code>...</code>。这证明 PostgreSQL 早已采用"截断 + <code>...</code> 标记"的日志风格，上游这次修复只是把<strong>语句文本</strong>也对齐到同一套逻辑。</p>
+
+        <hr>
+
+        <h2>对运维的启发</h2>
+        <table>
+            <thead>
+                <tr><th>要点</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>日志长度治理要等 PG20</td><td>若依赖 <code>log_statement_max_length</code> 控制日志体积，需等包含该修复的版本（预计 PG20）发布</td></tr>
+                <tr><td>现在可用 <code>log_parameter_max_length</code></td><td>它早已能截断绑定参数值，对防止手机号/token 等敏感数据泄露到日志尤其有用，建议生产设合理值</td></tr>
+                <tr><td>排查日志别只盯主语句</td><td><code>EXECUTE</code> 的 <code>DETAIL</code> 过去可能携带超长原文；PG20 修复后 <code>prepare: ...</code> 也会被统一截断</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>小结</h2>
+        <ul>
+            <li><strong>问题</strong>：<code>EXECUTE</code> 的 <code>DETAIL</code> 绕过 <code>log_statement_max_length</code> 不截断</li>
+            <li><strong>修复</strong>：2026-07-10 合入 master（<code>999a841</code> + <code>5594f20</code>）</li>
+            <li><strong>现状</strong>：16.11 / 16.14 / 19beta1 均无此参数，无法复现；同类机制 <code>log_parameter_max_length</code> 双版本实测确凿</li>
+            <li><strong>待办</strong>：PG20 发布后补一篇真实验证</li>
+        </ul>
+
+        <hr>
+
+        <p><small>📝 本文由 AI 辅助整理，所有 SQL 均在真实 PostgreSQL 环境（16.11 / 16.14 / 19beta1）验证通过；其中 <code>log_statement_max_length</code> 相关 bug 行为因参数不存在未复现，已在文中明确标注。</small></p>
+    </div>
+</article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

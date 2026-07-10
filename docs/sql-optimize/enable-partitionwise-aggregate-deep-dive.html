@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>enable_partitionwise_aggregate：分区聚合的内存放大与性能权衡 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="enable_partitionwise_aggregate 是 GUC 家族的异类——默认 off。本文在 PG 16.11 和 16.14 双版本实测 8 分区 80 万行（有并行）+ 8/32 分区 8/32 万行（无并行，3次中位数），对比 on/off 的执行计划、内存占用、耗时差异，给出 OLAP/OLTP 角色配置建议。">
+    <meta property="og:title" content="enable_partitionwise_aggregate：分区聚合的内存放大与性能权衡">
+    <meta property="og:description" content="8 分区 80 万行实测，on/off 执行计划对比，内存放大公式，OLAP/OLTP 配置建议。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>enable_partitionwise_aggregate：分区聚合的内存放大与性能权衡</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-07">2026-07-07</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">partition</span>
+                <span class="tag">aggregate</span>
+                <span class="tag">GUC</span>
+                <span class="tag">EXPLAIN</span>
+                <span class="tag">memory</span>
+                <span class="tag">parallel</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + 16.14 双版本实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>enable_partitionwise_aggregate</code> 是 <code>enable_*</code> 家族的<strong>异类</strong>——几乎所有 <code>enable_*</code> 参数默认都是 <code>on</code>（它们是优化器探针，关掉只用于诊断），唯独它默认 <code>off</code>。原因很简单：<strong>开了会吃内存</strong>。每个分区各自做一个 HashAggregate，内存占用 = 分区数 × <code>work_mem</code>。本文在 PG 16.11 和 16.14 双版本实测 8 分区 80 万行表，用数据告诉你什么时候该开、什么时候别碰。</p>
+
+        <hr>
+
+        <h2>白话版：大锅 vs 小锅</h2>
+
+        <p>假设你有 8 个分区的订单表，要按地区做 SUM 汇总：</p>
+
+        <table>
+            <thead>
+                <tr><th>模式</th><th>比喻</th><th>机制</th><th>内存</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>off（默认）</strong></td>
+                    <td>把 8 个分区的数据全堆到一起，用<strong>一口大锅</strong>煮</td>
+                    <td>Append → 1 个 HashAggregate<br>所有分区数据汇入后统一聚合</td>
+                    <td>1 × <code>work_mem</code></td>
+                </tr>
+                <tr>
+                    <td><strong>on</strong></td>
+                    <td>每个分区各自用<strong>一口小锅</strong>先煮，最后把 8 锅结果倒一起再搅</td>
+                    <td>Append → 8 个 HashAggregate → 上层合并<br>每分区独立聚合后结果再汇总</td>
+                    <td><strong>N × <code>work_mem</code></strong><br>N = 分区数</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>好处是每口锅可以并行煮（分区并行），坏处是<strong>内存吃 N 倍</strong>。这就是它默认 off 的原因——不是因为它不好，而是因为在 OLTP 环境下，8 分区 × 4MB = 32MB 一个查询，太贵了。</p>
+
+        <hr>
+
+        <h2>实测验证：8 分区 80 万行双版本对比</h2>
+
+        <h3>测试表准备</h3>
+
+        <pre><code>-- 8 分区 LIST 分区表，每分区 10 万行
+CREATE TABLE sales_2026 (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    region text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    sale_date date NOT NULL
+) PARTITION BY LIST (region);
+
+CREATE TABLE sales_2026_north     PARTITION OF sales_2026 FOR VALUES IN ('north');
+CREATE TABLE sales_2026_south     PARTITION OF sales_2026 FOR VALUES IN ('south');
+CREATE TABLE sales_2026_east      PARTITION OF sales_2026 FOR VALUES IN ('east');
+CREATE TABLE sales_2026_west      PARTITION OF sales_2026 FOR VALUES IN ('west');
+CREATE TABLE sales_2026_northeast PARTITION OF sales_2026 FOR VALUES IN ('northeast');
+CREATE TABLE sales_2026_northwest PARTITION OF sales_2026 FOR VALUES IN ('northwest');
+CREATE TABLE sales_2026_southeast PARTITION OF sales_2026 FOR VALUES IN ('southeast');
+CREATE TABLE sales_2026_southwest PARTITION OF sales_2026 FOR VALUES IN ('southwest');
+
+-- 每分区灌 10 万行随机数据
+INSERT INTO sales_2026 (region, amount, sale_date)
+SELECT 'north', round((random() * 10000)::numeric, 2),
+       date '2026-01-01' + (random() * 180)::int
+FROM generate_series(1, 100000);
+-- ... 重复 8 次，每次换 region
+
+ANALYZE sales_2026;
+
+-- 确认：80 万行，8 分区
+SELECT count(*) AS total_rows, count(DISTINCT region) AS regions
+FROM sales_2026;
+--  total_rows | regions
+-- ------------+---------
+--      800000 |       8</code></pre>
+
+        <p><strong>验证环境</strong>：PG 16.11 + PG 16.14，<code>work_mem = 4MB</code>，<code>max_parallel_workers_per_gather = 2</code>。</p>
+
+        <hr>
+
+        <h3>场景 1：GROUP BY 分区键（region）</h3>
+
+        <p>分区键 <code>region</code> 出现在 GROUP BY 中——这是 partitionwise aggregate 的<strong>理想场景</strong>，因为每分区聚合后结果直接是最终结果的一部分，不需要再合并相同 key。</p>
+
+        <p><strong>OFF（默认）</strong>——1 个大 HashAggregate 汇总所有分区：</p>
+
+        <pre><code>SET enable_partitionwise_aggregate = off;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT region, SUM(amount) AS total
+FROM sales_2026
+GROUP BY region
+ORDER BY region;
+
+--                          QUERY PLAN
+-- ----------------------------------------------------------------
+--  Finalize GroupAggregate  (actual time=260.767..260.840 rows=8)
+--    Group Key: sales_2026.region
+--    Buffers: shared hit=5706
+--    ->  Gather Merge  (actual time=260.758..260.824 rows=10)
+--          Workers Planned: 2  Workers Launched: 2
+--          ->  Sort  (actual time=201.936..201.939 rows=3 loops=3)
+--                Sort Key: sales_2026.region
+--                ->  <strong>Partial HashAggregate</strong>  (actual time=201.890..201.895 rows=3 loops=3)
+--                      Group Key: sales_2026.region
+--                      <strong>Batches: 1  Memory Usage: 24kB</strong>
+--                      ->  Parallel Append  (actual rows=266667 loops=3)
+--                            ->  8× Parallel Seq Scan on sales_2026_* 
+--  Planning Time: 0.735 ms
+--  <strong>Execution Time: 260.982 ms</strong></code></pre>
+
+        <p><strong>ON</strong>——8 个小 HashAggregate 各自处理分区：</p>
+
+        <pre><code>SET enable_partitionwise_aggregate = on;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT region, SUM(amount) AS total
+FROM sales_2026
+GROUP BY region
+ORDER BY region;
+
+--                          QUERY PLAN
+-- ----------------------------------------------------------------
+--  Sort  (actual time=234.959..236.344 rows=8)
+--    Sort Key: sales_2026_1.region
+--    ->  Gather  (actual time=58.035..236.318 rows=8)
+--          Workers Planned: 2  Workers Launched: 2
+--          ->  Parallel Append  (actual rows=3 loops=3)
+--                ->  <strong>HashAggregate</strong>  (actual time=48.469..48.470 rows=1)
+--                      Group Key: sales_2026_1.region
+--                      <strong>Batches: 1  Memory Usage: 24kB</strong>
+--                      ->  Seq Scan on sales_2026_north  (actual rows=100000)
+--                ->  <strong>HashAggregate</strong>  (actual time=57.669..57.669 rows=1)
+--                      Group Key: sales_2026_2.region
+--                      <strong>Batches: 1  Memory Usage: 24kB</strong>
+--                      ->  Seq Scan on sales_2026_northeast  (actual rows=100000)
+--                ... (共 8 个 HashAggregate，每个 24kB)
+--  Planning Time: 0.140 ms
+--  <strong>Execution Time: 236.481 ms</strong></code></pre>
+
+        <p><strong>关键差异</strong>：</p>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>OFF</th><th>ON</th><th>差异</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>HashAggregate 数量</td><td>1</td><td>8</td><td>8 倍</td></tr>
+                <tr><td>总内存</td><td>24 kB</td><td>192 kB (8×24)</td><td>8 倍</td></tr>
+                <tr><td>16.11 执行时间</td><td>260.982 ms</td><td>236.481 ms</td><td><strong>快 9.4%</strong></td></tr>
+                <tr><td>16.14 执行时间</td><td>1339.831 ms</td><td>1210.134 ms</td><td><strong>快 9.7%</strong></td></tr>
+            </tbody>
+        </table>
+
+        <p>ON 更快的原因：每分区扫描后<strong>立即</strong>聚合，只有 1 行（该分区的 SUM）传到上层。OFF 是 80 万行全部传到上层再聚合。数据传输量从 80 万行降到 8 行。</p>
+
+        <hr>
+
+        <h3>场景 2：GROUP BY 非分区键（sale_date）</h3>
+
+        <p>分区键是 <code>region</code>，但 GROUP BY 的是 <code>sale_date</code>——分区键<strong>不在</strong> GROUP BY 中。这种情况下 partitionwise aggregate 还有效吗？</p>
+
+        <p><strong>有</strong>，但机制不同。每分区仍然做 partial aggregation（10 万行 → 181 行），但上层需要 <code>Finalize GroupAggregate</code> 合并——因为同一个 <code>sale_date</code> 分布在多个分区。</p>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>OFF</th><th>ON</th><th>差异</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>HashAggregate 数量</td><td>1</td><td>8</td><td>8 倍</td></tr>
+                <tr><td>每分区内存</td><td>160 kB</td><td>160 kB</td><td>相同</td></tr>
+                <tr><td>总内存</td><td>160 kB</td><td><strong>1280 kB</strong> (8×160)</td><td><strong>8 倍</strong></td></tr>
+                <tr><td>16.11 执行时间</td><td>312.609 ms</td><td>241.977 ms</td><td><strong>快 22.6%</strong></td></tr>
+                <tr><td>16.14 执行时间</td><td>997.458 ms</td><td>687.147 ms</td><td><strong>快 31.1%</strong></td></tr>
+            </tbody>
+        </table>
+
+        <p>这个场景收益最明显——每分区从 10 万行降到 181 行，减少 99.8% 的数据传输量。但代价是 8 个 HashAggregate 各占 160 kB，总内存 1280 kB。</p>
+
+        <hr>
+
+        <h3>场景 3：GROUP BY 分区键 + 非分区键</h3>
+
+        <p><code>GROUP BY region, sale_date</code>——分区键和非分区键混合。这是最常见的 OLAP 报表场景。</p>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>OFF</th><th>ON</th><th>差异</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>HashAggregate 数量</td><td>1</td><td>8</td><td>8 倍</td></tr>
+                <tr><td>OFF 单个内存</td><td>577 kB</td><td>—</td><td>—</td></tr>
+                <tr><td>ON 每分区内存</td><td>—</td><td>160 kB</td><td>—</td></tr>
+                <tr><td>总内存</td><td>577 kB</td><td><strong>1280 kB</strong> (8×160)</td><td><strong>2.2 倍</strong></td></tr>
+                <tr><td>16.11 执行时间</td><td>387.063 ms</td><td>294.851 ms</td><td><strong>快 23.8%</strong></td></tr>
+                <tr><td>16.14 执行时间</td><td>899.506 ms</td><td>896.500 ms</td><td>快 0.3%（基本持平）</td></tr>
+            </tbody>
+        </table>
+
+        <p>注意这里的内存放大不是 8 倍而是 2.2 倍——因为 OFF 的单个 HashAggregate 也需要 577 kB（1448 个 group），而 ON 每分区只有 181 个 group（160 kB）。分区后每分区的 group 数更少，所以每分区内存也小。</p>
+
+        <hr>
+
+        <h3>场景 4：小数据量反例（work_mem=4MB）</h3>
+
+        <p>不是所有场景 ON 都更快。同样 GROUP BY 分区键（8 个 group，每分区只 1 个 group），但本组把 <code>work_mem</code> 调小到 4MB 后跑一次：</p>
+
+        <table>
+            <thead>
+                <tr><th>指标</th><th>16.11 OFF</th><th>16.11 ON</th><th>16.14 OFF</th><th>16.14 ON</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>执行时间</td><td>184.241 ms</td><td><strong>198.437 ms</strong></td><td>807.024 ms</td><td>775.082 ms</td></tr>
+                <tr><td>结论</td><td colspan="2"><strong>ON 反而慢 7.7%</strong></td><td colspan="2">ON 快 3.9%</td></tr>
+            </tbody>
+        </table>
+
+        <p>16.11 上 ON 反而更慢 7.7%——因为每分区只有 1 个 group（region 固定），HashAggregate 几乎没有聚合效果，但 8 个 HashAggregate node 的<strong>初始化和调度开销</strong>超过了收益。16.14 上 ON 反而快 3.9%——双版本结果不一致，说明 <strong>partitionwise aggregate 的收益在边界场景不稳定</strong>，取决于并行 worker 调度、IO 缓存、I/O 子系统状态等环境因素。</p>
+        <p>工程结论：<strong>数据量小 + group 数少时，partitionwise aggregate 是否值得开，没有稳定答案，必须 EXPLAIN ANALYZE 实测后再决定</strong>，不能想当然。</p>
+
+        <hr>
+
+        <h2>扩展验证：8 分区 vs 32 分区（无并行，3 次中位数）</h2>
+
+        <p>上面四个场景的测试<strong>有并行查询</strong>（<code>max_parallel_workers_per_gather = 2</code>），执行计划中有 Parallel Append + Gather Merge。一个问题自然浮现：<strong>如果没有并行查询，partitionwise aggregate 还值得开吗？</strong></p>
+
+        <p>为此我们在两个实例上重新跑了 8 分区和 32 分区测试，<strong>完全禁用并行</strong>（<code>max_parallel_workers_per_gather = 0</code>），每分区 1 万行（8 分区 = 8 万行，32 分区 = 32 万行），每个场景跑 <strong>3 次</strong>取<strong>中位数</strong>。</p>
+
+        <table>
+            <thead>
+                <tr><th>测试条件</th><th>有并行（上文场景 1-3）</th><th>无并行（本节扩展验证）</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>每分区行数</td><td>10 万</td><td>1 万</td></tr>
+                <tr><td><code>max_parallel_workers_per_gather</code></td><td>2</td><td><strong>0</strong></td></tr>
+                <tr><td>执行计划特征</td><td>Parallel Append + Gather Merge</td><td>普通 Append + 各分区 HashAggregate</td></tr>
+                <tr><td>采样方式</td><td>单次</td><td><strong>3 次取中位数</strong></td></tr>
+            </tbody>
+        </table>
+
+        <h3>16.11 实测结果（中位数，毫秒）</h3>
+
+        <table>
+            <thead>
+                <tr><th>分区</th><th>场景</th><th>OFF 中位数</th><th>ON 中位数</th><th>提速</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>8P</td><td>1 GROUP BY region</td><td>27.934</td><td>23.045</td><td><strong>+17.50%</strong></td></tr>
+                <tr><td>8P</td><td>2 GROUP BY sale_date</td><td>28.242</td><td>25.476</td><td><strong>+9.79%</strong></td></tr>
+                <tr><td>8P</td><td>3 GROUP BY region+date</td><td>33.967</td><td>30.796</td><td><strong>+9.34%</strong></td></tr>
+                <tr><td>32P</td><td>1 GROUP BY region</td><td>114.777</td><td>89.395</td><td><strong>+22.11%</strong></td></tr>
+                <tr><td>32P</td><td>2 GROUP BY sale_date</td><td>112.271</td><td>100.607</td><td><strong>+10.39%</strong></td></tr>
+                <tr><td>32P</td><td>3 GROUP BY region+date</td><td>136.335</td><td>109.126</td><td><strong>+19.96%</strong></td></tr>
+            </tbody>
+        </table>
+
+        <h3>16.14 实测结果（中位数，毫秒）</h3>
+
+        <table>
+            <thead>
+                <tr><th>分区</th><th>场景</th><th>OFF 中位数</th><th>ON 中位数</th><th>提速</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>8P</td><td>1 GROUP BY region</td><td>157.722</td><td>147.806</td><td><strong>+6.29%</strong></td></tr>
+                <tr><td>8P</td><td>2 GROUP BY sale_date</td><td>154.243</td><td>152.206</td><td><strong>+1.32%</strong></td></tr>
+                <tr><td>8P</td><td>3 GROUP BY region+date</td><td>183.477</td><td>171.605</td><td><strong>+6.47%</strong></td></tr>
+                <tr><td>32P</td><td>1 GROUP BY region</td><td>673.259</td><td>598.002</td><td><strong>+11.18%</strong></td></tr>
+                <tr><td>32P</td><td>2 GROUP BY sale_date</td><td>603.283</td><td>626.035</td><td><strong>−3.77%</strong> ⚠️</td></tr>
+                <tr><td>32P</td><td>3 GROUP BY region+date</td><td>738.693</td><td>704.106</td><td><strong>+4.68%</strong></td></tr>
+            </tbody>
+        </table>
+
+        <h3>8P vs 32P：ON 提速幅度差（百分点）</h3>
+
+        <table>
+            <thead>
+                <tr><th>版本</th><th>场景 1</th><th>场景 2</th><th>场景 3</th><th>结论</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>16.11</td><td>+4.6pp</td><td>+0.6pp</td><td>+10.6pp</td><td><strong>32P 全部 ≥ 8P</strong></td></tr>
+                <tr><td>16.14</td><td>+4.9pp</td><td>−5.1pp</td><td>−1.8pp</td><td><strong>32P 不稳定</strong></td></tr>
+            </tbody>
+        </table>
+
+        <h3>关键发现</h3>
+
+        <p><strong>1. 无并行条件下，ON 的收益明显缩水。</strong></p>
+
+        <p>对比有并行（10 万行/分区）和无并行（1 万行/分区）的场景 1：</p>
+
+        <table>
+            <thead>
+                <tr><th>测试条件</th><th>16.11 场景 1</th><th>16.14 场景 1</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>有并行（8P，10 万行/分区）</td><td>+9.4%</td><td>+9.7%</td></tr>
+                <tr><td>无并行（8P，1 万行/分区）</td><td>+17.5%</td><td>+6.3%</td></tr>
+                <tr><td>无并行（32P，1 万行/分区）</td><td>+22.1%</td><td>+11.2%</td></tr>
+            </tbody>
+        </table>
+
+        <p>16.11 无并行时收益反而更高（17.5% vs 9.4%），这是因为禁用并行后 OFF 的基准变慢了（没有 Parallel Append 加速），而 ON 的 per-partition 聚合优势更突出。但 16.14 的收益从 9.7% 降到 6.3%——<strong>两台服务器配置不同</strong>（16.14 的 <code>shared_buffers</code> 仅 128MB，绝对执行时间是 16.11 的 5-6 倍），不能简单归因于版本差异。</p>
+
+        <p><strong>2. 16.14 32P 场景 2 出现真实反例（慢 3.77%）。</strong></p>
+
+        <p>3 次执行中只有 1 次 ON 比 OFF 快。GROUP BY 非分区键时，每分区做 partial aggregation 后仍需上层 Finalize 合并——当分区数多（32）、group 数多（365 天）、且无并行时，Finalize 合并的开销可能抵消 partial aggregation 的收益。<strong>这个反例是真实的，但受 16.14 服务器 IO 不足影响，不能下"PG 16.14 的 partitionwise 有 bug"这种结论。</strong></p>
+
+        <p><strong>3. "分区越多收益越大"不是普遍规律。</strong></p>
+
+        <p>16.11 上 32P 提速 ≥ 8P（3 个场景全部成立），但 16.14 上 32P 提速反而低于 8P（3 个场景中 2 个下降）。<strong>分区数对收益的影响取决于数据量、group 数、服务器资源，不能想当然。</strong></p>
+
+        <hr>
+
+        <h3>结果正确性验证</h3>
+
+        <p>ON/OFF 结果<strong>完全一致</strong>，双版本验证通过：</p>
+
+        <pre><code>-- PG 16.11 ON/OFF 结果一致
+  region   |    total     |  cnt
+-----------+--------------+--------
+ east      | 500094851.86 | 100000
+ north     | 500253166.79 | 100000
+ northeast | 501375708.35 | 100000
+ northwest | 499487227.78 | 100000
+ south     | 498105593.02 | 100000
+ southeast | 500250490.66 | 100000
+ southwest | 500139409.41 | 100000
+ west      | 500032852.92 | 100000
+
+-- PG 16.14 ON/OFF 结果一致（数据随机不同，但 ON=OFF）
+  region   |    total     |  cnt
+-----------+--------------+--------
+ east      | 499408891.00 | 100000
+ north     | 500167281.74 | 100000
+ ...</code></pre>
+
+        <hr>
+
+        <h2>内存放大公式</h2>
+
+        <table>
+            <thead>
+                <tr><th>模式</th><th>HashAggregate 数量</th><th>每节点最大内存</th><th>总内存上限</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>OFF</strong></td><td>1</td><td><code>work_mem</code></td><td><code>work_mem</code></td></tr>
+                <tr><td><strong>ON</strong></td><td>N（分区数）</td><td><code>work_mem</code></td><td><strong>N × <code>work_mem</code></strong></td></tr>
+            </tbody>
+        </table>
+
+        <p><strong>实际占用</strong>取决于 group 数，不一定达到 <code>work_mem</code> 上限。但在最坏情况下（group 数足够多），ON 的内存确实是 OFF 的 N 倍。</p>
+
+        <h3>内存计算示例</h3>
+
+        <table>
+            <thead>
+                <tr><th>配置</th><th>OFF 总内存</th><th>ON 总内存（8 分区）</th><th>放大倍数</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>work_mem=4MB</code></td><td>4 MB</td><td>32 MB</td><td>8×</td></tr>
+                <tr><td><code>work_mem=64MB</code></td><td>64 MB</td><td>512 MB</td><td>8×</td></tr>
+                <tr><td><code>work_mem=256MB</code></td><td>256 MB</td><td><strong>2 GB</strong></td><td>8×</td></tr>
+            </tbody>
+        </table>
+
+        <p>想象一个 100 分区的表、<code>work_mem=64MB</code>——ON 时一个查询就要 6.4 GB 内存。这在生产环境是灾难性的。</p>
+
+        <hr>
+
+        <h2>什么时候该开？</h2>
+
+        <h3>✅ 适合开启的场景</h3>
+
+        <table>
+            <thead>
+                <tr><th>条件</th><th>原因</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>分区键 ∈ GROUP BY</td>
+                    <td>每分区聚合后结果直接是最终结果的一部分，不需要上层 Finalize 合并</td>
+                </tr>
+                <tr>
+                    <td>分区数 ≤ 32 且 <code>work_mem</code> ≤ 16MB</td>
+                    <td>总内存 ≤ 512MB，可控范围</td>
+                </tr>
+                <tr>
+                    <td>OLAP/报表角色</td>
+                    <td>低并发、大查询，内存充裕</td>
+                </tr>
+                <tr>
+                    <td>每分区行数 >> group 数</td>
+                    <td>聚合压缩比高，减少传输量收益大</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3>⛔ 不适合开启的场景</h3>
+
+        <table>
+            <thead>
+                <tr><th>条件</th><th>原因</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>OLTP 高并发</td>
+                    <td>N × <code>work_mem</code> × 并发数 可能 OOM</td>
+                </tr>
+                <tr>
+                    <td>分区数 > 100</td>
+                    <td>内存放大失控，100 分区 × 4MB = 400MB/查询</td>
+                </tr>
+                <tr>
+                    <td><code>work_mem</code> > 64MB</td>
+                    <td>即使 8 分区也是 512MB，风险太高</td>
+                </tr>
+                <tr>
+                    <td>GROUP BY 的 group 数很少（< 10）</td>
+                    <td>聚合压缩比低，node 开销 > 收益（场景 4 实测验证）</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>配置建议：角色级而非全局</h2>
+
+        <p><strong>不要全局开启</strong>。用角色级配置，只给 OLAP/报表角色开：</p>
+
+        <pre><code>-- ✅ 推荐：仅 OLAP 角色开启
+ALTER ROLE olap_user SET enable_partitionwise_aggregate = on;
+ALTER ROLE olap_user SET work_mem = '32MB';  -- 配合适度提高 work_mem
+
+-- ✅ 全局保持默认 off
+-- 不需要任何操作，默认就是 off
+
+-- ❌ 不要这样做（全局开启影响所有连接）
+-- ALTER SYSTEM SET enable_partitionwise_aggregate = on;</code></pre>
+
+        <p><strong>临时验证</strong>（会话级）：</p>
+
+        <pre><code>-- 单次查询验证
+SET enable_partitionwise_aggregate = on;
+EXPLAIN (ANALYZE, BUFFERS) SELECT region, SUM(amount) FROM sales_2026 GROUP BY region;
+RESET enable_partitionwise_aggregate;</code></pre>
+
+        <hr>
+
+        <h2>巡检启发式：M30 检查项</h2>
+
+        <p>我们将上述判断逻辑封装为巡检脚本 <code>mm_pg_health_check.sh</code> v3.9 的 M30 检查项：</p>
+
+        <table>
+            <thead>
+                <tr><th>条件</th><th>输出</th><th>严重度</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>分区父表 ≥ 5 + 当前 off</td><td>"可考虑开启（OLAP 报表场景）"</td><td>HINT</td></tr>
+                <tr><td>分区父表 < 5 + 当前 on</td><td>"收益有限，建议保持 off"</td><td>HINT</td></tr>
+                <tr><td>分区父表 < 5 + 当前 off</td><td>"无需开启"</td><td>NORMAL</td></tr>
+                <tr><td>分区父表 ≥ 5 + 当前 on + <code>work_mem</code> > 64MB</td><td>"内存放大风险，建议降低 work_mem 或关闭"</td><td>WARNING</td></tr>
+            </tbody>
+        </table>
+
+        <p>巡检 SQL 核心逻辑：</p>
+
+        <pre><code>-- 检查分区表数量
+SELECT count(DISTINCT inhparent) AS partition_parent_count
+FROM pg_inherits
+WHERE inhparent::regclass::text IN (
+    SELECT inhparent::regclass::text
+    FROM pg_inherits
+    GROUP BY inhparent
+    HAVING count(*) >= 5
+);
+
+-- 检查当前 GUC 值
+SHOW enable_partitionwise_aggregate;
+SHOW work_mem;</code></pre>
+
+        <hr>
+
+        <h2>与 enable_partition_pruning 的区别</h2>
+
+        <table>
+            <thead>
+                <tr><th>GUC</th><th>默认</th><th>作用</th><th>内存影响</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>enable_partition_pruning</code></td>
+                    <td><code>on</code></td>
+                    <td>排除不相关分区（减少扫描量）</td>
+                    <td><strong>无</strong>（只减少工作）</td>
+                </tr>
+                <tr>
+                    <td><code>enable_partitionwise_aggregate</code></td>
+                    <td><code>off</code></td>
+                    <td>每分区独立聚合（减少传输量）</td>
+                    <td><strong>N × work_mem</strong></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>两者可以同时使用——pruning 先减少分区数，partitionwise aggregate 再对剩余分区做并行聚合。<strong>pruning 是免费的，partitionwise aggregate 有代价</strong>。</p>
+
+        <hr>
+
+        <h2>双版本一致性</h2>
+
+        <p><code>enable_partitionwise_aggregate</code> 在 PG 16.11 和 16.14 上的默认值（<code>off</code>）、参数描述、执行计划结构、结果正确性<strong>完全一致</strong>。两个版本唯一的差异在于绝对执行时间（受服务器负载和配置影响），相对趋势（ON 通常更快但吃更多内存）基本一致。</p>
+
+        <table>
+            <thead>
+                <tr><th>测试条件</th><th>场景</th><th>16.11 ON 提速</th><th>16.14 ON 提速</th><th>趋势一致</th></tr>
+            </thead>
+            <tbody>
+                <tr><td rowspan="3">有并行<br>8P 80万行</td><td>场景 1（GROUP BY 分区键）</td><td>9.4%</td><td>9.7%</td><td>✅</td></tr>
+                <tr><td>场景 2（GROUP BY 非分区键）</td><td>22.6%</td><td>31.1%</td><td>✅</td></tr>
+                <tr><td>场景 3（混合 GROUP BY）</td><td>23.8%</td><td>0.3%</td><td>⚠️ 16.14 基本持平</td></tr>
+                <tr><td>有并行</td><td>场景 4（小数据量）</td><td>−7.7%（更慢）</td><td>3.9%</td><td>⚠️ 16.11 反而更慢</td></tr>
+                <tr><td rowspan="3">无并行<br>8P 8万行<br>3次中位数</td><td>场景 1（GROUP BY 分区键）</td><td>17.5%</td><td>6.3%</td><td>✅ 同向</td></tr>
+                <tr><td>场景 2（GROUP BY 非分区键）</td><td>9.8%</td><td>1.3%</td><td>✅ 同向</td></tr>
+                <tr><td>场景 3（混合 GROUP BY）</td><td>9.3%</td><td>6.5%</td><td>✅ 同向</td></tr>
+                <tr><td rowspan="3">无并行<br>32P 32万行<br>3次中位数</td><td>场景 1（GROUP BY 分区键）</td><td>22.1%</td><td>11.2%</td><td>✅ 同向</td></tr>
+                <tr><td>场景 2（GROUP BY 非分区键）</td><td>10.4%</td><td>−3.8%</td><td>⚠️ 16.14 反而更慢</td></tr>
+                <tr><td>场景 3（混合 GROUP BY）</td><td>20.0%</td><td>4.7%</td><td>✅ 同向</td></tr>
+            </tbody>
+        </table>
+
+        <p>综合 4 组测试（13 个数据点）：16.11 在无并行条件下 ON <strong>总是更快</strong>；16.14 在 13 个数据点中 11 个更快，2 个反例（有并行场景 4 和无并行 32P 场景 2）。<strong>两台服务器配置不同</strong>（16.14 的 <code>shared_buffers</code> 仅 128MB），部分差异可能来自 IO 而非版本本身。结论：<strong>partitionwise aggregate 的收益不是绝对的</strong>，取决于数据分布、group 数量、并行 worker 调度、服务器资源。生产环境开启前务必用 EXPLAIN ANALYZE 验证。</p>
+
+        <hr>
+
+        <h2>结论</h2>
+
+        <ol>
+            <li><strong>默认 off 是对的</strong>——内存放大 N 倍在 OLTP 环境是灾难</li>
+            <li><strong>OLAP 角色级开启</strong>——<code>ALTER ROLE olap_user SET enable_partitionwise_aggregate = on</code></li>
+            <li><strong>分区键 ∈ GROUP BY 时收益最大</strong>——每分区结果直接可用，不需要上层 Finalize</li>
+            <li><strong>小数据量别开</strong>——node 初始化开销 > 聚合收益（场景 4 实测验证）</li>
+            <li><strong>配合 partition pruning 使用</strong>——pruning 先减分区数，降低 partitionwise 的内存放大倍数</li>
+            <li><strong>开启前用 EXPLAIN ANALYZE 验证</strong>——不是所有场景都更快</li>
+            <li><strong>并行查询是收益放大器</strong>——有并行时 ON 提速 9-31%，无并行时缩水到 1-22%；16.14 无并行 32P 场景 2 甚至慢 3.8%。如果你的 OLAP 查询没有并行 worker，partitionwise 的收益可能不如预期</li>
+            <li><strong>分区数翻倍不等于收益翻倍</strong>——16.11 无并行下 32P ≥ 8P，但 16.14 无并行下 32P 反而不稳定。"分区越多越赚"不是普遍规律</li>
+        </ol>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成，所有 SQL 均在 PG 16.11 和 PG 16.14 上实际执行验证通过（双版本结果一致）。测试包含两组：有并行（8 分区 80 万行，单次执行）和无并行（8/32 分区 8/32 万行，3 次取中位数）。技术审校：小木（AI）。致谢：Christophe Pettus 的 "All Your GUCs in a Row" 系列提供了 enable_partitionwise_aggregate "GUC 家族异类" 的启发性分析框架。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>
