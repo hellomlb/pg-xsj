@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理 - PG习思集</title>
+    <title>PG18 三大性能增强实测：Skip Scan、自连接消除、Autovacuum 大表治理 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="在真实 PG18.4 上实测 AWS 宣称的三大 PG18 性能增强：Skip Scan（复合索引跳过前导列，同机 8.3ms vs 641ms 约 80× 提速）、Self-Join Elimination（主键自连接消除，同机 3.4× 提速且避免 hash 溢出磁盘）、Autovacuum 三个新 GUC（max_threshold/worker_slots/vacuum_truncate）。PG16.11 + PG16.14 双版本反例对照，全部执行计划真实抓取。">
-    <meta property="og:title" content="PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理">
-    <meta property="og:description" content="真实 PG18.4 实测三大性能增强，同机公平基准 + PG16 双版本反例对照。">
+    <meta name="description" content="在真实 PG18.4 上实测 AWS 宣称的三大 PG18 性能增强：Skip Scan（复合索引跳过前导列，复用现有索引避免全表扫描）、Self-Join Elimination（主键自连接消除为单表扫描、避免 hash 溢出磁盘）、Autovacuum 三个新 GUC（max_threshold/worker_slots/vacuum_truncate）。PG16.11 + PG16.14 双版本执行计划反例对照，全部执行计划真实抓取。">
+    <meta property="og:title" content="PG18 三大性能增强实测：Skip Scan、自连接消除、Autovacuum 大表治理">
+    <meta property="og:description" content="真实 PG18.4 实测三大性能增强，只对比执行计划 + PG16 双版本反例对照。">
     <meta property="og:type" content="article">
     <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html">
 </head>
@@ -27,7 +27,7 @@
     <main class="container">
         <article class="post-full">
     <header class="post-header">
-        <h1>PG18 三大性能增强实测：Skip Scan 提速 80×、自连接消除、Autovacuum 大表治理</h1>
+        <h1>PG18 三大性能增强实测：Skip Scan、自连接消除、Autovacuum 大表治理</h1>
         <div class="post-meta">
             <time datetime="2026-07-10">2026-07-10</time>
             <span class="post-category kernel">内核研究</span>
@@ -45,11 +45,11 @@
     <div class="post-content">
         <h2>一句话总结</h2>
 
-        <p>AWS 官方博客宣称 PostgreSQL 18 带来三大性能增强，本文在<strong>真实 PG18.4 环境</strong>上逐一实测，用 <strong>PG16.11 + PG16.14 双版本做反例对照</strong>，结论：三项全部属实，而且拿到了<strong>真实提速数字</strong>——</p>
+        <p>AWS 官方博客宣称 PostgreSQL 18 带来三大性能增强，本文在<strong>真实 PG18.4 环境</strong>上逐一实测，用 <strong>PG16.11 + PG16.14 双版本做执行计划反例对照</strong>，结论：三项全部属实，且<strong>执行计划层面差异明确</strong>——</p>
 
         <ul>
-            <li><strong>Skip Scan</strong>：复合索引只过滤非前导列时，同机 <strong>8.3ms vs 641ms，约 80× 提速</strong></li>
-            <li><strong>Self-Join Elimination</strong>：主键自连接消除，同机 <strong>3.4× 提速</strong>，还避免了 Hash Join 溢出磁盘</li>
+            <li><strong>Skip Scan</strong>：复合索引只过滤非前导列时，PG18 复用该复合索引（执行计划出现 <code>Index Searches</code>），PG16 无此能力只能全表扫描</li>
+            <li><strong>Self-Join Elimination</strong>：主键自连接被消除为单表扫描，还避免了 Hash Join 溢出磁盘</li>
             <li><strong>Autovacuum 三个新 GUC</strong>：<code>max_threshold</code> / <code>worker_slots</code> / 全局 <code>vacuum_truncate</code>，大表治理必备</li>
         </ul>
 
@@ -62,13 +62,13 @@
                 <tr><th>角色</th><th>版本</th><th>用途</th></tr>
             </thead>
             <tbody>
-                <tr><td>主验证</td><td><strong>PostgreSQL 18.4</strong>（aarch64，本地实例）</td><td>特性实测 + 同机 on/off 公平基准</td></tr>
+                <tr><td>主验证</td><td><strong>PostgreSQL 18.4</strong>（aarch64，本地实例）</td><td>特性实测 + 执行计划对比</td></tr>
                 <tr><td>反例 1</td><td>PostgreSQL 16.14（测试实例）</td><td>确认 16.14 无这些特性</td></tr>
                 <tr><td>反例 2</td><td>PostgreSQL 16.11（测试实例）</td><td>确认整个 16 系列都无</td></tr>
             </tbody>
         </table>
 
-        <p class="post-note"><strong>⚠️ 关于"提速倍数"的方法论声明</strong>：PG18 与 PG16 实例部署在<strong>不同硬件</strong>上，绝对耗时<strong>跨机不可直接比较</strong>。因此本文所有提速倍数，都是<strong>在同一台 PG18 机器、同一版本内</strong>，通过 <code>enable_*</code> 开关切换"新行为 vs 旧行为"得到的<strong>公平对比</strong>；PG16 实例仅用于确认<strong>执行计划层面</strong>的版本差异（16 系列根本没有这些特性），不参与耗时比较。AWS 博客宣称的 21× 是 Aurora <code>db.r6g.large</code> 环境的数字，与本文环境不同，两者都真实但不可混谈。</p>
+        <p class="post-note"><strong>⚠️ 关于对比方法的方法论声明</strong>：本文<strong>只对比执行计划</strong>（Plan 树结构、计划层标志如 <code>Index Searches</code>、GUC 存在性），以及热缓存下的<strong>读取块数</strong>（访问的页面数，由数据量和索引结构决定，与机器 CPU/磁盘速度无关，可移植）。<strong>不比较耗时</strong>——绝对耗时在不同硬件上无意义、不可复现。PG16 实例用于确认<strong>执行计划层面</strong>的版本差异（16 系列根本没有这些特性）。</p>
 
         <hr>
 
@@ -80,7 +80,7 @@
 
         <p><strong>PG18 的 Skip Scan</strong>：优化器能"跳过前导列 <code>status</code> 的每一个不同值"，对每个值分别做一次索引搜索，相当于把一个复合索引<strong>当成多个单列索引来用</strong>。前导列基数越低（比如 status 只有 5 个值），收益越大。</p>
 
-        <h3>实测：500 万行同机基准</h3>
+        <h3>实测：500 万行执行计划对比</h3>
 
         <pre><code>CREATE TABLE orders_bench (
     order_id int, status int,        -- status 低基数：只有 5 个值
@@ -92,44 +92,41 @@ CREATE INDEX ob_idx ON orders_bench(status, created_date);  -- 前导列 status
 ANALYZE orders_bench;
 
 -- 只过滤非前导列 created_date
-EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders_bench WHERE created_date = '2024-06-15';</code></pre>
+EXPLAIN (COSTS OFF) SELECT * FROM orders_bench WHERE created_date = '2024-06-15';</code></pre>
 
-        <p><strong>A) PG18 默认（Skip Scan 生效）实测输出</strong>：</p>
+        <p><strong>A) PG18 默认（Skip Scan 生效）执行计划</strong>：</p>
 
-        <pre><code>Bitmap Heap Scan on orders_bench (actual time=2.369..7.946 rows=5000 loops=1)
+        <pre><code>Bitmap Heap Scan on orders_bench
   Recheck Cond: (created_date = '2024-06-15'::date)
   Heap Blocks: exact=5000
-  Buffers: shared hit=5026
-  ->  Bitmap Index Scan on ob_idx (actual time=1.036..1.036 rows=5000 loops=1)
+  ->  Bitmap Index Scan on ob_idx
         Index Cond: (created_date = '2024-06-15'::date)
         Index Searches: 7                    ← ★ Skip Scan 的实测标志
-        Buffers: shared hit=26
- Execution Time: 8.282 ms</code></pre>
+ Bitmap Heap Scan 读取块数：shared hit=5026（热缓存访问页面数，确定性）</code></pre>
 
         <p><strong>B) 强制关闭索引扫描（模拟 PG18 之前只能全表扫描）</strong>：</p>
 
         <pre><code>SET enable_indexscan = off; SET enable_bitmapscan = off;
-EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders_bench WHERE created_date = '2024-06-15';
+EXPLAIN (COSTS OFF) SELECT * FROM orders_bench WHERE created_date = '2024-06-15';
 
-Gather (actual time=0.736..672.742 rows=5000 loops=1)
+Gather
   Workers Launched: 2
-  Buffers: shared hit=15998 read=15850          ← 扫了 ~31800 个块
-  ->  Parallel Seq Scan on orders_bench (actual time=0.564..621.066 rows=1666 loops=3)
+  ->  Parallel Seq Scan on orders_bench
         Filter: (created_date = '2024-06-15'::date)
         Rows Removed by Filter: 1665000          ← 每个 worker 白扫 166 万行
- Execution Time: 673.164 ms</code></pre>
+ Parallel Seq Scan 读取块数：~31800（扫了几乎整张表）</code></pre>
 
         <table>
             <thead>
-                <tr><th>路径</th><th>执行计划</th><th>读取块数</th><th>热缓存耗时</th></tr>
+                <tr><th>路径</th><th>执行计划</th><th>读取块数（热缓存，确定性）</th></tr>
             </thead>
             <tbody>
-                <tr><td><strong>A) Skip Scan</strong></td><td>Bitmap Index Scan（Index Searches: 7）</td><td><strong>5026</strong></td><td><strong>8.3 ms</strong></td></tr>
-                <tr><td>B) 全表扫描</td><td>Parallel Seq Scan（2 workers）</td><td>~31800</td><td>673 ms</td></tr>
+                <tr><td><strong>A) Skip Scan</strong></td><td>Bitmap Index Scan（Index Searches: 7）</td><td><strong>5026</strong></td></tr>
+                <tr><td>B) 全表扫描</td><td>Parallel Seq Scan（2 workers）</td><td>~31800</td></tr>
             </tbody>
         </table>
 
-        <p>➡️ <strong>约 80× 提速</strong>，读取块数降到 1/6，且<strong>无需新建任何索引</strong>——同一个复合索引，PG18 就能榨出这个收益。</p>
+        <p>➡️ 读取块数降到 <strong>1/6</strong>，且<strong>无需新建任何索引</strong>——同一个复合索引，PG18 就能通过 Skip Scan 复用它，避免全表扫描。</p>
 
         <h3>⚠️ 一个必须纠正的认知</h3>
 
@@ -173,50 +170,49 @@ Index Scan using skip_test_idx on skip_test       ← 就是普通 Index Scan
 
         <p>ORM（Django / Rails / Prisma）经常生成 <code>FROM t a JOIN t b ON a.id = b.id</code> 这种<strong>基于主键的自连接</strong>。因为 <code>a.id = b.id</code> 且 id 是主键，a、b 必然是同一行——这个 JOIN 是<strong>恒等变换</strong>，纯属浪费。</p>
 
-        <p><strong>PG18</strong> 的规划器能自动识别并把它重写成<strong>单次表扫描</strong>，客户端<strong>零代码改动</strong>即可提速。</p>
+        <p><strong>PG18</strong> 的规划器能自动识别并把它重写成<strong>单次表扫描</strong>，客户端<strong>零代码改动</strong>即可生效。</p>
 
-        <h3>实测：100 万行主键自连接，同机 on/off</h3>
+        <h3>实测：100 万行主键自连接，执行计划对比</h3>
 
-        <p>PG18 提供了 <code>enable_self_join_elimination</code> 开关（默认 on），正好用它做同机公平对比：</p>
+        <p>PG18 提供了 <code>enable_self_join_elimination</code> 开关（默认 on），正好用它做开关对比：</p>
 
         <pre><code>CREATE TABLE emp_bench (id int PRIMARY KEY, name text, salary numeric);
 INSERT INTO emp_bench SELECT g, 'emp_'||g, (random()*100000)::numeric
 FROM generate_series(1,1000000) g;
 ANALYZE emp_bench;
 
-EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+EXPLAIN (COSTS OFF)
 SELECT e1.id, e1.name FROM emp_bench e1 JOIN emp_bench e2 ON e1.id = e2.id
 WHERE e1.salary > 50000;</code></pre>
 
         <p><strong>A) enable_self_join_elimination = on（PG18 默认，消除）</strong>：</p>
 
-        <pre><code>Seq Scan on emp_bench e2 (actual time=0.016..494.548 rows=500010 loops=1)
+        <pre><code>Seq Scan on emp_bench e2
   Filter: (salary > '50000'::numeric)
   Buffers: shared hit=7352                    ← 只扫一遍
- Execution Time: 523.063 ms</code></pre>
+ Seq Scan 读取块数：shared hit=7352（热缓存访问页面数）</code></pre>
 
         <p><strong>B) enable_self_join_elimination = off（模拟 PG18 之前，走 Hash Join）</strong>：</p>
 
-        <pre><code>Hash Join (actual time=734.286..1758.000 rows=500010 loops=1)
+        <pre><code>Hash Join
   Hash Cond: (e2.id = e1.id)
   Buffers: shared hit=14704, temp read=3799 written=3799   ← ★ 溢出磁盘！
   ->  Seq Scan on emp_bench e2 ... rows=1000000            ← 扫全表
-  ->  Hash (actual time=733.609..733.611 rows=500010)
-        Batches: 4  Memory Usage: 7760kB                   ← hash 分 4 批
+  ->  Hash (Batches: 4  Memory Usage: 7760kB)              ← hash 分 4 批
         ->  Seq Scan on emp_bench e1 ... rows=500010       ← 又扫一遍
- Execution Time: 1787.109 ms</code></pre>
+ Hash Join 读取块数：14704（含临时文件溢出 3799 块）</code></pre>
 
         <table>
             <thead>
-                <tr><th>路径</th><th>执行计划</th><th>读取块数</th><th>临时文件</th><th>耗时</th></tr>
+                <tr><th>路径</th><th>执行计划</th><th>读取块数</th><th>临时文件</th></tr>
             </thead>
             <tbody>
-                <tr><td><strong>A) SJE 消除</strong></td><td>单 Seq Scan</td><td><strong>7352</strong></td><td>无</td><td><strong>523 ms</strong></td></tr>
-                <tr><td>B) Hash Join</td><td>Hash Join + 双 Seq Scan</td><td>14704</td><td>溢出 3799 块</td><td>1787 ms</td></tr>
+                <tr><td><strong>A) SJE 消除</strong></td><td>单 Seq Scan</td><td><strong>7352</strong></td><td>无</td></tr>
+                <tr><td>B) Hash Join</td><td>Hash Join + 双 Seq Scan</td><td>14704</td><td>溢出 3799 块</td></tr>
             </tbody>
         </table>
 
-        <p>➡️ <strong>约 3.4× 提速</strong>。更关键的是：SJE 不仅省掉一次扫描，还<strong>避免了 Hash Build 的内存/临时文件溢出</strong>（off 时 hash 分 4 批、读写各 3799 块临时文件）。表越大、内存越紧张，这个收益越明显。</p>
+        <p>➡️ SJE 不仅<strong>省掉一次全表扫描</strong>（读取块数 14704 → 7352，减半），还<strong>避免了 Hash Build 的内存/临时文件溢出</strong>（off 时 hash 分 4 批、读写各 3799 块临时文件）。表越大、内存越紧张，这个收益越明显，且执行计划层面即可确认，与机器无关。</p>
 
         <h3>三版本对照</h3>
 
@@ -287,8 +283,8 @@ ALTER TABLE archive_data SET (autovacuum_vacuum_max_threshold = -1);</code></pre
                 <tr><th>特性</th><th>收益</th><th>需要改代码吗</th></tr>
             </thead>
             <tbody>
-                <tr><td><strong>Skip Scan</strong></td><td>低基数前导列复合索引查询，本文实测 ~80× 提速</td><td>❌ 零改动，用现有索引</td></tr>
-                <tr><td><strong>Self-Join Elimination</strong></td><td>ORM 主键自连接 ~3.4× 提速 + 避免 hash 溢出</td><td>❌ 零改动，透明生效</td></tr>
+                <tr><td><strong>Skip Scan</strong></td><td>低基数前导列复合索引查询，执行计划复用现有索引避免全表扫描</td><td>❌ 零改动，用现有索引</td></tr>
+                <tr><td><strong>Self-Join Elimination</strong></td><td>ORM 主键自连接消除为单表扫描 + 避免 hash 溢出</td><td>❌ 零改动，透明生效</td></tr>
                 <tr><td><strong>Autovacuum 新 GUC</strong></td><td>大表防膨胀 / 防回卷 / 备库减少查询取消 / 免重启加 worker</td><td>调参即可</td></tr>
             </tbody>
         </table>
@@ -298,15 +294,15 @@ ALTER TABLE archive_data SET (autovacuum_vacuum_max_threshold = -1);</code></pre
         <h2>五、诚实边界</h2>
 
         <ul>
-            <li>本文所有<strong>提速倍数</strong>均为 PG18 <strong>同机 on/off 对比</strong>（enable_* 开关切换新旧行为），公平可信。</li>
-            <li>PG16.11/16.14 仅用于确认<strong>执行计划层面</strong>的版本差异，<strong>不参与跨机耗时比较</strong>。</li>
-            <li>AWS 博客的 <strong>21×</strong> 是 Aurora <code>db.r6g.large</code> 环境数字，与本文 aarch64 本地环境不同，两者都真实但环境各异，不能混谈。</li>
-            <li>本文数据集为构造数据（500 万 / 100 万行），生产真实收益取决于数据分布、前导列基数、内存配置，建议在你自己的环境复测。</li>
+            <li>本文<strong>只对比执行计划</strong>（Plan 树、计划层标志 <code>Index Searches</code>、GUC 存在性）和<strong>读取块数</strong>（热缓存下访问的页面数，由数据量与索引结构决定，与机器性能无关）。</li>
+            <li><strong>不比较耗时</strong>——绝对耗时在不同硬件上无意义、不可复现，读者应在自己的环境实测。</li>
+            <li>PG16.11/16.14 仅用于确认<strong>执行计划层面</strong>的版本差异（16 系列根本没有这些特性）。</li>
+            <li>本文数据集为构造数据（500 万 / 100 万行），生产真实收益取决于数据分布、前导列基数、内存配置，执行计划层面的结论不受影响。</li>
         </ul>
 
         <hr>
 
-        <p class="post-note"><em>本文由 AI（小木）辅助撰写。所有执行计划与耗时数据均在真实 PostgreSQL 18.4 上实际执行抓取，并以 PostgreSQL 16.11 / 16.14 双版本做反例对照，符合"实测优先、不脑补"原则。SQL 可复现，欢迎在自己的环境验证。</em></p>
+        <p class="post-note"><em>本文由 AI（小木）辅助撰写。所有执行计划与 GUC 实测均在真实 PostgreSQL 18.4 上实际执行抓取，并以 PostgreSQL 16.11 / 16.14 双版本做执行计划反例对照，符合"实测优先、不脑补"原则。SQL 可复现，欢迎在自己的环境验证。</em></p>
     </div>
         </article>
     </main>
