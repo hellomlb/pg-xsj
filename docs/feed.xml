@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Mon, 13 Jul 2026 10:00:00 +0800</lastBuildDate>
+    <lastBuildDate>Mon, 13 Jul 2026 10:15:00 +0800</lastBuildDate>
+    <item>
+      <title>enable_self_join_elimination：主键自连接自动消除（PG18+ 性能特性）</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/enable-self-join-elimination.html</link>
+      <description>ORM 与视图嵌套常写出 FROM t a JOIN t b ON a.pk=b.pk 这种冗余自连接。PG18 引入的 enable_self_join_elimination 能识别并直接消除它，把双表扫描降为单表。PG 19 Beta1 实测约 4.7x 加速，并给出 PG16 无此特性的反证。</description>
+      <pubDate>Mon, 13 Jul 2026 10:15:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/enable-self-join-elimination.html</guid>
+    </item>
     <item>
       <title>非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战</title>
       <link>https://hellomlb.github.io/pg-xsj/sql-optimize/non-partition-key-pruning.html</link>

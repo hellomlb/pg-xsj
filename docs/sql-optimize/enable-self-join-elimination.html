@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>enable_self_join_elimination：主键自连接自动消除（PG18+ 性能特性） - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="ORM 与视图嵌套常写出 FROM t a JOIN t b ON a.pk=b.pk 这种冗余自连接。PG18 引入的 enable_self_join_elimination 能识别并直接消除它，把双表扫描降为单表。本文所有计划均在 PG 19 Beta1 实测，并给出 PG16 无此特性的反证。">
+    <meta property="og:title" content="enable_self_join_elimination：主键自连接自动消除（PG18+ 性能特性）">
+    <meta property="og:description" content="PG18+ 优化器自动消除主键等值自连接，PG19 Beta1 实测 4.7x 加速。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/enable-self-join-elimination.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>enable_self_join_elimination：主键自连接自动消除（PG18+ 性能特性）</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-13">2026-07-13</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">self_join_elimination</span>
+                <span class="tag">optimizer</span>
+                <span class="tag">EXPLAIN</span>
+                <span class="tag">PG18</span>
+                <span class="tag">performance</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 19 Beta1 实测（PG18+ 特性，PG 16.x 无此 GUC，未做双版本功能验证）</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><strong>ORM 或视图嵌套经常写出 <code>FROM t a JOIN t b ON a.pk = b.pk</code> 这种"自己和自己主键连"的冗余自连接。</strong>PG18 起，优化器能识别它并<strong>直接消除</strong>——既然主键等值是一对一的，连出来还是原来的行，那个多余的 <code>b</code> 表纯属浪费。PG 19 Beta1 实测：消除后 <strong>4.621 ms</strong> vs 保留时 <strong>21.689 ms</strong>，约 <strong>4.7x 加速</strong>。</p>
+
+        <hr>
+
+        <h2>白话：这种自连接从哪来？</h2>
+
+        <p>你大概从没手写过 <code>t a JOIN t b ON a.id = b.id</code>。但它很常见，来源通常是：</p>
+
+        <ul>
+            <li><strong>ORM 懒加载 / 关联映射</strong>：框架为了"统一"地拼 SQL，把同一个实体 join 到自己一次。</li>
+            <li><strong>视图嵌套</strong>：视图 V1 基于表 T，视图 V2 又 JOIN 了 V1，而查询同时用 V1 和 V2 并通过主键关联——展开后就是 T 的自连接。</li>
+            <li><strong>CTE / 子查询复用</strong>：同一份派生表被引用两次并通过主键相连。</li>
+        </ul>
+
+        <p>这些自连接<strong>结果完全正确，但计划却做了两遍全表扫描再 Hash Join</strong>。在 PG17 及更早版本，优化器老老实实把它当真 join 执行。PG18 起多了个"看一眼就知道能省"的能力。</p>
+
+        <hr>
+
+        <h2>原理：什么条件下能消？</h2>
+
+        <p>优化器只在一个强前提下沉掉自连接：<strong>连接条件是"主键 = 主键"（或等价的不同表间的唯一约束等值）</strong>。因为主键唯一，<code>a.id = b.id</code> 必然是一对一映射，join 结果集和 <code>a</code> 单独扫描的结果集<strong>完全一致</strong>——那 <code>b</code> 就没有存在意义，直接删掉。</p>
+
+        <table>
+            <thead><tr><th>条件</th><th>是否消除</th><th>原因</th></tr></thead>
+            <tbody>
+                <tr><td>主键等值自连接 <code>a.pk = b.pk</code></td><td>✅ 消除</td><td>一对一，结果无损</td></tr>
+                <tr><td>非唯一列自连接 <code>a.val = b.val</code></td><td>❌ 保留</td><td>可能一对多，删了会丢行</td></tr>
+                <tr><td>非等值 <code>a.id &gt; b.id</code></td><td>❌ 保留</td><td>不是恒等映射</td></tr>
+                <tr><td>三表主键自连接</td><td>✅ 全消除</td><td>逐对都是一对一</td></tr>
+            </tbody>
+        </table>
+
+        <p class="note">注意：这与 <code>enable_seqscan</code> 等"靠加惩罚成本逼优化器换路"的 GUC 不同。self join elimination 是<strong>真正重写查询树</strong>——Pettus 称它是 enable_* 家族里唯一做查询重写的成员。所以关掉它，计划会<strong>真的多出 join 节点</strong>，而不只是标个 Disabled。</p>
+
+        <hr>
+
+        <h2>实测验证：测试表准备</h2>
+
+        <pre><code>DROP TABLE IF EXISTS sje_test;
+CREATE TABLE sje_test (id int PRIMARY KEY, name text, val int);
+INSERT INTO sje_test SELECT i, 'name_' || i, i * 10 FROM generate_series(1, 10000) i;
+ANALYZE sje_test;
+
+SHOW enable_self_join_elimination;   -- on（PG18+ 默认值）</code></pre>
+
+        <hr>
+
+        <h2>验证结果（PG 19 Beta1）</h2>
+
+        <h3>场景 1：主键自连接（默认 on）→ 期望无 join 节点</h3>
+        <pre><code>EXPLAIN (COSTS OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.id = b.id;
+
+       QUERY PLAN
+------------------------
+ Seq Scan on sje_test b
+(1 row)</code></pre>
+        <p>✅ 只剩一个 <code>Seq Scan</code>，<code>a</code> 和 join 全没了。<code>b</code> 被消除，优化器直接从 <code>b</code> 取结果（选哪个别名作基表是实现的细节，不影响正确性）。</p>
+
+        <h3>场景 2：SET enable_self_join_elimination = off → 期望出现 join 节点</h3>
+        <pre><code>SET enable_self_join_elimination = off;
+EXPLAIN (COSTS OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.id = b.id;
+
+             QUERY PLAN
+------------------------------------
+ Hash Join
+   Hash Cond: (a.id = b.id)
+   ->  Seq Scan on sje_test a
+   ->  Hash
+         ->  Seq Scan on sje_test b
+(5 rows)</code></pre>
+        <p>✅ 关掉后立刻变回 <code>Hash Join</code> + 两次 Seq Scan。说明场景 1 的"单表扫描"确实是被这个特性吃掉 join 的结果。</p>
+
+        <h3>场景 3：性能对比（on vs off）</h3>
+        <pre><code>-- ON（消除）：Execution Time 4.621 ms
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.id = b.id;
+ Seq Scan on sje_test b (actual rows=10000.00 loops=1)
+   Buffers: shared hit=65 dirtied=1
+ Planning Time: 0.196 ms
+ Execution Time: 4.621 ms
+
+-- OFF（保留 join）：Execution Time 21.689 ms
+SET enable_self_join_elimination = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.id = b.id;
+ Hash Join (actual rows=10000.00 loops=1)
+   Hash Cond: (a.id = b.id)
+   Buffers: shared hit=128
+   ->  Seq Scan on sje_test a (actual rows=10000.00 loops=1)
+         Buffers: shared hit=64
+   ->  Hash (actual rows=10000.00 loops=1)
+         Buckets: 16384  Batches: 1  Memory Usage: 480kB
+         Buffers: shared hit=64
+         ->  Seq Scan on sje_test b (actual rows=10000.00 loops=1)
+               Buffers: shared hit=64
+ Planning Time: 0.950 ms
+ Execution Time: 21.689 ms</code></pre>
+        <p>✅ 消除后省掉一遍全表扫描 + Hash 构建，<strong>4.621 ms → 21.689 ms，约 4.7x 加速</strong>。Pettus 引用 Dalibo 实测是 2.9x（530ms→185ms），我们的加速比更高是因为测试表更小、join 开销占比更大。</p>
+
+        <h3>场景 4：非主键自连接（val 无唯一）→ 期望保留 join</h3>
+        <pre><code>EXPLAIN (COSTS OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.val = b.val;
+
+             QUERY PLAN
+------------------------------------
+ Hash Join
+   Hash Cond: (a.val = b.val)
+   ->  Seq Scan on sje_test a
+   ->  Hash
+         ->  Seq Scan on sje_test b
+(5 rows)</code></pre>
+        <p>✅ <code>val</code> 没有唯一约束，优化器不敢消——消了可能丢行。正确行为。</p>
+
+        <h3>场景 5：三表主键自连接 → 期望全部消除</h3>
+        <pre><code>EXPLAIN (COSTS OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.id = b.id JOIN sje_test c ON b.id = c.id;
+
+       QUERY PLAN
+------------------------
+ Seq Scan on sje_test c
+(1 row)</code></pre>
+        <p>✅ 两个 join 都被吃掉，只剩一个 <code>Seq Scan</code>。嵌套视图展开出的多层自连接也能一气呵成地消掉。</p>
+
+        <h3>场景 6：主键自连接 + 额外过滤 → 仍消除</h3>
+        <pre><code>EXPLAIN (COSTS OFF) SELECT a.* FROM sje_test a JOIN sje_test b ON a.id = b.id WHERE a.val &gt; 50000;
+
+       QUERY PLAN
+-------------------------
+ Seq Scan on sje_test b
+   Filter: (val &gt; 50000)
+(2 rows)</code></pre>
+        <p>✅ 消除后过滤条件下推到那唯一的一次扫描上，逻辑不变。</p>
+
+        <hr>
+
+        <h2>版本边界（重要，诚实说明）</h2>
+
+        <p>这是 <strong>PG18 引入</strong>的特性。我们在 <strong>PG 16.14</strong> 上验证该 GUC 根本不存在：</p>
+
+        <pre><code>-- PG 16.14
+SHOW enable_self_join_elimination;
+ERROR:  unrecognized configuration parameter "enable_self_join_elimination"</code></pre>
+
+        <p>因此本文<strong>只在 PG 19 Beta1 做功能验证</strong>，未做 PG 16.x 功能验证（它无此能力）。若你的生产库还在 PG16 或更早，这篇对你而言是"未来特性"，升级到 PG18+ 后会自动受益，无需改 SQL。</p>
+
+        <hr>
+
+        <h2>白话总结：要不要管它？</h2>
+
+        <ul>
+            <li><strong>默认就是 on，你什么都不用做。</strong>它只在"主键等值自连接"这种冗余场景下悄悄帮你省一遍扫描。</li>
+            <li><strong>结果永远正确。</strong>消除是恒等变换，不会改变返回行。</li>
+            <li><strong>诊断时怎么用？</strong>怀疑某条慢 SQL 被它影响（或想看"如果不消除会怎样"），<code>SET enable_self_join_elimination = off</code> 临时对比计划即可，看完记得 <code>RESET</code>。</li>
+            <li><strong>它救不了非唯一自连接。</strong>如果真是 <code>a.val = b.val</code> 这种有语义的 join，该留着就得留着——那是业务需要的，不是冗余。</li>
+        </ul>
+
+        <hr>
+
+        <h2>参考</h2>
+        <ul>
+            <li>Christophe Pettus, "enable_self_join_elimination"（PG 专家专栏，postgr.es/p/9pg）</li>
+            <li>PostgreSQL 18.0 Release Notes — "Allow the optimizer to remove self-joins on unique columns"</li>
+        </ul>
+
+        <hr>
+
+        <p class="disclaimer"><em>本文 SQL 与 EXPLAIN 计划均在 PG 19 Beta1 测试实例实际执行并原样记录；PG16.14 反证用于说明版本边界。AI 辅助整理，核心计划数据均来自真实执行。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>PG习思集 · 木木的 PostgreSQL 实战笔记 · 内容基于真实环境验证</p>
+        </div>
+    </footer>
+</body>
+</html>

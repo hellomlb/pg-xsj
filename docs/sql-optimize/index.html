@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/enable-self-join-elimination.html">enable_self_join_elimination：主键自连接自动消除（PG18+ 性能特性）</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-13">2026-07-13</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">ORM 与视图嵌套常写出 FROM t a JOIN t b ON a.pk=b.pk 这种冗余自连接。PG18 引入的 enable_self_join_elimination 能识别并直接消除它，把双表扫描降为单表。PG 19 Beta1 实测约 4.7x 加速，并给出 PG16 无此特性的反证。</p>
+        <a href="/pg-xsj/sql-optimize/enable-self-join-elimination.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/non-partition-key-pruning.html">非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-13">2026-07-13</time>
