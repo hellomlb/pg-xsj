@@ -65,12 +65,17 @@
 
         <h2>原理：什么条件下能消？</h2>
 
-        <p>优化器只在一个强前提下沉掉自连接：<strong>连接条件是"主键 = 主键"（或等价的不同表间的唯一约束等值）</strong>。因为主键唯一，<code>a.id = b.id</code> 必然是一对一映射，join 结果集和 <code>a</code> 单独扫描的结果集<strong>完全一致</strong>——那 <code>b</code> 就没有存在意义，直接删掉。</p>
+        <p>优化器只在<strong>「同一张基表自我出现」</strong>这一个强前提下沉掉自连接：连接条件是该表自身的<strong>主键 = 主键</strong>（或等价的唯一约束等值，例如同一表的两个别名、或视图展开后指向同一基表）。因为主键唯一，<code>a.id = b.id</code> 必然是一对一映射，join 结果集和 <code>a</code> 单独扫描的结果集<strong>完全一致</strong>——那另一侧就没存在意义，直接删掉。</p>
+
+        <p class="note">关键闸门是<strong>「两侧解析到同一个基表（relid 相同）」</strong>，不是「两张表各自有主键」。所以<strong>两个不同基表即使都有主键、甚至加了外键保证覆盖，本特性也不消除</strong>——它走的是「自连接检测」这条专属路径，不接管「基于外键推论的跨表冗余 join 消除」（PG18/19 实测均不触发）。</p>
 
         <table>
             <thead><tr><th>条件</th><th>是否消除</th><th>原因</th></tr></thead>
             <tbody>
-                <tr><td>主键等值自连接 <code>a.pk = b.pk</code></td><td>✅ 消除</td><td>一对一，结果无损</td></tr>
+                <tr><td>主键等值自连接 <code>a.pk = b.pk</code>（同表别名）</td><td>✅ 消除</td><td>一对一，结果无损</td></tr>
+                <tr><td>视图包装同表后自连接 <code>a JOIN v(based_on_same_table)</code></td><td>✅ 消除</td><td>视图展开后仍是同一基表，名字不同无关</td></tr>
+                <tr><td>不同基表 PK=PK（无 FK）</td><td>❌ 保留</td><td>不同 relid，规划器不能假设覆盖，join 可能过滤掉行</td></tr>
+                <tr><td>不同基表 PK=PK（有 FK 保证覆盖）</td><td>❌ 保留</td><td>本特性只走自连接检测路径，不接管 FK 推论消除（PG18/19 实测）</td></tr>
                 <tr><td>非唯一列自连接 <code>a.val = b.val</code></td><td>❌ 保留</td><td>可能一对多，删了会丢行</td></tr>
                 <tr><td>非等值 <code>a.id &gt; b.id</code></td><td>❌ 保留</td><td>不是恒等映射</td></tr>
                 <tr><td>三表主键自连接</td><td>✅ 全消除</td><td>逐对都是一对一</td></tr>
@@ -78,6 +83,37 @@
         </table>
 
         <p class="note">注意：这与 <code>enable_seqscan</code> 等"靠加惩罚成本逼优化器换路"的 GUC 不同。self join elimination 是<strong>真正重写查询树</strong>——Pettus 称它是 enable_* 家族里唯一做查询重写的成员。所以关掉它，计划会<strong>真的多出 join 节点</strong>，而不只是标个 Disabled。</p>
+
+        <hr>
+
+        <h2>边界实测：不同基表为什么不消（PG 19 Beta1 原样计划）</h2>
+
+        <p>为确认「同基表」是闸门，准备两个不同基表 <code>sj_t1</code> / <code>sj_t2</code>（各有 PK，数据域完全重叠），分别测「无 FK」「加 FK 保证覆盖」「视图包装同表」三种情况：</p>
+
+        <pre><code>-- Q2: 不同基表 PK=PK，无 FK → 不消除（Hash Join 仍在）
+EXPLAIN (COSTS OFF)
+SELECT sj_t1.* FROM sj_t1 JOIN sj_t2 ON sj_t1.id = sj_t2.id;
+--   Hash Join
+--     Hash Cond: (sj_t1.id = sj_t2.id)
+--     ->  Seq Scan on sj_t1
+--     ->  Hash  ->  Seq Scan on sj_t2
+
+-- Q3: 加 FK sj_t1.id -> sj_t2.id（理论已保证覆盖） → 仍然不消除
+ALTER TABLE sj_t1 ADD CONSTRAINT fk_sj FOREIGN KEY (id) REFERENCES sj_t2(id);
+EXPLAIN (COSTS OFF)
+SELECT sj_t1.* FROM sj_t1 JOIN sj_t2 ON sj_t1.id = sj_t2.id;
+--   Hash Join            ← 依旧在，本特性不接管 FK 推论消除
+--     Hash Cond: (sj_t1.id = sj_t2.id)
+--     ->  Seq Scan on sj_t1
+--     ->  Hash  ->  Seq Scan on sj_t2
+
+-- Q4: 视图包装同表，语法像"不同表" → 消除（视图展开后是同一基表）
+CREATE VIEW v_sj AS SELECT * FROM sj_t1;
+EXPLAIN (COSTS OFF)
+SELECT a.* FROM sj_t1 a JOIN v_sj b ON a.id = b.id;
+--   Seq Scan on sj_t1    ← 消除，名字不同但基表相同</code></pre>
+
+        <p class="note">Q3 最说明问题：外键已经<strong>在语义上证明</strong> join 不丢行、且只选 <code>sj_t1.*</code> 不缺列，理论上完全冗余——但 PG18/19 的 <code>enable_self_join_elimination</code> 依然不消除。因为它只识别「自连接（同基表）」这种模式，跨表的冗余 join 消除是另一条尚未实现的路。</p>
 
         <hr>
 
