@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/non-partition-key-pruning.html">非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-13">2026-07-13</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">声明式分区表按 A 列分区、业务却总用 B 列查，默认会扫全部分区。当 B 与 A 强相关时，给每个分区加声明其 B 列边界的 CHECK 约束，constraint_exclusion（默认 partition）即可按非分区键裁剪。PG 16.11 + PG 19 Beta1 双版本实测，并修正了本博客此前关于 constraint_exclusion 的片面表述。</p>
+        <a href="/pg-xsj/sql-optimize/non-partition-key-pruning.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/enable-partitionwise-aggregate-deep-dive.html">enable_partitionwise_aggregate：分区聚合的内存放大与性能权衡</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-07">2026-07-07</time>

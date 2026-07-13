@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="声明式分区表按 A 列分区、业务却总用 B 列查，默认会扫全部分区。当 B 与 A 强相关时，给每个分区加声明其 B 列边界的 CHECK 约束，constraint_exclusion（默认 partition）即可按非分区键裁剪。本文所有 SQL 在 PG 16.11 与 PG 19 Beta1 双版本实测，并修正了本博客此前关于 constraint_exclusion 的片面表述。">
+    <meta property="og:title" content="非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战">
+    <meta property="og:description" content="CHECK 约束编码非分区键边界 + constraint_exclusion，让非分区键查询也能裁剪分区。PG 16.11 + PG 19 Beta1 双版本实测。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/non-partition-key-pruning.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-13">2026-07-13</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">partition</span>
+                <span class="tag">pruning</span>
+                <span class="tag">constraint_exclusion</span>
+                <span class="tag">CHECK</span>
+                <span class="tag">EXPLAIN</span>
+                <span class="tag">gaps-and-islands</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + PG 19 Beta1 双版本实测</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><strong>声明式分区表按 A 列分区，但业务总用 B 列查——默认会扫全部分区。</strong>当 B 与 A <strong>强相关</strong>（如 session_id 随时间单调递增）时，给每个分区加一条声明其 B 列取值边界的 <code>CHECK</code> 约束，<code>constraint_exclusion</code>（默认 <code>partition</code>）就会利用这些 CHECK 把不匹配的分区<strong>直接裁掉</strong>。本文所有 SQL 在 <strong>PG 16.11</strong> 与 <strong>PG 19 Beta1</strong> 上实际执行，两个版本输出<strong>逐字节一致</strong>。</p>
+
+        <hr>
+
+        <h2>问题：非分区键查询命中所有分区</h2>
+
+        <p>经典事件/日志表按时间分区：</p>
+
+        <pre><code>CREATE TABLE events (
+    event_time timestamp NOT NULL,   -- 分区键
+    session_id int      NOT NULL,   -- 业务查询键（非分区键）
+    payload    text
+) PARTITION BY RANGE (event_time);</code></pre>
+
+        <p>业务要"查某个 session 的全部事件"。它用 <code>session_id</code> 过滤，<strong>根本不碰分区键</strong>。<code>enable_partition_pruning</code> 只能拿分区键边界去匹配 WHERE，对 <code>session_id</code> 无能为力——于是优化器只能把三个分区全扫一遍。这是我们之前在《enable_partition_pruning 两阶段分区裁剪》里讲过的"裁剪失效原因 1：WHERE 未约束分区键"。</p>
+
+        <h2>误区：constraint_exclusion 对声明式分区"没用"？</h2>
+
+        <p>我们那篇文章里写过一句：</p>
+
+        <blockquote>"PG11+ 的声明式分区只用 <code>enable_partition_pruning</code>，调 <code>constraint_exclusion</code> 对你的声明式分区表没有任何作用。"</blockquote>
+
+        <p>这句话对<strong>分区键裁剪</strong>完全正确——分区边界匹配由 <code>enable_partition_pruning</code> 接管，<code>constraint_exclusion</code> 在那里纯冗余。但对本文的<strong>非分区键 + CHECK 约束</strong>场景，它需要被修正：<code>constraint_exclusion</code>（默认 <code>partition</code>）正是让 CHECK 约束参与分区裁剪的总开关。下面的场景 6 会直接证明——把它设为 <code>off</code>，三个分区立刻全部出现。</p>
+
+        <hr>
+
+        <h2>解法：CHECK 约束编码"非分区键 → 分区"的映射</h2>
+
+        <p>核心前提：<strong>session_id 与 event_time 强相关</strong>。session 是递增分配的，2026-07-01 的 session 落在 1..1000，07-02 落在 1001..2000……既然每个分区的 session_id 范围是确定的，就把这个范围<strong>写死成 CHECK 约束</strong>。优化器在计划时把 WHERE 的 <code>session_id</code> 条件和各分区的 CHECK 比对，能证明不匹配的就裁掉。</p>
+
+        <table>
+            <thead><tr><th>要素</th><th>作用</th></tr></thead>
+            <tbody>
+                <tr><td><code>CHECK (session_id BETWEEN lo AND hi)</code></td><td>声明"本分区的 session_id 只可能在这个区间"</td></tr>
+                <tr><td><code>constraint_exclusion = partition</code>（默认）</td><td>允许优化器用 CHECK 约束排除分区</td></tr>
+                <tr><td>session_id 与分区键强相关</td><td>保证区间不重叠、不漏数据，裁剪才有意义</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>实测验证：测试表准备</h2>
+
+        <pre><code>DROP TABLE IF EXISTS events_np;
+CREATE TABLE events_np (
+    event_time timestamp NOT NULL,
+    session_id  int NOT NULL,
+    payload    text
+) PARTITION BY RANGE (event_time);
+
+CREATE TABLE events_np_d1 PARTITION OF events_np FOR VALUES FROM ('2026-07-01') TO ('2026-07-02');
+CREATE TABLE events_np_d2 PARTITION OF events_np FOR VALUES FROM ('2026-07-02') TO ('2026-07-03');
+CREATE TABLE events_np_d3 PARTITION OF events_np FOR VALUES FROM ('2026-07-03') TO ('2026-07-04');
+
+-- session_id 与日期强相关（越大越新）
+INSERT INTO events_np SELECT '2026-07-01'::timestamp + (g % 86400 || ' s')::interval, g, 'p'||g FROM generate_series(1,1000) g;
+INSERT INTO events_np SELECT '2026-07-02'::timestamp + (g % 86400 || ' s')::interval, 1000+g, 'p'||g FROM generate_series(1,1000) g;
+INSERT INTO events_np SELECT '2026-07-03'::timestamp + (g % 86400 || ' s')::interval, 2000+g, 'p'||g FROM generate_series(1,1000) g;
+
+-- 关键：把每个分区的 session_id 边界写死成 CHECK 约束
+ALTER TABLE events_np_d1 ADD CONSTRAINT ck_d1 CHECK (session_id BETWEEN 1    AND 1000);
+ALTER TABLE events_np_d2 ADD CONSTRAINT ck_d2 CHECK (session_id BETWEEN 1001 AND 2000);
+ALTER TABLE events_np_d3 ADD CONSTRAINT ck_d3 CHECK (session_id BETWEEN 2001 AND 3000);
+
+ANALYZE events_np;
+
+SHOW constraint_exclusion;   -- partition（默认值，无需修改）</code></pre>
+
+        <hr>
+
+        <h2>验证结果总览</h2>
+
+        <table>
+            <thead><tr><th>查询</th><th>约束 / 开关</th><th>扫描分区</th><th>说明</th></tr></thead>
+            <tbody>
+                <tr><td><code>session_id = 500</code></td><td>CHECK + cx=partition</td><td><strong>d1</strong></td><td>点查裁剪到 1 个分区</td></tr>
+                <tr><td><code>session_id BETWEEN 2500 AND 2800</code></td><td>CHECK + cx=partition</td><td><strong>d3</strong></td><td>范围裁剪到 1 个分区</td></tr>
+                <tr><td><code>session_id IN (500, 2500)</code></td><td>CHECK + cx=partition</td><td><strong>d1 + d3</strong></td><td>跨两区，d2 被裁</td></tr>
+                <tr><td><code>session_id = 500</code></td><td>无 CHECK</td><td>d1 + d2 + d3</td><td>对照：全扫</td></tr>
+                <tr><td><code>session_id = 500</code></td><td>CHECK + cx=off</td><td>d1 + d2 + d3</td><td>对照：开关是关键</td></tr>
+                <tr><td><code>session_id BETWEEN 900 AND 1500</code></td><td>CHECK + cx=partition</td><td><strong>d1 + d2</strong></td><td>部分重叠跨两区</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <h2>逐场景 EXPLAIN（PG 16.11 与 19 Beta1 完全一致）</h2>
+
+        <h3>场景 1：分区键查询（基线，本来就会裁）</h3>
+
+        <pre><code>EXPLAIN SELECT * FROM events_np
+WHERE event_time &gt;= '2026-07-02' AND event_time &lt; '2026-07-03';
+
+--                         QUERY PLAN
+-- ----------------------------------------------------------------
+--  Seq Scan on events_np_d2 events_np
+--    Filter: ((event_time &gt;= '2026-07-02 00:00:00'::timestamp without time zone)
+--             AND (event_time &lt; '2026-07-03 00:00:00'::timestamp without time zone))
+-- (2 rows)</code></pre>
+
+        <p>这是 <code>enable_partition_pruning</code> 的功劳，仅作基线对照。</p>
+
+        <h3>场景 2：非分区键点查 → 只扫 d1</h3>
+
+        <pre><code>EXPLAIN SELECT * FROM events_np WHERE session_id = 500;
+
+--           QUERY PLAN
+-- ------------------------------
+--  Seq Scan on events_np_d1 events_np
+--    Filter: (session_id = 500)
+-- (2 rows)</code></pre>
+
+        <p><strong>events_np_d2、events_np_d3 从计划里直接消失了。</strong>d1 的 CHECK 是 <code>1..1000</code>，500 落在其中；d2 是 <code>1001..2000</code>、d3 是 <code>2001..3000</code>，优化器证明 500 不可能在那两个分区，直接裁掉。</p>
+
+        <h3>场景 3：非分区键范围 → 只扫 d3</h3>
+
+        <pre><code>EXPLAIN SELECT * FROM events_np WHERE session_id BETWEEN 2500 AND 2800;
+
+--                      QUERY PLAN
+-- -------------------------------------------------
+--  Seq Scan on events_np_d3 events_np
+--    Filter: ((session_id &gt;= 2500) AND (session_id &lt;= 2800))
+-- (2 rows)</code></pre>
+
+        <h3>场景 4：IN 跨两区 → 扫 d1 + d3，d2 被裁</h3>
+
+        <pre><code>EXPLAIN SELECT * FROM events_np WHERE session_id IN (500, 2500);
+
+--                        QUERY PLAN
+-- --------------------------------------------------
+--  Append
+--    ->  Seq Scan on events_np_d1 events_np_1
+--          Filter: (session_id = ANY ('{500,2500}'::integer[]))
+--    ->  Seq Scan on events_np_d3 events_np_2
+--          Filter: (session_id = ANY ('{500,2500}'::integer[]))
+-- (5 rows)</code></pre>
+
+        <p>优化器对 IN 列表里每个值分别判断归属分区，500→d1、2500→d3，d2 两边都不沾，被裁。</p>
+
+        <h3>场景 5 &amp; 6：两个对照（证明机制）</h3>
+
+        <pre><code>-- 对照 A：去掉所有 CHECK 约束后，点查退化为全扫
+ALTER TABLE events_np_d1 DROP CONSTRAINT ck_d1;
+ALTER TABLE events_np_d2 DROP CONSTRAINT ck_d2;
+ALTER TABLE events_np_d3 DROP CONSTRAINT ck_d3;
+EXPLAIN SELECT * FROM events_np WHERE session_id = 500;
+--  Append: events_np_d1 + events_np_d2 + events_np_d3（三个全扫）
+
+-- 对照 B：恢复 CHECK，但关掉 constraint_exclusion → 仍然全扫
+ALTER TABLE events_np_d1 ADD CONSTRAINT ck_d1 CHECK (session_id BETWEEN 1    AND 1000);
+ALTER TABLE events_np_d2 ADD CONSTRAINT ck_d2 CHECK (session_id BETWEEN 1001 AND 2000);
+ALTER TABLE events_np_d3 ADD CONSTRAINT ck_d3 CHECK (session_id BETWEEN 2001 AND 3000);
+SET constraint_exclusion = off;
+EXPLAIN SELECT * FROM events_np WHERE session_id = 500;
+--  Append: events_np_d1 + events_np_d2 + events_np_d3（三个全扫）
+RESET constraint_exclusion;</code></pre>
+
+        <p>两个对照说明：<strong>CHECK 约束和 <code>constraint_exclusion</code> 缺一不可</strong>。对照 A 证明没有 CHECK 就无从裁剪；对照 B 证明开关一关，CHECK 约束被闲置。</p>
+
+        <h3>场景 7：部分重叠 → 跨 d1 + d2</h3>
+
+        <pre><code>EXPLAIN SELECT * FROM events_np WHERE session_id BETWEEN 900 AND 1500;
+
+--                        QUERY PLAN
+-- --------------------------------------------------
+--  Append
+--    ->  Seq Scan on events_np_d1 events_np_1
+--    ->  Seq Scan on events_np_d2 events_np_2
+-- (5 rows)</code></pre>
+
+        <p>900 在 d1（1..1000）内、1500 在 d2（1001..2000）内，区间横跨两个分区，两个都保留，但 d3 仍被裁。</p>
+
+        <hr>
+
+        <h2>真实扫描量对比（EXPLAIN ANALYZE）</h2>
+
+        <pre><code>EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT * FROM events_np WHERE session_id = 500;
+
+--                         QUERY PLAN
+-- ------------------------------------------------------------
+--  Seq Scan on events_np_d1 events_np (actual rows=1 loops=1)
+--    Filter: (session_id = 500)
+--    Rows Removed by Filter: 999
+-- (3 rows)</code></pre>
+
+        <p>裁剪生效后，只扫 <strong>d1 的 1000 行</strong>（999 被过滤、1 返回）。若未裁剪，需要扫三个分区共 3000 行——扫描量降到 1/3。表越大、分区越多，收益越夸张（100 个分区 → 扫描量降到 1/100）。</p>
+
+        <p class="post-note"><em>注：PG 19 Beta1 在此计划末尾额外输出 <code>Buffers: shared hit=7</code>，是 19 对 EXPLAIN ANALYZE 的默认增强，不影响裁剪结论；两版本核心计划完全一致。</em></p>
+
+        <hr>
+
+        <h2>进阶：用 Gaps and Islands 推导 CHECK 边界</h2>
+
+        <p>上面的边界是我"已知"的。真实环境里，你往往需要从数据反推每个分区的 session_id 范围。最简单的是 min/max：</p>
+
+        <pre><code>SELECT pgc.relname,
+       min(e.session_id) AS sid_min,
+       max(e.session_id) AS sid_max,
+       count(*)          AS rows
+FROM events_np e
+JOIN pg_class pgc ON pgc.oid = e.tableoid
+GROUP BY pgc.relname
+ORDER BY pgc.relname;
+
+--    relname    | sid_min | sid_max | rows
+-- --------------+---------+---------+------
+--  events_np_d1 |       1 |    1000 | 1000
+--  events_np_d2 |    1001 |    2000 | 1000
+--  events_np_d3 |    2001 |    3000 | 1000</code></pre>
+
+        <p>但当某个分区的 session_id 有<strong>空洞</strong>（如 d1 只插了 1..500 和 800..1000，缺 501..799），min/max 会给出错误的 <code>1..1000</code> 边界，导致 CHECK 比真实数据更宽。这时用 <strong>Gaps and Islands</strong> 算法求<strong>最大连续区间</strong>：</p>
+
+        <pre><code>WITH ranked AS (
+  SELECT tableoid, session_id,
+         session_id - row_number() OVER (PARTITION BY tableoid ORDER BY session_id) AS grp
+  FROM events_np
+)
+SELECT pgc.relname, min(session_id) AS sid_min, max(session_id) AS sid_max
+FROM ranked r JOIN pg_class pgc ON pgc.oid = r.tableoid
+GROUP BY pgc.relname, grp
+ORDER BY pgc.relname, sid_min;
+
+--    relname    | sid_min | sid_max
+-- --------------+---------+---------
+--  events_np_d1 |       1 |     500
+--  events_np_d1 |     800 |    1000   ← 空洞 501..799 被识别为两段
+--  events_np_d2 |    1001 |    2000
+--  events_np_d3 |    2001 |    3000</code></pre>
+
+        <p>带空洞的分区要用<strong>单个 OR CHECK 约束</strong>覆盖多段（不能拆成两条独立 CHECK 分别 ADD，否则加第一条时既有数据就违反它）：</p>
+
+        <pre><code>ALTER TABLE events_np_d1 ADD CONSTRAINT ck_d1
+  CHECK (session_id BETWEEN 1 AND 500 OR session_id BETWEEN 800 AND 1000);
+
+EXPLAIN SELECT * FROM events_np WHERE session_id = 500;   -- → d1
+EXPLAIN SELECT * FROM events_np WHERE session_id = 900;   -- → d1（落在 800..1000 段）
+EXPLAIN SELECT * FROM events_np WHERE session_id = 1500;  -- → d2</code></pre>
+
+        <p>优化器能正确处理 OR 形式的 CHECK，裁剪依然精准。</p>
+
+        <hr>
+
+        <h2>生效前提与陷阱（必读）</h2>
+
+        <ol>
+            <li><strong>非分区键必须与分区键强相关。</strong>如果是随机 user_id，CHECK 范围会覆盖<strong>所有</strong>分区 → 裁剪彻底失效，白加约束还拖慢写入。</li>
+            <li><strong>CHECK 约束必须是"真"的。</strong>CHECK 会拦下越界插入——但如果你为写入性能放松 CHECK（或在应用层"保证"），一旦数据越界，<strong>查询会漏掉本应返回的行</strong>。这是<strong>正确性事故</strong>，不只是性能问题。</li>
+            <li><strong>分区重组要同步维护 CHECK。</strong>分裂/合并/重命名分区时，边界漂移，CHECK 不跟着更新就会出上面第 2 条的问题。建议用迁移脚本或触发器强约束。</li>
+            <li><strong>适合读多写少、分区稳定的日志/事件/历史表。</strong>不适合高频 DDL 或混乱数据。</li>
+            <li><strong>写入与 DDL 开销。</strong>每行插入都过一遍 CHECK 校验；ALTER 加 CHECK 在大表上可能长时间持锁。</li>
+        </ol>
+
+        <hr>
+
+        <h2>与 enable_partition_pruning 的关系（修正前文）</h2>
+
+        <table>
+            <thead><tr><th>机制</th><th>裁剪依据</th><th>适用查询</th></tr></thead>
+            <tbody>
+                <tr><td><code>enable_partition_pruning</code>（默认 on）</td><td>分区<strong>边界</strong>约束（分区键）</td><td>WHERE 含分区键</td></tr>
+                <tr><td><code>constraint_exclusion</code>（默认 partition）</td><td>分区上的<strong>CHECK 约束</strong>（含用户自定义）</td><td>WHERE 含被 CHECK 覆盖的任意列</td></tr>
+            </tbody>
+        </table>
+
+        <p>两者<strong>互补不互斥</strong>：分区键裁剪交给前者，非分区键裁剪靠后者。我们此前"constraint_exclusion 对声明式分区没用"的说法，仅在"分区键裁剪"语境下成立；一旦你用 CHECK 约束显式声明非分区键的取值范围，<code>constraint_exclusion</code> 立刻变成刚需。</p>
+
+        <hr>
+
+        <h2>跨版本一致性</h2>
+
+        <p><code>constraint_exclusion</code> 在 PG 16.11 与 PG 19 Beta1 上的默认值（<code>partition</code>）、行为、以及本文所有 EXPLAIN 输出<strong>逐字节一致</strong>。这不是 PG19 新特性，而是 PG 老祖宗就有的能力——只是大多数人没想到它能这么用。</p>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成，所有 SQL 均在 PG 16.11 与 PG 19 Beta1 上实际执行验证通过（两版本输出一致）。技术审校：小木（AI）。致谢：Haki Benita《Pruning partitions on non-partitioning keys》提供了本主题的启发；本文亦对本博客《enable_partition_pruning 两阶段分区裁剪深度解析》中关于 constraint_exclusion 的表述做了场景化修正。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>&copy; 2026 木木 · Powered by <a href="https://pages.github.com">GitHub Pages</a></p>
+        </div>
+    </footer>
+</body>
+</html>

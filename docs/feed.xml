@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Fri, 10 Jul 2026 10:52:00 +0800</lastBuildDate>
+    <lastBuildDate>Mon, 13 Jul 2026 10:00:00 +0800</lastBuildDate>
+    <item>
+      <title>非分区键查询实现分区裁剪：CHECK 约束 + constraint_exclusion 实战</title>
+      <link>https://hellomlb.github.io/pg-xsj/sql-optimize/non-partition-key-pruning.html</link>
+      <description>声明式分区表按 A 列分区、业务却总用 B 列查，默认会扫全部分区。当 B 与 A 强相关时，给每个分区加声明其 B 列边界的 CHECK 约束，constraint_exclusion（默认 partition）即可按非分区键裁剪。所有 SQL 在 PG 16.11 与 PG 19 Beta1 双版本实测，并修正了本博客此前关于 constraint_exclusion 的片面表述。</description>
+      <pubDate>Mon, 13 Jul 2026 10:00:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/sql-optimize/non-partition-key-pruning.html</guid>
+    </item>
     <item>
       <title>PG19 Property Graph 实战：在关系表上声明式叠图，以及三个必须知道的坑</title>
       <link>https://hellomlb.github.io/pg-xsj/graph/pg19-property-graph.html</link>
