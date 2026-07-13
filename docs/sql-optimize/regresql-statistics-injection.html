@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战） - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="RegreSQL 2.0 用 pg_dump --statistics-only 把生产的真实统计注入本地小库，让 EXPLAIN 在笔记本上就复现生产计划。本文在 PG 18.4 本地 + PG 19 Beta1 远程完整实测：注入生效、autovacuum 冲掉坑、跨版本目录格式被版本保护挡死而 plain 文本可注入，并挖掘出 visibility map 这一被忽略的边界。">
+    <meta property="og:title" content="RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战）">
+    <meta property="og:description" content="pg_dump --statistics-only 统计注入实测：同版本生效、易失、跨版本 plain 可注入，并发现 visibility map 边界。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/regresql-statistics-injection.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战）</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-13">2026-07-13</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">RegreSQL</span>
+                <span class="tag">statistics-only</span>
+                <span class="tag">pg_dump</span>
+                <span class="tag">EXPLAIN</span>
+                <span class="tag">PG18</span>
+                <span class="tag">plan-regression</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · 本地 PG 18.4 实测 + PG 19 Beta1 跨版本实测（--statistics-only 为 PG18 pg_dump 新增客户端选项，底层 pg_restore_*_stats 函数 PG16+ 已存在）</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>RegreSQL 2.0 的核心玩法，是用 <code>pg_dump --statistics-only</code> 把<strong>生产的真实统计</strong>（行数、直方图、最常用值 MCV）导出，再注入你本机那张只有十行的小库。这样 <strong>EXPLAIN 在本地就"看见"了生产的数据分布</strong>，计划回归在笔记本上就能拦住，不用等上线才炸。</p>
+
+        <p>我们完整实测了一遍：<strong>同版本注入确实让本地计划与源库逐字节一致；但统计是易失的，一次 ANALYZE 就被冲掉；跨版本时目录格式被版本保护挡死，plain 文本可以注入；更深的边界是——它压根不碰 visibility map，所以"计划完全匹配生产"是有前提的。</strong></p>
+
+        <hr>
+
+        <h2>白话：为什么需要统计注入？</h2>
+
+        <p>优化器做计划时，<strong>读的从来不是数据，是统计</strong>。你的 dev 库只有几百行，统计说"每个值都差不多"，于是 EXPLAIN 觉得全表扫最便宜——它没撒谎，只是样本太小、分布太平。</p>
+
+        <p>可生产库是几百万行、<code>region</code> 99% 是 'east' 的倾斜数据。同样的 SQL，生产优化器看着另一套统计，可能选了完全不同的计划（比如从索引扫描悄悄退化成顺序扫描）。你的测试套件在 dev 库全绿，因为 dev 的统计根本不会发生这种退化。</p>
+
+        <p>RegreSQL 的洞见是：<strong>你不需要把生产数据搬回家，你只需要搬优化器真正读的那点统计。</strong> PG18 的 <code>pg_dump --statistics-only</code> 干的就是这个。</p>
+
+        <hr>
+
+        <h2>原理：导出与注入两条命令</h2>
+
+        <p>统计存在系统表 <code>pg_statistic</code> 里（以及 <code>pg_class</code> 的 relpages/reltuples）。PG18 起 <code>pg_dump</code> 多了个 <code>--statistics-only</code> 开关，只导这些、不导表结构和数据：</p>
+
+        <pre><code># 从生产导出统计（目录格式，含 TOC）
+pg_dump --statistics-only -h &lt;生产&gt; -d &lt;库&gt; -F d -f /tmp/prod_stats
+
+# 注入到本地小库
+pg_restore --statistics-only -h &lt;本地&gt; -d &lt;库&gt; /tmp/prod_stats</code></pre>
+
+        <p class="note">底层调用的是 <code>pg_restore_relation_stats()</code> / <code>pg_restore_attribute_stats()</code> 两个函数（plain 格式导出时直接是这两个函数的 SQL 调用）。这两个函数在 <strong>PG16 起就存在</strong>——所以"统计注入"的机制本身不限于 PG18，只是那条<strong>一键导出的便捷选项是 PG18 才加的 pg_dump 客户端功能</strong>。</p>
+
+        <hr>
+
+        <h2>实测一：同版本统计注入（本地 PG 18.4）</h2>
+
+        <p>准备两张结构相同的表 <code>t_orders(region, ...)</code>，各 10 万行，区别只在 <code>region</code> 的分布：</p>
+        <ul>
+            <li><strong>源库 stats_src</strong>：<code>region</code> 99% 是 'east'（模拟生产倾斜）</li>
+            <li><strong>目标库 stats_dst</strong>：<code>region</code> 均匀四分（模拟本地小库"太平"的分布）</li>
+        </ul>
+
+        <p>同样一条 <code>SELECT count(*) FROM t_orders WHERE region='east'</code>，注入前两个库的计划估算完全不同——因为统计不同：</p>
+
+        <pre><code>-- 目标库 stats_dst（均匀 25% east）：估算 25303 行 → Index Only Scan
+Aggregate (cost=598.35..598.36 rows=1 width=8)
+  ->  Index Only Scan using idx_region on t_orders (cost=0.29..535.10 rows=25303 width=0)
+        Index Cond: (region = 'east'::text)
+        Heap Fetches: 0
+
+-- 源库 stats_src（99% east）：估算 99047 行 → 同样的 Index Only Scan 但估算差近 4 倍
+Aggregate (cost=2329.23..2329.24 rows=1 width=8)
+  ->  Index Only Scan using idx_region on t_orders (cost=0.29..2081.62 rows=99047 width=0)
+        Index Cond: (region = 'east'::text)</code></pre>
+
+        <p>现在导出源库统计、注入目标库：</p>
+
+        <pre><code>pg_dump --statistics-only -d stats_src -F d -f /tmp/stats_src_dump
+pg_restore --statistics-only -d stats_dst /tmp/stats_src_dump</code></pre>
+
+        <p>注入后，目标库的 <code>pg_statistic</code> 里 <code>region</code> 列的确变成了源库的倾斜分布：</p>
+
+        <pre><code>-- 注入后 stats_dst.region 的 MCV（最常用值 + 频率）
+stavalues1 : {east,west,north,south}
+stanumbers1: {0.99046665,0.0034666667,0.0033333334,0.0027333333}   ← east 占 99%，源库特征</code></pre>
+
+        <p>关键看计划——目标库注入后，<strong>估算从 25303 跳到 99047，与源库完全一致</strong>：</p>
+
+        <pre><code>-- 目标库 stats_dst 注入后：rows=99047，cost 与源库逐字节相同 ✅
+Aggregate (cost=2329.23..2329.24 rows=1 width=8)
+  ->  Index Only Scan using idx_region on t_orders (cost=0.29..2081.62 rows=99047 width=0)
+        Index Cond: (region = 'east'::text)</code></pre>
+
+        <p>✅ 这就是文章的核心 claim：<strong>注入生产统计后，本地 EXPLAIN 的估算（rows/cost）与生产完全一致</strong>。计划回归检测工具据此就能在本地发现"生产会退化"的查询。</p>
+
+        <hr>
+
+        <h2>实测二：统计是易失的——autovacuum 一次就冲掉</h2>
+
+        <p>注入的统计不是"焊死"在表上的。它是 <code>pg_statistic</code> 里的一行数据，<strong>任何一次 ANALYZE（或后台 autovacuum 自动触发）都会重新计算、直接覆盖</strong>。实测：</p>
+
+        <pre><code>-- 注入后 MCV：east = 0.9904（源库倾斜，已注入）
+stanumbers1: {0.99046665,0.0034666667,0.0033333334,0.0027333333}
+
+-- 手动 ANALYZE（模拟 autovacuum 覆盖注入统计）
+ANALYZE t_orders;
+
+-- ANALYZE 后 MCV：被打回本地均匀分布
+stanumbers1: {0.25203332,0.2514,0.2489,0.24766667}   ← 回到 25% 均匀
+
+-- 计划也随之漂回本地分布（估算 25140，不再是 99047）
+Aggregate (cost=591.09..591.10 rows=1 width=8)
+  ->  Index Only Scan using idx_region on t_orders (cost=0.29..528.24 rows=25140 width=0)
+        Index Cond: (region = 'east'::text)</code></pre>
+
+        <p class="note">⚠️ 这意味着<strong>统计注入是一个"临时快照"，不是永久修复</strong>。它适合在 CI / 回归测试里"注入→跑计划检查→用完即弃"，不适合当成长期的生产配置。这也正是 RegreSQL 把它设计成"测试时注入、测试完清理"的原因。</p>
+
+        <hr>
+
+        <h2>实测三：跨版本注入（PG18 → PG 19 Beta1）</h2>
+
+        <p>把本地 PG18 导出的统计，往远程 PG 19 Beta1 注入，撞到一个明确的版本墙：</p>
+
+        <h3>目录格式：-F d 被版本保护直接 abort</h3>
+        <pre><code>pg_restore --statistics-only -h &lt;PG19beta1&gt; -d stats_xver /tmp/stats_src_dump
+
+pg_restore: error: aborting because of server version mismatch
+pg_restore: detail: server version: 19beta1; pg_restore version: 18.4</code></pre>
+        <p>✅ 复现了"跨主版本二进制 dump 被挡死"的预期。pg_restore 对目录格式有严格的 server/pg_restore 版本一致要求。</p>
+
+        <h3>plain 格式：-F p 的函数调用可以跨版本</h3>
+        <p>改用 plain 文本格式导出（里面是 <code>pg_restore_relation_stats()</code> / <code>pg_restore_attribute_stats()</code> 的 SQL 调用），直接 psql 执行到 PG19beta1：</p>
+
+        <pre><code>pg_dump --statistics-only -F p -d stats_src -f /tmp/stats_src_plain.sql
+psql -h &lt;PG19beta1&gt; -d stats_xver -f /tmp/stats_src_plain.sql   ← 退出码 0，成功
+
+-- 远程 PG19 Beta1 注入后 MCV，与源库 PG18 逐字节一致 ✅
+stanumbers1: {0.99046665,0.0034666667,0.0033333334,0.0027333333}</code></pre>
+
+        <p>✅ <strong>跨主版本注入统计，用 plain 文本格式是可行的</strong>。底层函数 PG18/19 都认。所以"把生产（PG18）统计注入测试库（PG19 预发布）做计划回归比对"这条路是通的——只是别用目录格式，用 plain。</p>
+
+        <hr>
+
+        <h2>深度洞察：visibility map 这道被忽略的边界</h2>
+
+        <p>实测中我们撞见一个比文档更微妙的现象，值得单拎出来说。</p>
+
+        <p>源库 <code>stats_src</code> 在<strong>刚建好、autovacuum 还没来得及 VACUUM 的那一刻</strong>，同样的查询跑出的是 <strong>Seq Scan（估算 99060）</strong>；等 visibility map 变新鲜（autovacuum 跑过）后，同样的统计下却改选了 <strong>Index Only Scan（估算 99047）</strong>。统计一字未改，计划却变了。</p>
+
+        <pre><code>-- 源库 stats_src 初次 EXPLAIN（VM 尚不新鲜）：Seq Scan
+Aggregate (cost=2732.65..2732.66 rows=1 width=8)
+  ->  Seq Scan on t_orders (cost=0.00..2485.00 rows=99060 width=0)
+        Filter: (region = 'east'::text)
+        Rows Removed by Filter: 948
+
+-- VM 变新鲜后（autovacuum 跑过），同一统计下：Index Only Scan
+Aggregate (cost=2329.23..2329.24 rows=1 width=8)
+  ->  Index Only Scan using idx_region on t_orders (cost=0.29..2081.62 rows=99047 width=0)</code></pre>
+
+        <p class="note">根因：<code>pg_dump --statistics-only</code> 注入的是<strong>逻辑统计</strong>（MCV / 直方图 / relpages / reltuples），它<strong>不注入 visibility map 的物理状态</strong>（<code>relallvisible</code> 由 VACUUM 设置，不在统计 dump 里）。Index Only Scan 的 cost 高度依赖 VM 新鲜度——VM 脏意味着要回表，cost 飙升，优化器就改选 Seq Scan。</p>
+
+        <p>这恰好是文章那句"<strong>空库会撒谎</strong>"的更深一层：连逻辑统计都对齐了，<strong>如果本地小库的 VM 状态和生产不一致</strong>（生产库经过海量 UPDATE/DELETE，VM 往往大片脏），Index Only Scan 的真实 cost 仍可能和生产不同，计划也就可能不完全匹配。统计注入解决了"分布撒谎"，但没解决"物理状态撒谎"。它极大提升了本地复现的保真度，但不是 100% 等价。</p>
+
+        <hr>
+
+        <h2>版本边界（诚实说明）</h2>
+
+        <ul>
+            <li><code>--statistics-only</code> 是 <strong>PG18 新增的 pg_dump 客户端选项</strong>。PG17 及更早的 pg_dump 不认识它（用 PG18+ 客户端连老服务器则可以导出，我们连 PG 16.14 实测成功）。</li>
+            <li>统计注入的底层函数 <code>pg_restore_relation_stats()</code> / <code>pg_restore_attribute_stats()</code> 在 <strong>PG16 起已存在</strong>，所以"统计注入"机制本身跨 PG16/17/18/19 都可用。</li>
+            <li>跨版本注入首选 <strong>plain 文本格式</strong>（函数调用），目录格式会被版本保护挡死。</li>
+            <li>统计注入是<strong>易失快照</strong>，ANALYZE / autovacuum 会覆盖，适合测试时临时用。</li>
+        </ul>
+
+        <hr>
+
+        <h2>白话总结：什么时候用它？</h2>
+
+        <ul>
+            <li><strong>CI 计划回归测试</strong>：把生产统计注入测试库，跑 EXPLAIN 比对 baseline，计划漂移（索引扫描→顺序扫描、缓冲暴涨）在合并前就拦住。这正是 RegreSQL 2.0 的主场。</li>
+            <li><strong>本地复现"生产才出现的慢查询"</strong>：不用导数据，导统计就能在笔记本上看到生产的计划形状。</li>
+            <li><strong>别当永久配置</strong>：统计易失，autovacuum 一跑就丢；它是测试夹具，不是生产调优手段。</li>
+            <li><strong>记住 VM 边界</strong>：若你的查询高度依赖 Index Only Scan，光注入统计可能还不够——生产 VM 的脏净程度也会影响计划，必要时连 VACUUM 状态也一并考虑。</li>
+        </ul>
+
+        <hr>
+
+        <h2>参考</h2>
+        <ul>
+            <li>Radim Marek, 《The tests passed. The plan didn't.》(RegreSQL 2.0 介绍，boringsQL，2026-07-12) — postgr.es/p/9pn</li>
+            <li>PostgreSQL 18.0 Release Notes — pg_dump 新增 --statistics-only</li>
+            <li>本文全部 EXPLAIN / pg_statistic 数据均在本地 PG 18.4 与远程 PG 19 Beta1 实际执行并原样记录</li>
+        </ul>
+
+        <hr>
+
+        <p class="disclaimer"><em>本文 SQL 与 EXPLAIN 计划、pg_statistic 查询结果均在 PG 18.4（本地）与 PG 19 Beta1（远程）测试实例实际执行并原样记录；版本边界与跨版本行为均经实测。AI 辅助整理，核心数据均来自真实执行。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>PG习思集 · 木木的 PostgreSQL 实战笔记 · 内容基于真实环境验证</p>
+        </div>
+    </footer>
+</body>
+</html>

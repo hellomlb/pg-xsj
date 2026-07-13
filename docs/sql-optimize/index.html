@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/regresql-statistics-injection.html">RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战）</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-13">2026-07-13</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">RegreSQL 2.0 用 pg_dump --statistics-only 把生产的真实统计注入本地小库，让 EXPLAIN 在笔记本上就复现生产计划。本地 PG 18.4 + PG 19 Beta1 实测：注入后估算与源库逐字节一致、autovacuum 一次冲掉注入统计、跨版本目录格式被版本保护挡死而 plain 文本可注入，并挖掘出 visibility map 这一被忽略的边界。</p>
+        <a href="/pg-xsj/sql-optimize/regresql-statistics-injection.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/enable-self-join-elimination.html">enable_self_join_elimination：主键自连接自动消除（PG18+ 性能特性）</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-13">2026-07-13</time>
