@@ -14,3 +14,7 @@ docs/**/*.md
 .DS_Store
 *.pyc
 __pycache__/
+
+# 所有 Markdown 不入库（仅技术博客 HTML 入库，且需老木同意）
+/*.md
+!README.md
