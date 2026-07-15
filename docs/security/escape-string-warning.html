@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>escape_string_warning：守了二十年的 SQL 注入哨兵，在 PG19 谢幕 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="escape_string_warning 是 PostgreSQL 默认开启的 GUC，作用是检测应用是否偷偷依赖非标准字符串转义（SQL 注入防护的检测端）。PG 16.11 + 16.14 双版本实测其完整行为，并揭示 PG 19 Beta1 已将其移除、彻底禁用非标准字符串字面量。">
+    <meta property="og:title" content="escape_string_warning：守了二十年的 SQL 注入哨兵，在 PG19 谢幕">
+    <meta property="og:description" content="默认 on 的 GUC 是如何当 SQL 注入哨兵的？PG 16.11 + 16.14 双版本实测，并揭示 PG 19 Beta1 已将其移除。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/security/escape-string-warning.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>escape_string_warning：守了二十年的 SQL 注入哨兵，在 PG19 谢幕</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-15">2026-07-15</time>
+            <span class="post-category security">安全加固</span>
+            <span class="post-tags">
+                <span class="tag">escape_string_warning</span>
+                <span class="tag">GUC</span>
+                <span class="tag">SQL注入防护</span>
+                <span class="tag">字符串转义</span>
+                <span class="tag">PG16</span>
+                <span class="tag">PG19</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 双版本实测 · PG 16.11 + PG 16.14 已验证（含 PG 19 Beta1 版本边界实测）</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><strong><code>escape_string_warning</code> 是一个默认开启的 GUC，作用是「检测非标准字符串转义的使用」</strong>——当应用悄悄依赖老式 <code>standard_conforming_strings=off</code> 写法（如 <code>'O\'Brien'</code>）时，提前打一声 WARNING。它是 SQL 注入防护的<strong>检测端（detection half）</strong>，不是修复端。PG 16.11 与 16.14 双版本实测行为完全一致；而 <strong>PG 19 Beta1 已将其彻底移除</strong>——因为非标准字符串字面量转义本身在 PG19 被禁用了。</p>
+
+        <hr>
+
+        <h2>白话：这个哨兵站在哪、守什么？</h2>
+
+        <p>SQL 标准里，字符串字面量 <code>'...'</code> 中的反斜杠 <code>\</code> 就是普通字符。但 PostgreSQL 老版本（8.1 之前）默认把 <code>\</code> 当转义符，<code>'O\'Brien'</code> 表示 O'Brien。8.1 起引入 <code>standard_conforming_strings</code>（默认 on），让普通字符串回归标准，<code>\</code> 变为字面字符；需要转义时改用显式的 <code>E'...'</code> 语法。</p>
+
+        <p>那么问题来了：那些<strong>从老版本迁上来、仍写着 <code>'O\'Brien'</code> 的应用</strong>，一旦切到标准模式，<code>\</code> 就不再是转义符，字符串含义变了，甚至变成 SQL 注入的温床。<code>escape_string_warning</code> 就是给这类应用的一声响铃：<strong>只要你用了非标准转义，我就警告你</strong>。</p>
+
+        <hr>
+
+        <h2>原理：什么情况下会响？</h2>
+
+        <p>触发 WARNING 的<strong>唯一</strong>条件：</p>
+        <ul>
+            <li><code>standard_conforming_strings = off</code>（应用仍依赖非标准转义）</li>
+            <li><strong>且</strong> 普通字符串字面量 <code>'...'</code> 中包含反斜杠 <code>\</code></li>
+        </ul>
+        <p>其他一切情况都不响：</p>
+        <ul>
+            <li>GUC 本身设为 <code>off</code></li>
+            <li><code>standard_conforming_strings = on</code>（默认，<code>\</code> 就是普通字符，无转义可言）</li>
+            <li>使用显式 <code>E'...'</code> 转义串（你明确声明了要转义，不需要警告）</li>
+        </ul>
+
+        <hr>
+
+        <h2>验证准备（双版本）</h2>
+
+        <pre><code>-- 在 PG 16.11 与 PG 16.14 上分别确认默认值
+SELECT name, setting,
+       (SELECT setting FROM pg_settings WHERE name='standard_conforming_strings') AS scs_default
+FROM pg_settings WHERE name='escape_string_warning';
+-- PG 16.11: escape_string_warning=on, scs=on
+-- PG 16.14: escape_string_warning=on, scs=on</code></pre>
+
+        <hr>
+
+        <h2>场景验证（PG 16.11 与 PG 16.14 输出完全一致）</h2>
+
+        <p>每个场景在两个版本各跑一遍，结果逐字节相同。</p>
+
+        <h3>场景 1：scs=off + 字面量含 \ → 触发 WARNING（哨兵响）</h3>
+        <pre><code>SET standard_conforming_strings=off;
+SELECT 'a\b' AS sc1_result;
+
+WARNING:  nonstandard use of escape in a string literal
+HINT:  Use the escape string syntax for escapes, e.g., E'\r\n'.
+ sc1_result
+------------
+ a\x08
+(1 row)</code></pre>
+        <p>✅ 这是哨兵存在的意义：应用若依赖 <code>scs=off</code>，<code>\b</code> 会被当作退格转义符（0x08），同时满足触发条件时报警。</p>
+
+        <h3>场景 2：scs=on（默认）+ 字面量含 \ → 不响（\ 是普通字符）</h3>
+        <pre><code>SET standard_conforming_strings=on;
+SELECT 'a\b' AS sc2_result;
+
+ sc2_result
+------------
+ a\b
+(1 row)</code></pre>
+        <p>✅ 标准模式下 <code>\</code> 就是字面反斜杠，没有「转义」概念，自然无需警告。</p>
+
+        <h3>场景 3：E'...' 显式转义串 → 不响（明确声明）</h3>
+        <pre><code>SET standard_conforming_strings=on;
+SELECT E'a\b' AS sc3_result;
+
+ sc3_result
+------------
+ a\x08
+(1 row)</code></pre>
+        <p>✅ <code>E'...'</code> 是显式转义语法，<code>\b</code> 合法转义为退格，因为「你明确要转义」，哨兵不重复报警。</p>
+
+        <h3>场景 4：GUC 设为 off → 不响</h3>
+        <pre><code>SET escape_string_warning=off;
+SET standard_conforming_strings=off;
+SELECT 'a\b' AS sc4_result;
+
+ sc4_result
+------------
+ a\x08
+(1 row)</code></pre>
+        <p>✅ 关掉哨兵，当然不报警——但转义行为本身（<code>\b</code>→退格）取决于 <code>scs</code>，与 GUC 无关。</p>
+
+        <hr>
+
+        <h2>版本边界（重要，诚实说明）：PG 19 Beta1 已移除该 GUC</h2>
+
+        <p>PG 19 做了一个<strong>语义断裂</strong>式变更。在 PG 19 Beta1（x86_64 Linux 测试实例）上：</p>
+
+        <pre><code>-- PG 19 Beta1
+SELECT ... WHERE name='escape_string_warning';  -- 0 rows（GUC 已不存在）
+SET escape_string_warning=off;
+ERROR:  unrecognized configuration parameter "escape_string_warning"
+
+SET standard_conforming_strings=off;
+ERROR:  non-standard string literals are not supported</code></pre>
+
+        <ul>
+            <li><code>escape_string_warning</code> GUC <strong>查无此行</strong>，<code>SET</code> 直接报 <code>unrecognized configuration parameter</code>；</li>
+            <li><code>SET standard_conforming_strings=off</code> 直接报 <code>ERROR: non-standard string literals are not supported</code>——<strong>非标准字符串字面量被彻底禁止</strong>；</li>
+            <li>普通字面量里 <code>\</code> 永远是字面字符（<code>'a\b'</code> 原样返回 <code>a\b</code>）；<code>E'...'</code> 转义串语法仍保留。</li>
+        </ul>
+
+        <p class="note"><strong>为什么移除？</strong> 因为非标准字符串转义被禁用了，<code>scs=off</code> 不再可能，这个「提醒你用了非标准转义」的哨兵自然失去了存在意义，被一并删除。这是 Pettus 文章里「守了二十年」的哨兵的终点。</p>
+
+        <hr>
+
+        <h2>白话总结：对升级和巡检意味着什么</h2>
+
+        <ul>
+            <li><strong>默认就是 on，你什么都不用做</strong>（PG 8.1 ~ 18）。它只在「应用偷偷依赖老式转义」时响。</li>
+            <li><strong>PG19 升级必查</strong>：任何仍写着 <code>'O\'Brien'</code> 这类非标准转义老代码的应用，到了 PG19 会<strong>直接报错</strong>（不是警告），迁移前必须改成 <code>E'O\'Brien'</code> 或标准字面量。</li>
+            <li><strong>巡检注意</strong>：若巡检脚本检查 <code>escape_string_warning</code>，对 <strong>PG 19+ 应判定「GUC 不存在属正常」</strong>，否则会误报告警。</li>
+            <li><strong>SQL 注入防护是体系</strong>：这个 GUC 只是「检测端」的提示音，真正的防护靠参数化查询 / 预编译语句，不要因为「没收到警告」就放松。</li>
+        </ul>
+
+        <hr>
+
+        <h2>参考</h2>
+        <ul>
+            <li>Christophe Pettus, "All Your GUCs in a Row: escape_string_warning"（The Build 博客，<a href="https://thebuild.com/blog/all-your-gucs-in-a-row-escape_string_warning" target="_blank" rel="noopener">原文链接</a>）</li>
+        </ul>
+
+        <hr>
+
+        <p class="disclaimer"><em>本文由 AI 辅助整理撰写，所有 SQL 与执行输出均在 PG 16.11（本机 aarch64）与 PG 16.14（x86_64 Linux 测试实例）双版本实际执行并原样记录；PG 19 Beta1（x86_64 Linux 测试实例）用于版本边界验证。AI 未绕过实测，核心结论均来自真实执行数据。</em></p>
+    </div>
+        </article>
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>PG习思集 · 木木的 PostgreSQL 实战笔记 · 内容基于真实环境验证</p>
+        </div>
+    </footer>
+</body>
+</html>

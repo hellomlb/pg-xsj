@@ -27,7 +27,17 @@
     <p class="back-link"><a href="/pg-xsj/">← 返回首页</a></p>
 </header>
 
-<p class="empty-notice">暂无文章，敬请期待。</p>
+<div class="post-list">
+    <article class="post-card">
+        <h3><a href="/pg-xsj/security/escape-string-warning.html">escape_string_warning：守了二十年的 SQL 注入哨兵，在 PG19 谢幕</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-15">2026-07-15</time>
+            <span class="post-category security">安全加固</span>
+        </div>
+        <p class="post-excerpt">escape_string_warning 是 PostgreSQL 默认开启的 GUC，检测应用是否偷偷依赖非标准字符串转义（SQL 注入防护的检测端）。PG 16.11 + 16.14 双版本实测其完整行为，并揭示 PG 19 Beta1 已将其移除、彻底禁用非标准字符串字面量——老应用 'O\'Brien' 写法升级到 19 会直接报错。</p>
+        <a href="/pg-xsj/security/escape-string-warning.html" class="read-more">阅读全文 →</a>
+    </article>
+</div>
     </main>
 
     <footer class="site-footer">

@@ -5,7 +5,15 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Mon, 13 Jul 2026 15:28:00 +0800</lastBuildDate>
+    <lastBuildDate>Wed, 15 Jul 2026 10:57:00 +0800</lastBuildDate>
+    <item>
+      <title>escape_string_warning：守了二十年的 SQL 注入哨兵，在 PG19 谢幕</title>
+      <link>https://hellomlb.github.io/pg-xsj/security/escape-string-warning.html</link>
+      <description>escape_string_warning 是 PostgreSQL 默认开启的 GUC，检测应用是否偷偷依赖非标准字符串转义（SQL 注入防护的检测端）。PG 16.11 + 16.14 双版本实测其完整行为，并揭示 PG 19 Beta1 已将其移除、彻底禁用非标准字符串字面量——依赖非标准转义的老应用代码升级到 PG19 会直接报错而非仅警告，巡检检查该 GUC 时对 PG19+ 应判「不存在属正常」。</description>
+      <pubDate>Wed, 15 Jul 2026 10:57:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/security/escape-string-warning.html</guid>
+    </item>
+
     <item>
       <title>RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战）</title>
       <link>https://hellomlb.github.io/pg-xsj/sql-optimize/regresql-statistics-injection.html</link>
