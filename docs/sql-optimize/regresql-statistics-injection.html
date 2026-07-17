@@ -6,7 +6,7 @@
     <title>RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战） - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="RegreSQL 2.0 用 pg_dump --statistics-only 把生产的真实统计注入本地小库，让 EXPLAIN 在笔记本上就复现生产计划。本文在 PG 18.4 本地 + PG 19 Beta1 远程完整实测：注入生效、autovacuum 冲掉坑、跨版本目录格式被版本保护挡死而 plain 文本可注入，并挖掘出 visibility map 这一被忽略的边界。">
+    <meta name="description" content="RegreSQL 2.0 用 pg_dump --statistics-only 把生产的真实统计注入本地小库，让 EXPLAIN 在笔记本上就复现生产计划。本文在 PG 18.4 与 PG 19 Beta1 完整实测：注入生效、autovacuum 冲掉坑、跨版本目录格式被版本保护挡死而 plain 文本可注入，并挖掘出 visibility map 这一被忽略的边界。">
     <meta property="og:title" content="RegreSQL 2.0 统计注入：让本地 EXPLAIN 看见生产的数据分布（PG18+ 实战）">
     <meta property="og:description" content="pg_dump --statistics-only 统计注入实测：同版本生效、易失、跨版本 plain 可注入，并发现 visibility map 边界。">
     <meta property="og:type" content="article">
@@ -40,7 +40,7 @@
                 <span class="tag">plan-regression</span>
             </span>
         </div>
-        <div class="verified-badge">✅ 已验证版 · 本地 PG 18.4 实测 + PG 19 Beta1 跨版本实测（--statistics-only 为 PG18 pg_dump 新增客户端选项，底层 pg_restore_*_stats 函数 PG16+ 已存在）</div>
+        <div class="verified-badge">✅ 已验证版 · PG 18.4 实测 + PG 19 Beta1 跨版本实测（--statistics-only 为 PG18 pg_dump 新增客户端选项，底层 pg_restore_*_stats 函数 PG16+ 已存在）</div>
     </header>
 
     <div class="post-content">
@@ -76,7 +76,7 @@ pg_restore --statistics-only -h &lt;本地&gt; -d &lt;库&gt; /tmp/prod_stats</c
 
         <hr>
 
-        <h2>实测一：同版本统计注入（本地 PG 18.4）</h2>
+        <h2>实测一：同版本统计注入（PG 18.4）</h2>
 
         <p>准备两张结构相同的表 <code>t_orders(region, ...)</code>，各 10 万行，区别只在 <code>region</code> 的分布：</p>
         <ul>
@@ -143,7 +143,7 @@ Aggregate (cost=591.09..591.10 rows=1 width=8)
 
         <h2>实测三：跨版本注入（PG18 → PG 19 Beta1）</h2>
 
-        <p>把本地 PG18 导出的统计，往远程 PG 19 Beta1 注入，撞到一个明确的版本墙：</p>
+        <p>把 PG18 导出的统计向 PG 19 Beta1 注入，撞到一个明确的版本墙：</p>
 
         <h3>目录格式：-F d 被版本保护直接 abort</h3>
         <pre><code>pg_restore --statistics-only -h &lt;PG19beta1&gt; -d stats_xver /tmp/stats_src_dump
@@ -158,7 +158,7 @@ pg_restore: detail: server version: 19beta1; pg_restore version: 18.4</code></pr
         <pre><code>pg_dump --statistics-only -F p -d stats_src -f /tmp/stats_src_plain.sql
 psql -h &lt;PG19beta1&gt; -d stats_xver -f /tmp/stats_src_plain.sql   ← 退出码 0，成功
 
--- 远程 PG19 Beta1 注入后 MCV，与源库 PG18 逐字节一致 ✅
+-- PG19 Beta1 注入后 MCV，与源库 PG18 逐字节一致 ✅
 stanumbers1: {0.99046665,0.0034666667,0.0033333334,0.0027333333}</code></pre>
 
         <p>✅ <strong>跨主版本注入统计，用 plain 文本格式是可行的</strong>。底层函数 PG18/19 都认。所以"把生产（PG18）统计注入测试库（PG19 预发布）做计划回归比对"这条路是通的——只是别用目录格式，用 plain。</p>
@@ -213,12 +213,12 @@ Aggregate (cost=2329.23..2329.24 rows=1 width=8)
         <ul>
             <li>Radim Marek, 《The tests passed. The plan didn't.》(RegreSQL 2.0 介绍，boringsQL，2026-07-12) — postgr.es/p/9pn</li>
             <li>PostgreSQL 18.0 Release Notes — pg_dump 新增 --statistics-only</li>
-            <li>本文全部 EXPLAIN / pg_statistic 数据均在本地 PG 18.4 与远程 PG 19 Beta1 实际执行并原样记录</li>
+            <li>本文全部 EXPLAIN / pg_statistic 数据均在 PG 18.4 与 PG 19 Beta1 实际执行并原样记录</li>
         </ul>
 
         <hr>
 
-        <p class="disclaimer"><em>本文 SQL 与 EXPLAIN 计划、pg_statistic 查询结果均在 PG 18.4（本地）与 PG 19 Beta1（远程）测试实例实际执行并原样记录；版本边界与跨版本行为均经实测。AI 辅助整理，核心数据均来自真实执行。</em></p>
+        <p class="disclaimer"><em>本文 SQL 与 EXPLAIN 计划、pg_statistic 查询结果均在 PG 18.4 与 PG 19 Beta1 实际执行并原样记录；版本边界与跨版本行为均经实测。AI 辅助整理，核心数据均来自真实执行。</em></p>
     </div>
         </article>
     </main>
