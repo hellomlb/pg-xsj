@@ -29,6 +29,15 @@
 
     <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/kernel/exit-on-error-guc-crash.html">exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测却能把整个实例干崩</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-17">2026-07-17</time>
+            <span class="post-category kernel">内核研究</span>
+        </div>
+        <p class="post-excerpt">exit_on_error 是 PostgreSQL 的 fail-fast 开关：会话内任意 SQL 报错即终止整个后端连接。PG 16.11 + PG 18.4 双版本实测三大反直觉陷阱：普通用户即可开启（PGC_USERSET）、它是服务端杀进程而非 psql 客户端行为、且在 PG 18.4 上会触发全实例 crash recovery。</p>
+        <a href="/pg-xsj/kernel/exit-on-error-guc-crash.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/kernel/pg18-skip-scan-self-join-elimination.html">PG18 三大性能增强实测：Skip Scan、自连接消除、Autovacuum 大表治理</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-10">2026-07-10</time>

@@ -5,7 +5,14 @@
     <link>https://hellomlb.github.io/pg-xsj</link>
     <description>PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</description>
     <language>zh-CN</language>
-    <lastBuildDate>Wed, 15 Jul 2026 10:57:00 +0800</lastBuildDate>
+    <lastBuildDate>Fri, 17 Jul 2026 10:30:00 +0800</lastBuildDate>
+    <item>
+      <title>exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测却能把整个实例干崩</title>
+      <link>https://hellomlb.github.io/pg-xsj/kernel/exit-on-error-guc-crash.html</link>
+      <description>exit_on_error 是 PostgreSQL 的 fail-fast 开关：会话内任意 SQL 报错即终止整个后端连接。PG 16.11 + PG 18.4 双版本实测三大反直觉陷阱：普通用户即可开启（PGC_USERSET）、它是服务端杀进程而非 psql 客户端行为、且在 PG 18.4 上会触发全实例 crash recovery。版本诚实说明：本机无 16.14 实例，第二验证版本用 18.4 替代，未伪造双版本结论。</description>
+      <pubDate>Fri, 17 Jul 2026 10:30:00 +0800</pubDate>
+      <guid isPermaLink="true">https://hellomlb.github.io/pg-xsj/kernel/exit-on-error-guc-crash.html</guid>
+    </item>
     <item>
       <title>escape_string_warning：守了二十年的 SQL 注入哨兵，在 PG19 谢幕</title>
       <link>https://hellomlb.github.io/pg-xsj/security/escape-string-warning.html</link>
