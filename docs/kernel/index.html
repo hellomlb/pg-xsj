@@ -34,7 +34,7 @@
             <time datetime="2026-07-17">2026-07-17</time>
             <span class="post-category kernel">内核研究</span>
         </div>
-        <p class="post-excerpt">exit_on_error 是 PostgreSQL 的 fail-fast 开关：会话内任意 SQL 报错即终止整个后端连接。四版本实测（本机 PG16.11/18.4 macOS + 远程 PG16.14/19beta1 Linux）揭示三大反直觉陷阱：普通用户即可开启（PGC_USERSET）、它是服务端杀进程而非 psql 客户端行为、且在 macOS 的 PG 18.4 上曾触发全实例 crash recovery（但 Linux 生产环境仅结束会话，属平台特有现象，通用风险为会话被终止）。</p>
+        <p class="post-excerpt">exit_on_error 是 PostgreSQL 的 fail-fast 开关：会话内任意 SQL 报错即终止整个后端连接。PG 16.11 / 16.14 / 18.4 / 19beta1 四版本实测揭示三大反直觉陷阱：普通用户即可开启（PGC_USERSET）、它是服务端杀进程而非 psql 客户端行为、误开或全局开启会引发会话被批量终止的连接池雪崩。</p>
         <a href="/pg-xsj/kernel/exit-on-error-guc-crash.html" class="read-more">阅读全文 →</a>
     </article>
     <article class="post-card">
