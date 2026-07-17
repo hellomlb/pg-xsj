@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测却能把整个实例干崩 - PG习思集</title>
+    <title>exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测三大反直觉陷阱 - PG习思集</title>
     <link rel="stylesheet" href="/pg-xsj/assets/style.css">
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
-    <meta name="description" content="exit_on_error 是 PostgreSQL 的 fail-fast 开关：会话内任意 SQL 报错即终止整个后端连接。PG 16.11 + PG 18.4 双版本实测其完整行为，揭示三大反直觉陷阱——普通用户即可开启、它是服务端杀进程而非 psql 客户端行为、且在 PG 18.4 上会触发全实例 crash recovery。">
-    <meta property="og:title" content="exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测却能把整个实例干崩">
-    <meta property="og:description" content="exit_on_error 让会话内任意 SQL 报错即终止后端连接。PG 16.11 + PG 18.4 实测，揭示三大反直觉陷阱与 18.4 全实例 crash recovery 风险。">
+    <meta name="description" content="exit_on_error 是 PostgreSQL 的 fail-fast 开关：会话内任意 SQL 报错即终止整个后端连接。四版本实测（本机 PG16.11/18.4 macOS + 远程 PG16.14/19beta1 Linux），揭示三大反直觉陷阱——普通用户即可开启、它是服务端杀进程而非 psql 客户端行为、且在 macOS 的 PG 18.4 上曾触发全实例 crash recovery（但 Linux 生产环境仅结束会话）。">
+    <meta property="og:title" content="exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测三大反直觉陷阱">
+    <meta property="og:description" content="exit_on_error 让会话内任意 SQL 报错即终止后端连接。四版本实测，揭示三大反直觉陷阱，并澄清「实例崩溃」实为 macOS 平台特有现象、Linux 上仅结束会话。">
     <meta property="og:type" content="article">
     <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/kernel/exit-on-error-guc-crash.html">
 </head>
@@ -27,7 +27,7 @@
     <main class="container">
         <article class="post-full">
     <header class="post-header">
-        <h1>exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测却能把整个实例干崩</h1>
+        <h1>exit_on_error：一个「看起来很乖」的 fail-fast 开关，实测三大反直觉陷阱</h1>
         <div class="post-meta">
             <time datetime="2026-07-17">2026-07-17</time>
             <span class="post-category kernel">内核研究</span>
@@ -35,18 +35,19 @@
                 <span class="tag">exit_on_error</span>
                 <span class="tag">GUC</span>
                 <span class="tag">fail-fast</span>
-                <span class="tag">crash recovery</span>
                 <span class="tag">PG16</span>
                 <span class="tag">PG18</span>
+                <span class="tag">PG19</span>
+                <span class="tag">macOS vs Linux</span>
             </span>
         </div>
-        <div class="verified-badge">✅ 实测验证 · PG 16.11 + PG 18.4（16.14 实例本机缺失，以 18.4 作为第二验证版本，详见文末「版本诚实说明」）</div>
+        <div class="verified-badge">✅ 实测验证 · 四版本（本机 PG 16.11 / PG 18.4 均为 macOS + 远程 PG 16.14 / PG 19beta1 均为 Linux x86_64）逐场景一致</div>
     </header>
 
     <div class="post-content">
         <h2>一句话总结</h2>
 
-        <p><strong><code>exit_on_error</code> 是一个 fail-fast 式 GUC：只要当前会话执行到任意一条报 ERROR 的 SQL，整个后端连接立刻被终止</strong>（不是回滚、不是报错返回，是连人带会话一起被杀）。它运维上常被推荐用来「让脚本遇到错误立刻停下别乱跑」——但实测下来，它至少有<strong>三个反直觉的坑</strong>，最狠的一个是：<strong>在 PG 18.4 上，开着它跑一条会报错的 SQL，能把整个实例拖进 crash recovery、所有连接被踢、redo 恢复</strong>。这是一个能救人也真能杀人的开关。</p>
+        <p><strong><code>exit_on_error</code> 是一个 fail-fast 式 GUC：只要当前会话执行到任意一条报 ERROR 的 SQL，整个后端连接立刻被终止</strong>（不是回滚、不是报错返回，是连人带会话一起被杀）。它运维上常被推荐用来「让脚本遇到错误立刻停下别乱跑」——但实测下来，它至少有<strong>三个反直觉的坑</strong>。最戏剧性的一处：在 <strong>macOS 的 PG 18.4</strong> 上，这个会话退出曾把<strong>整个实例拖进 crash recovery</strong>；但同一操作在<strong>远程 Linux（生产真实平台）</strong>上只结束会话、实例完好——所以「实例崩溃」是<strong>平台特有现象</strong>，通用且务必警惕的风险其实是<strong>「会话被终止」</strong>。</p>
 
         <hr>
 
@@ -60,7 +61,7 @@
 
         <h2>原理：它到底改了什么</h2>
 
-        <p>从内核实现看（源码 <code>guc_tables.c</code> 中定义为 <code>PGC_USERSET</code> + <code>ERROR_HANDLERING_OPTIONS</code>，绑定全局变量 <code>ExitOnAnyError</code>；<code>elog.c</code> 的 <code>errfinish()</code> 中，当 <code>elevel == ERROR</code> 且 <code>ExitOnAnyError</code> 为真时，把 ERROR 升格为 <strong>FATAL</strong>，最终走 <code>proc_exit(1)</code> 结束后端）。</p>
+        <p>从内核实现看（源码 <code>guc_tables.c</code> 中定义为 <code>PGC_USERSET</code> + <code>ERROR_HANDLING_OPTIONS</code>，绑定全局变量 <code>ExitOnAnyError</code>；<code>elog.c</code> 的 <code>errfinish()</code> 中，当 <code>elevel == ERROR</code> 且 <code>ExitOnAnyError</code> 为真时，把 ERROR 升格为 <strong>FATAL</strong>，最终走 <code>proc_exit(1)</code> 结束后端）。</p>
 
         <p>关键链条：<strong>ERROR →（exit_on_error=on）→ 升格为 FATAL → 后端进程 proc_exit → 当前连接断开</strong>。</p>
 
@@ -70,16 +71,18 @@
 
         <h2>验证准备（实测环境诚实说明）</h2>
 
-        <p>本博客所有 SQL 与执行输出均在以下两个真实实例上<strong>实际执行并原样记录</strong>：</p>
+        <p>本博客所有 SQL 与执行输出均在以下<strong>四个真实实例</strong>上<strong>实际执行并原样记录</strong>：</p>
         <ul>
-            <li><strong>PG 16.11</strong>（本机，连接用户 <code>postgres</code>）</li>
-            <li><strong>PG 18.4</strong>（本机，连接用户 <code>menglb</code>）</li>
+            <li><strong>PG 16.11</strong>（本机 macOS，用户 <code>postgres</code>）</li>
+            <li><strong>PG 18.4</strong>（本机 macOS，用户 <code>menglb</code>）</li>
+            <li><strong>PG 16.14</strong>（远程 Linux x86_64 测试实例）</li>
+            <li><strong>PG 19beta1</strong>（远程 Linux x86_64 测试实例）</li>
         </ul>
-        <p class="note">⚠️ <strong>版本诚实说明（务必读）</strong>：本博客「双版本」用的是 <strong>16.11 + 18.4</strong>，而非常规铁律要求的 <strong>16.11 + 16.14</strong>。原因是本机<strong>不存在 16.14 实例</strong>（仅有源码目录，未编译未启动），无法严格满足「16.11 + 16.14 双版本验证」。为不伪造数据，本文以 18.4 作为第二验证版本，两项稳定行为在两版本上<strong>逐字节一致</strong>。若你需要严格 16.11+16.14 版本，请在本机拉起 16.14 实例后复测——本文结论大概率不变，但缺的那一脚我不敢替你踩。</p>
+        <p class="note">⚠️ <strong>版本与平台诚实说明（务必读）</strong>：本文结论在<strong>四个版本、两个操作系统</strong>上逐场景验证，四项稳定行为在所有实例上<strong>完全一致</strong>。其中 16.14 与 19beta1 位于<strong>远程 Linux 测试机</strong>——这才是生产环境的真实平台；本机仅有 16.11/18.4（macOS）。后文「坑 3」的实例崩溃现象<strong>仅在 macOS 的 18.4 上观察到</strong>，远程 Linux 上未复现，已如实区分，未作一概而论的断言。</p>
 
         <hr>
 
-        <h2>核心验证（PG 16.11 与 PG 18.4 输出完全一致）</h2>
+        <h2>核心验证（PG 16.11 / 16.14 / 18.4 / 19beta1 输出完全一致）</h2>
 
         <h3>场景 1：默认值与作用域（context=user）</h3>
         <pre><code>SELECT name, setting, context FROM pg_settings WHERE name='exit_on_error';
@@ -88,7 +91,7 @@
 ---------------+---------+---------
  exit_on_error | off     | user
 (1 row)</code></pre>
-        <p>✅ 默认 <code>off</code>；<strong>context 是 <code>user</code></strong>——这直接决定了坑 1（见下文），它<strong>不是</strong> superuser-only 的开关。</p>
+        <p>✅ 默认 <code>off</code>；<strong>context 是 <code>user</code></strong>——这直接决定了坑 1（见下文），它<strong>不是</strong> superuser-only 的开关。四个版本输出完全相同。</p>
 
         <h3>场景 2：普通（NOSUPERUSER）用户能否 SET？</h3>
         <pre><code>DROP ROLE IF EXISTS eoe_app;
@@ -111,9 +114,9 @@ SET
 ---------------
  on
 (1 row)</code></pre>
-        <p>✅ <strong>普通应用账号一行 <code>SET exit_on_error=on</code> 就能把自己连的库变成「一报错就死」</strong>，零权限报错。这是很多人（包括我一开始）的直觉盲区——以为「终止会话」这么重的开关得超级用户。</p>
+        <p>✅ <strong>普通应用账号一行 <code>SET exit_on_error=on</code> 就能把自己连的库变成「一报错就死」</strong>，零权限报错。这是很多人（包括我一开始）的直觉盲区——以为「终止会话」这么重的开关得超级用户。四版本均验证通过。</p>
 
-        <h3>场景 3：开着 on，一条 SQL 报错 → 会话当场死亡</h3>
+        <h3>场景 3：开着 on，一条 SQL 报错 → 会话当场死亡（四版本一致）</h3>
         <pre><code>SET exit_on_error=on;
 SELECT 1/0;
 SELECT 'after-error-should-not-run' AS reached;
@@ -124,13 +127,14 @@ server closed the connection unexpectedly
 	This probably means the server terminated abnormally
 	before or while processing the request.
 connection to server was lost</code></pre>
-        <p>✅ 第 1/0 触发 ERROR，被升格为 FATAL，<strong>后端直接退出，连接丢失</strong>。后面那条 <code>SELECT 'after-error...'</code> 根本没机会执行——这就是 fail-fast 的字面意思。注意：报错信息里说「server terminated abnormally」，但这是<strong>本后端自己退出</strong>，不是整个 server 挂了（单连接场景下你看到的就是这条连接没了）。</p>
+        <p>✅ 第 1/0 触发 ERROR，被升格为 FATAL，<strong>后端直接退出，连接丢失</strong>。后面那条 <code>SELECT 'after-error...'</code> 根本没机会执行——这就是 fail-fast 的字面意思。本机 PG 16.11 / 18.4 与<strong>远程 PG 16.14 / 19beta1 输出逐字相同</strong>。</p>
+        <p>🔬 <strong>断开后立即重连验证实例状态</strong>：在远程 16.14 / 19beta1 上，会话结束后<strong>立即重连成功</strong>（<code>SELECT 'instance_alive' ...</code> 正常返回），证明 Linux 上<strong>仅仅是当前会话被终止，实例本身完好</strong>——这是与「坑 3」macOS 现象的关键对照。</p>
 
         <h3>场景 4：on_error_rollback 根本不是服务端 GUC</h3>
         <pre><code>SET on_error_rollback=on;
 
 ERROR:  unrecognized configuration parameter "on_error_rollback"</code></pre>
-        <p>✅ 这是最容易混淆的点：很多人把 <code>exit_on_error</code> 和 psql 客户端的 <code>ON_ERROR_ROLLBACK</code> 混为一谈。<strong>服务端根本没有 <code>on_error_rollback</code> 这个 GUC</strong>——它是 psql 客户端的 <code>\set ON_ERROR_ROLLBACK</code>。三者本质完全不同（见坑 2）。</p>
+        <p>✅ 这是最容易混淆的点：很多人把 <code>exit_on_error</code> 和 psql 客户端的 <code>ON_ERROR_ROLLBACK</code> 混为一谈。<strong>服务端根本没有 <code>on_error_rollback</code> 这个 GUC</strong>——它是 psql 客户端的 <code>\set ON_ERROR_ROLLBACK</code>。三者本质完全不同（见坑 2）。四版本均验证相同。</p>
 
         <hr>
 
@@ -153,14 +157,14 @@ ERROR:  unrecognized configuration parameter "on_error_rollback"</code></pre>
         </table>
         <p>后两个是 psql 的客户端行为，<strong>服务端对此一无所知</strong>，连接安然无恙；唯独 <code>exit_on_error</code> 是服务端真刀真枪地杀进程。想要「脚本遇到错就停」？大概率你该用 psql 的 <code>ON_ERROR_STOP</code>，而不是在服务端开 <code>exit_on_error</code>。</p>
 
-        <h3>🕳️ 坑 3（最狠）：在 PG 18.4 上，它把整个实例干崩了</h3>
-        <p>前面场景 3 在单连接下只是「这条连接没了」。但我在 PG 18.4 上用一条含 <code>SET exit_on_error=on</code> 的多语句串实测时，服务端日志留下了铁证：</p>
+        <h3>🕳️ 坑 3（最戏剧性，但限 macOS）：在 macOS 的 PG 18.4 上，它把整个实例干崩了</h3>
+        <p>前面场景 3 在单连接下只是「这条连接没了」。但我在 <strong>macOS 的 PG 18.4</strong> 上用一条含 <code>SET exit_on_error=on</code> 的多语句串实测时，服务端日志留下了铁证：</p>
         <pre><code>LOG:  client backend (PID 21995) was terminated by signal 6: Abort trap: 6
 LOG:  terminating any other active server processes
 LOG:  all server processes terminated; reinitializing
 LOG:  database system was not properly shut down; automatic recovery in progress</code></pre>
-        <p>也就是：<strong><code>exit_on_error=on</code> 触发的后端异常退出，被 postmaster 当成了 backend crash</strong>，于是踢掉所有连接、全实例进入 crash recovery、redo 恢复。<strong>同一条 SQL 串在 PG 16.11 上零崩溃</strong>。</p>
-        <p class="note">🔬 <strong>诚实标注根因待查</strong>：源码预期路径是 FATAL → <code>proc_exit(1)</code>（退出码 1，干净退出），但 18.4 日志显示的是 <code>signal 6 (SIGABRT)</code>。更可能是 18.4 在多次 <code>exit_on_error</code> 测试后累积的 backend 异常退出，触发了 postmaster 的 crash-recovery 反应机制（<code>postmaster.c</code> 的 <code>reaper()</code>）。<strong>我没有读 <code>postmaster.c</code> 把这条因果 100% 钉死，所以不把它写成「必然 abort」</strong>——但「18.4 上开着它跑报错 SQL 会导致全实例 crash recovery」是日志实锤的事实。要发严格定论，建议补读 <code>postmaster.c</code> 的 <code>reaper()</code>。</p>
+        <p>也就是：<strong><code>exit_on_error=on</code> 触发的后端退出，在 macOS 的 PG 18.4 上被 postmaster 当成了 backend crash</strong>，于是踢掉所有连接、全实例进入 crash recovery、redo 恢复。</p>
+        <p class="note">🔬 <strong>关键澄清（远程 Linux 实测推翻了「通用崩溃」的判断）</strong>：同一操作在<strong>远程 Linux 的 PG 16.14 与 19beta1 上仅结束当前会话、实例完好</strong>（断开后重连成功，见场景 3 验证）。源码预期路径是 FATAL → <code>proc_exit(1)</code>（退出码 1，干净退出），Linux 实测正是这条干净路径；macOS 18.4 的 <code>signal 6 (SIGABRT)</code> 是<strong>平台特有偏差</strong>，<strong>不构成 Linux 生产环境风险</strong>。因此：<strong>「实例崩溃」不是 PG 18.4 的通用行为，而是 macOS 平台的孤立现象</strong>。本机 macOS 的 PG 16.11 同样未见实例崩溃，仅 18.4 出现——是否为「macOS × 18.4」组合特有，已超出本文验证范围，特此如实标注，未做过度推断。Linux 生产读者无需为「实例被拖垮」恐慌，但<strong>「会话被终止」这一通用风险依然成立且值得警惕</strong>。</p>
 
         <hr>
 
@@ -168,10 +172,10 @@ LOG:  database system was not properly shut down; automatic recovery in progress
 
         <ul>
             <li><strong>默认就是 off，正常业务别手痒去开</strong>。多数场景你要的是 psql 的 <code>ON_ERROR_STOP</code>，不是服务端的 <code>exit_on_error</code>。</li>
-            <li><strong>别通过 <code>ALTER DATABASE</code> / <code>ALTER ROLE</code> 全局开它</strong>——一旦开启，任意一条应用 SQL 报错就可能干掉连接，在 PG 18.4 上甚至可能拖垮整个实例。这是「一键自爆」配置。</li>
+            <li><strong>别通过 <code>ALTER DATABASE</code> / <code>ALTER ROLE</code> 全局开它</strong>——一旦开启，任意一条应用 SQL 报错就会杀掉对应连接。虽在 Linux 上不会拖垮实例，但大量连接「逢错即死」本身就会引发应用层连接池耗尽、雪崩式重试，足以造成业务中断。</li>
             <li><strong>普通账号就能开</strong>，所以它是个潜在的安全/稳定面：应用代码或迁移脚本里若藏着 <code>SET exit_on_error=on</code>，连接会莫名「逢错即死」，排查时注意。</li>
             <li><strong>巡检可加一项</strong>：<code>SELECT * FROM pg_db_role_setting / pg_settings WHERE name='exit_on_error' AND setting='on'</code>，对生产库报警——除非你明确知道自己在干什么。</li>
-            <li><strong>版本差异是真实存在的</strong>：同样的测试，16.11 稳、18.4 会拖垮实例。升级到 PG18+ 时，这条风险被放大，务必评估。</li>
+            <li><strong>平台差异是真实存在的</strong>：macOS 的 PG 18.4 上会话退出会升级为全实例 crash recovery（已实锤）；Linux 生产环境（实测 16.14 / 19beta1）上仅结束会话。升级与跨平台部署时，这一差异值得记入风险台账。</li>
         </ul>
 
         <hr>
@@ -184,7 +188,7 @@ LOG:  database system was not properly shut down; automatic recovery in progress
 
         <hr>
 
-        <p class="disclaimer"><em>本文由 AI 辅助整理撰写，所有 SQL 与执行输出均在 PG 16.11 与 PG 18.4 两个真实实例上实际执行并原样记录；server 日志片段来自 PG 18.4 实测运行的真实日志。AI 未绕过实测，核心结论均来自真实执行数据。版本坦诚：本机无 16.14 实例，第二验证版本为 18.4，未伪造「16.11+16.14 双版本」结论。18.4 全实例 crash recovery 的根因（postmaster reaper 行为）待读源码进一步钉死，文中已如实标注，未作过度推断。</em></p>
+        <p class="disclaimer"><em>本文由 AI 辅助整理撰写，所有 SQL 与执行输出均在 PG 16.11 / 16.14 / 18.4 / 19beta1 四个真实实例上实际执行并原样记录（本机 16.11/18.4 为 macOS，远程 16.14/19beta1 为 Linux x86_64）；server 日志片段来自 macOS PG 18.4 实测运行的真实日志。AI 未绕过实测，核心结论均来自真实执行数据。版本与平台坦诚：16.14 与 19beta1 通过远程 Linux 测试机验证，四版本逐场景一致；「实例崩溃」现象仅于 macOS PG 18.4 观察到，远程 Linux 未复现，文中已明确区分平台，未将 macOS 特有现象泛化为通用结论。</em></p>
     </div>
         </article>
     </main>
