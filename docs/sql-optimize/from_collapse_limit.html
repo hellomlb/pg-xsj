@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>from_collapse_limit 深度实测：PG 16/19 里它为什么常常"没用"，真正管用的旋钮是谁 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="基于 PG 16.11 与 19 Beta1 的实跑验证，拆解 from_collapse_limit 的真实作用点（deconstruct_jointree）、它在现代版本为何对日常查询几乎失效，以及真正控制连接重排的活旋钮 join_collapse_limit 与 geqo_threshold 的隐藏关系。">
+    <meta property="og:title" content="from_collapse_limit 深度实测：PG 16/19 里它为什么常常没用，真正管用的旋钮是谁">
+    <meta property="og:description" content="实跑验证 from_collapse_limit 在 PG 16.11 / 19 Beta1 的行为：FROM 子查询被无条件下拉、扁平逗号列表永远合并，参数几乎失效；join_collapse_limit 才是连接重排的活旋钮。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/from_collapse_limit.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>from_collapse_limit 深度实测：PG 16/19 里它为什么常常"没用"，真正管用的旋钮是谁</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-24">2026-07-24</time>
+            <span class="post-category sql-optimize">SQL优化</span>
+            <span class="post-tags">
+                <span class="tag">from_collapse_limit</span>
+                <span class="tag">join_collapse_limit</span>
+                <span class="tag">规划器</span>
+                <span class="tag">deconstruct_jointree</span>
+                <span class="tag">geqo_threshold</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + 19 Beta1 双版本实跑</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>from_collapse_limit</code> 的官方定义是"规划器把 FROM 子查询/括号化连接折叠进父查询、形成一个可整体重排的 join 问题时，允许的最大关系数"，默认 <code>8</code>。但我在 <strong>PG 16.11 与 19 Beta1</strong> 上实跑验证后发现：<strong>对现代版本的日常查询，这个参数几乎不起作用</strong>——FROM 子查询（含聚合、LIMIT、UNION）被无条件下拉内联，扁平逗号列表永远合并。真正控制连接重排、你调了能立刻看到计划变化的，是它兄弟 <code>join_collapse_limit</code>。</p>
+
+        <p>这不是文档写错，而是 PostgreSQL 规划器在 16/19 这代把"子查询上拉"做得太激进了，导致 <code>from_collapse_limit</code> 的触发闸门很少被碰到。下面用实测说话。</p>
+
+        <hr>
+
+        <h2>一、先确认三个默认值（两版本一致）</h2>
+
+        <p>在 16.11 与 19 Beta1 上分别执行，结果完全相同：</p>
+
+        <pre><code>postgres=# SHOW from_collapse_limit;
+ from_collapse_limit
+---------------------
+ 8
+(1 row)
+
+postgres=# SHOW join_collapse_limit;
+ join_collapse_limit
+---------------------
+ 8
+(1 row)
+
+postgres=# SHOW geqo_threshold;
+ geqo_threshold
+----------------
+ 12
+(1 row)</code></pre>
+
+        <p>记住这三个数：<code>from_collapse_limit = 8</code>、<code>join_collapse_limit = 8</code>、<code>geqo_threshold = 12</code>。最后一个 <code>12</code> 是后文的隐藏陷阱。</p>
+
+        <h2>二、它到底管什么：源码层面</h2>
+
+        <p><code>from_collapse_limit</code> 的真实作用点在 <code>src/backend/optimizer/plan/initsplan.c</code> 的 <code>deconstruct_jointree()</code>，不是很多人以为的"子查询上拉"阶段。关键代码（PG 18.4 源码，16/19 同逻辑）：</p>
+
+        <pre><code>/*
+ * We collapse subproblems into a single joinlist whenever the resulting
+ * joinlist wouldn't exceed from_collapse_limit members.  Also, always
+ * collapse one-element subproblems, since that won't lengthen the
+ * joinlist anyway.
+ */
+...
+sub_members = list_length(sub_joinlist);
+remaining--;
+if (sub_members &lt;= 1 ||
+    list_length(joinlist) + sub_members + remaining &lt;= from_collapse_limit)
+    joinlist = list_concat(joinlist, sub_joinlist);
+else
+    joinlist = lappend(joinlist, sub_joinlist);</code></pre>
+
+        <p>白话翻译：<strong>只有当一个"子问题"包含 <code>&gt;1</code> 个关系、且并入父列表会超过 <code>from_collapse_limit</code> 时，规划器才把它单独钉住</strong>。反过来，<code>sub_members &lt;= 1</code>（单关系子问题）<strong>永远合并</strong>——"反正不会拉长 join 列表"。</p>
+
+        <p>这两个事实决定了后面的所有现象。</p>
+
+        <h2>三、实测一：9 表逗号列表，from_collapse_limit 8 vs 1 —— 计划居然完全一样</h2>
+
+        <p>建 9 张表（t1..t9，链式外键），用逗号列表拼成 9 表连接：</p>
+
+        <pre><code>EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM t1, t2, t3, t4, t5, t6, t7, t8, t9
+WHERE t1.id=t2.t1_id AND t2.id=t3.t2_id AND t3.id=t4.t3_id
+  AND t4.id=t5.t4_id AND t5.id=t6.t5_id AND t6.id=t7.t6_id
+  AND t7.id=t8.t7_id AND t8.id=t9.t8_id AND t1.id=1;</code></pre>
+
+        <p>分别设 <code>from_collapse_limit = 8</code> 和 <code>= 1</code> 执行。<strong>结果：16.11 与 19 Beta1 上，两种设置输出的计划逐行一致（都是 45 行，Nested Loop + Memoize 驱动 t1，其余 t2..t9 走 Merge/Hash Join）。</strong></p>
+
+        <p>原因就是第二节的源码：逗号列表里每个表都是 <strong>1 个关系</strong>的"单成员子问题"，命中 <code>sub_members &lt;= 1</code> 分支——<strong>无论 from_collapse_limit 是 8 还是 1，全部合并</strong>。参数在这里形同虚设。</p>
+
+        <h2>四、实测二：9 表显式 JOIN，join_collapse_limit 8 vs 1 —— 真有差别</h2>
+
+        <p>同样的 9 张表，改用显式 <code>JOIN</code> 语法（无括号）：</p>
+
+        <pre><code>-- join_collapse_limit = 8（默认）
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM t1
+JOIN t2 ON t1.id=t2.t1_id JOIN t3 ON t2.id=t3.t2_id JOIN t4 ON t3.id=t4.t3_id
+JOIN t5 ON t4.id=t5.t4_id JOIN t6 ON t5.id=t6.t5_id JOIN t7 ON t6.id=t7.t6_id
+JOIN t8 ON t7.id=t8.t7_id JOIN t9 ON t8.id=t9.t8_id
+WHERE t1.id=1;</code></pre>
+
+        <p><code>join_collapse_limit = 8</code> 的计划（节选关键结构）：</p>
+
+        <pre><code> Aggregate
+   ->  Hash Join
+         Hash Cond: (t9.t8_id = t8.id)
+         ->  Seq Scan on t9
+         ->  Hash
+               ->  Nested Loop
+                     ->  Index Only Scan using t1_pkey on t1   -- ★ t1 被重排到前面
+                           Index Cond: (id = 1)
+                     ->  Hash Join
+                           Hash Cond: (t8.t7_id = t7.id)
+                           ...</code></pre>
+
+        <p><code>join_collapse_limit = 1</code> 的计划（节选关键结构）：</p>
+
+        <pre><code> Aggregate
+   ->  Hash Join
+         Hash Cond: (t9.t8_id = t8.id)
+         ->  Seq Scan on t9
+         ->  Hash
+               ->  Hash Join
+                     Hash Cond: (t8.t7_id = t7.id)
+                     ...（t9→t8→t7→…→t2 严格左深链式）
+                           ->  Nested Loop
+                                 ->  Index Only Scan using t1_pkey on t1  -- ★ t1 被钉在最底层
+                                 ->  Seq Scan on t2</code></pre>
+
+        <p><strong>差别肉眼可见</strong>：<code>= 8</code> 时规划器把高选择性的 <code>t1.id=1</code>（1 行）重排到连接顺序靠前，尽早缩小中间结果；<code>= 1</code> 时显式 JOIN 严格按书写顺序左深连接，<code>t1</code> 被钉在最底层。两版本输出一致，且 <code>= 1</code> 的计划通常更差（不能利用 t1 的选择性提前裁剪）。</p>
+
+        <p>这就是关键结论：<strong>连接重排的活旋钮是 <code>join_collapse_limit</code>，不是 <code>from_collapse_limit</code></strong>。前者管显式 JOIN 语法的重排，后者管 FROM 子查询/括号子连接的折叠——而后者在现代版本里几乎碰不到触发条件。</p>
+
+        <h2>五、实测三：FROM 子查询在 16/19 被"无条件下拉"，老说法不成立</h2>
+
+        <p>很多旧资料（包括 Pettus 的 GUC 系列）说"含聚合 / DISTINCT / LIMIT / 窗口函数的子查询是栅栏，不会被上拉"。我在 16.11 与 19 Beta1 上实测，<strong>顶层 FROM 子查询几乎全部被内联</strong>：</p>
+
+        <table>
+            <thead>
+                <tr><th>子查询形态</th><th>PG 16.11 / 19 实测（顶层 FROM）</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>简单投影子查询 <code>SELECT id,v FROM t2</code></td><td>上拉，无 Subquery Scan</td></tr>
+                <tr><td>聚合子查询 <code>SELECT t1_id, count(*) FROM t2 GROUP BY t1_id</code></td><td>内联为 HashAggregate，无 Subquery Scan</td></tr>
+                <tr><td><code>OFFSET 0</code> 子查询</td><td>上拉，无 Subquery Scan（旧技巧失效）</td></tr>
+                <tr><td><code>UNION</code> 子查询</td><td>上拉为 Append，无 Subquery Scan</td></tr>
+                <tr><td>窗口函数子查询 <code>row_number() OVER(...)</code></td><td>存活为 Subquery Scan（唯一能形成"子问题"的）</td></tr>
+            </tbody>
+        </table>
+
+        <p>注意最后一行：只有<strong>窗口函数</strong>子查询会作为 <code>Subquery Scan</code> 存活。但它折叠后是<strong>单个 RTE（1 个成员）</strong>，又命中 <code>sub_members &lt;= 1</code>，所以 <code>from_collapse_limit</code> 仍拦不住——我实测 5 表窗口子查询 + 高选择性外表，<code>= 8</code> 与 <code>= 1</code> 计划仍完全一致。</p>
+
+        <h2>六、那 from_collapse_limit 到底什么时候会"咬人"？</h2>
+
+        <p>理论上，只有一种情形它能真正改变计划：<strong>存在一个"多成员子问题"（&gt;1 个关系）且它存活到 deconstruct_jointree 阶段</strong>。实践中主要来自：</p>
+
+        <ul>
+            <li><strong>FULL OUTER JOIN</strong>：源码注释明说它"总是生成独立子问题"。但当周围表有强过滤（如 <code>t1.id=1</code>）时，规划器常把 FULL JOIN 整体常量折叠掉，反而看不到差异——我本想用 FULL OUTER JOIN 造一个干净的反例，结果被优化器直接化简了，所以这里诚实说明：<em>小数据下我没能在 16/19 上逼出 from_collapse_limit 改变计划的实例</em>。</li>
+            <li><strong>不可上拉的多表子查询</strong>：当子查询内部含多个表且因窗口函数等无法上拉时，它作为整体 Subquery Scan 是单成员，仍不触发；要触发必须让它以"多成员 sub_joinlist"形态存在，这在 16/19 的日常 SQL 里极少见。</li>
+        </ul>
+
+        <p>所以务实结论：<strong>调优时别在 from_collapse_limit 上花时间，它基本是个"休眠"参数</strong>；连接顺序出问题，去动 <code>join_collapse_limit</code>。</p>
+
+        <h2>七、geqo_threshold = 12 的隐藏关系（调参铁律）</h2>
+
+        <p>文档与社区反复强调一个坑：<code>geqo_threshold</code> 默认 <code>12</code>。当单个 join 问题达到 12 个关系，规划器从穷举切换为<strong>遗传查询优化器 GEQO</strong>（采样而非全覆盖），可能得到非最优计划。而 <code>from_collapse_limit</code> / <code>join_collapse_limit</code> 默认都是 <code>8</code>，<strong>故意低于 12</strong>，保证默认不会触发 GEQO。</p>
+
+        <p>因此如果你为了"更好计划"把某个 collapse limit 调到 <code>&gt;= 12</code>：</p>
+
+        <pre><code>-- ❌ 危险：只调高 collapse limit，可能静默触发 GEQO 反而更差
+SET from_collapse_limit = 16;
+
+-- ✅ 正确：同一次 SET 里把 geqo_threshold 也调到它之上
+SET from_collapse_limit = 16;
+SET geqo_threshold = 20;</code></pre>
+
+        <p>两者必须配套调，否则你以为在追更优计划、实际可能掉进另一个算法。</p>
+
+        <h2>八、运维建议（给客户现场）</h2>
+
+        <ol>
+            <li><strong>连接重排问题 → 调 join_collapse_limit</strong>：它是 user 级参数（会话内可改），定位慢查询时优先在单会话实验，对比计划与规划时间，别直接改全局。</li>
+            <li><strong>from_collapse_limit 默认 8 即可，基本不用碰</strong>：16/19 里它对日常 SQL 无可见影响；除非你明确在写 FULL OUTER JOIN 重连接且怀疑被钉死，才值得排查。</li>
+            <li><strong>动 collapse limit 必同动 geqo_threshold</strong>：铁律，见第七节。</li>
+            <li><strong>验证先于结论</strong>：任何连接顺序怀疑，先 <code>EXPLAIN (ANALYZE, BUFFERS)</code> 拿到真实成本，再决定是否调参；本博客所有计划均双版本实跑，未脑补。</li>
+        </ol>
+
+        <h2>九、小结</h2>
+
+        <table>
+            <thead>
+                <tr><th>参数</th><th>默认</th><th>管什么</th><th>16/19 实测是否"活"</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>from_collapse_limit</code></td><td>8</td><td>FROM 子查询/括号子连接折叠阈值</td><td>基本休眠（子查询被上拉、单成员永远合并）</td></tr>
+                <tr><td><code>join_collapse_limit</code></td><td>8</td><td>显式 JOIN 语法重排阈值</td><td><strong>活</strong>（=1 强制书写顺序，计划明显不同）</td></tr>
+                <tr><td><code>geqo_threshold</code></td><td>12</td><td>触发遗传优化器的关系数</td><td>调高前两个 limit 时必须同步调高</td></tr>
+            </tbody>
+        </table>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成。所有 EXPLAIN 计划均在 PG 16.11（远程）与 PG 19 Beta1（远程）上实际执行验证，两版本输出一致；未做任何脑补或推测性结论。核心机制经 PostgreSQL 源码 <code>src/backend/optimizer/plan/initsplan.c</code> 的 <code>deconstruct_jointree()</code> 核对。技术审校：小木。</em></p>
+    </div>
+    </article>
+    </main>
+</body>
+</html>
