@@ -167,7 +167,8 @@ WHERE t1.id=1;</code></pre>
             <tbody>
                 <tr><td>简单投影 <code>SELECT id,v FROM t2</code></td><td>无 Subquery Scan</td><td>上拉</td></tr>
                 <tr><td>聚合 <code>GROUP BY ... count(*)</code></td><td>内联为 HashAggregate</td><td>上拉</td></tr>
-                <tr><td><code>OFFSET 0</code></td><td>无 Subquery Scan（旧技巧失效）</td><td>上拉</td></tr>
+                <tr><td><code>OFFSET 0</code>（无外层 WHERE）</td><td>无 Subquery Scan（旧技巧失效）</td><td>上拉</td></tr>
+                <tr><td><code>OFFSET 0</code>（带外层 WHERE）</td><td>子查询存活为 <code>Subquery Scan</code>，谓词下推为 Filter</td><td>拦截（保留）</td></tr>
                 <tr><td><code>UNION</code></td><td>上拉为 Append</td><td>上拉</td></tr>
                 <tr><td>普通 <code>LIMIT</code>（无 OFFSET 0）</td><td>Limit 节点被合并</td><td>上拉</td></tr>
                 <tr><td>普通 <code>DISTINCT</code> / 嵌套 DISTINCT</td><td>两层 HashAggregate，无 Subquery Scan</td><td>上拉</td></tr>
@@ -176,14 +177,14 @@ WHERE t1.id=1;</code></pre>
             </tbody>
         </table>
 
-        <p>注意最后一行：在 16/19 实测中，<strong>只有窗口函数</strong>子查询会作为 <code>Subquery Scan</code> 存活（聚合、LIMIT、DISTINCT、DISTINCT ON、UNION、OFFSET 0 全被上拉）。但这活下来的窗口函数子查询折叠后是<strong>单个 RTE（1 个成员）</strong>，又命中 <code>sub_members &lt;= 1</code>，所以 <code>from_collapse_limit</code> 仍拦不住——我实测 5 表窗口子查询 + 高选择性外表，<code>= 8</code> 与 <code>= 1</code> 计划仍完全一致。换句话说：<strong>拦截上拉 ≠ 触发 from_collapse_limit</strong>，二者是不同阶段的门槛。</p>
-        <p><em>脚注（与老木对齐）：老木提醒"某些嵌套 DISTINCT 形态仍可能保留子问题"。但本实测在 16.11 与 19 Beta1 上，普通嵌套 <code>DISTINCT</code>（验证 3：<code>SELECT DISTINCT a FROM (SELECT DISTINCT a ...)</code>）也被上拉为两层 HashAggregate，未形成 Subquery Scan；<code>DISTINCT ON</code>（补充验证）同样被下推为 Unique → Sort。可见 16/19 对 DISTINCT 的放宽比旧资料描述的更彻底——窗口函数是目前实测唯一确凿的拦截点。对于含不可下推聚合/集合操作等更特殊的子查询，仍可能保留，但那已超出日常 SQL 范畴。</em></p>
+        <p>注意上表后半部分：在 16/19 实测中，<strong>窗口函数</strong>子查询必然作为 <code>Subquery Scan</code> 存活；而经典的 <code>OFFSET 0</code> "栅栏"技巧<strong>取决于外层是否有谓词</strong>——无外层 WHERE 时被移除（旧技巧失效），带外层 WHERE 时仍存活为 <code>Subquery Scan</code> 屏障（谓词仅下推为 Filter，无法改写子查询）。但这些被拦截存活的子查询折叠后仍是<strong>单个 RTE（1 个成员）</strong>，命中 <code>sub_members &lt;= 1</code>，所以 <code>from_collapse_limit</code> 照样拦不住——我实测 5 表窗口子查询 + 高选择性外表，<code>= 8</code> 与 <code>= 1</code> 计划仍完全一致。换句话说：<strong>拦截上拉 ≠ 触发 from_collapse_limit</strong>，二者是不同阶段的门槛。</p>
+        <p><em>脚注（与老木对齐）：老木提醒"某些嵌套 DISTINCT 形态仍可能保留子问题"。但本实测在 16.11 与 19 Beta1 上，普通嵌套 <code>DISTINCT</code>（验证 3：<code>SELECT DISTINCT a FROM (SELECT DISTINCT a ...)</code>）也被上拉为两层 HashAggregate，未形成 Subquery Scan；<code>DISTINCT ON</code>（补充验证）同样被下推为 Unique → Sort。可见 16/19 对 DISTINCT 的放宽比旧资料描述的更彻底——窗口函数是目前实测唯一确凿的拦截点。对于含不可下推聚合/集合操作等更特殊的子查询，仍可能保留，但那已超出日常 SQL 范畴。此外，老木复核指出经典 <code>OFFSET 0</code> 栅栏并非无条件移除——本实测 A/B 对照确认：无外层谓词时子查询被移除（旧技巧失效），带外层 <code>WHERE</code> 时仍保留 <code>Subquery Scan</code> 屏障、谓词仅下推为 Filter。上表已据实测拆分为"无/有外层 WHERE"两行。</em></p>
 
         <h2>六、那 from_collapse_limit 到底什么时候会"咬人"？概念澄清</h2>
 
         <p>先厘清容易被混为一谈的两个阶段：</p>
         <ul>
-            <li><strong>阶段一 · 入口闸门 <code>pull_up_subqueries</code></strong>：决定一个 FROM 子查询能不能被"拉平"进父查询。这一步在 16/19 非常激进，多数子查询（聚合、LIMIT、DISTINCT、UNION…）都被上拉，于是它们根本不会以"子问题"形态存活到下一阶段。</li>
+            <li><strong>阶段一 · 入口闸门 <code>pull_up_subqueries</code></strong>：决定一个 FROM 子查询能不能被"拉平"进父查询。这一步在 16/19 非常激进，多数子查询（聚合、LIMIT、DISTINCT、UNION、无外层谓词的 OFFSET 0 等）都被上拉，于是它们根本不会以"子问题"形态存活到下一阶段。</li>
             <li><strong>阶段二 · <code>deconstruct_jointree</code>（from_collapse_limit 作用点）</strong>：对<em>已经存活</em>的子问题，决定是否把它并入父 joinlist 成为可整体重排的 join 问题。<code>from_collapse_limit</code> 只在这里起作用。</li>
         </ul>
         <p>所以老木的审阅点很准：<code>from_collapse_limit</code> <strong>不是"休眠"或"无效"</strong>，而是<strong>入口闸门在现代 PG 里已经把大多数子查询上拉掉了，导致它很少有机会碰到"多成员子问题"</strong>。它该管的场景依然在：</p>
