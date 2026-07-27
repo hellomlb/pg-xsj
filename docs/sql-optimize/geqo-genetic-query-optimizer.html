@@ -46,7 +46,7 @@
     <div class="post-content">
         <h2>一句话总结</h2>
 
-        <p>遗传查询优化器（GEQO）是 PostgreSQL 在 join 关系过多、常规规划器算不动时启用的"<strong>近似优化</strong>"兜底。我在 <strong>PG 16.11 与 16.14</strong> 上实跑验证后，三个结论最值得记：<strong>① geqo_threshold 是 7 个参数里唯一真正有价值的旋钮</strong>（其余 6 个基本不可调）；<strong>② EXPLAIN 计划树里永远没有任何 GEQO 标记</strong>——它悄悄介入却从不告诉你；<strong>③ 当你调高 join_collapse_limit / from_collapse_limit 后，视图被内联，planner 看到的关系数越过 geqo_threshold，会"意外"触发 GEQO</strong>。排查 GEQO 闯祸，靠的是经验而非 EXPLAIN 里的字面证据。</p>
+        <p>遗传查询优化器（GEQO）是 PostgreSQL 在 join 关系过多、常规规划器算不动时启用的"<strong>近似优化</strong>"兜底。我在 <strong>PG 16.11 与 16.14</strong> 上实跑验证后，三个结论最值得记：<strong>① geqo_threshold 是 7 个参数里最该先碰的旋钮</strong>——其余 6 个全部能 SET / ALTER SYSTEM 成功，但只有 geqo（排查时关）、geqo_seed（锁定计划）、geqo_effort（极端调优）这 3 个有实战价值，geqo_pool_size / geqo_generations / geqo_selection_bias 虽能设却几乎无人动（详见第五节价值分档）；<strong>② EXPLAIN 计划树里永远没有任何 GEQO 标记</strong>——它悄悄介入却从不告诉你（坐实靠 seed 抖动对照，非字面证据）；<strong>③ 当你调高 join_collapse_limit / from_collapse_limit 后，视图被内联，planner 看到的关系数越过 geqo_threshold，会"意外"触发 GEQO</strong>。排查 GEQO 闯祸，靠的是排除法而非 EXPLAIN 里的字面证据。</p>
 
         <hr>
 
