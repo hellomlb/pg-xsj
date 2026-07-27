@@ -8,7 +8,7 @@
     <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
     <meta name="description" content="基于 PG 16.11 与 16.14 双版本实跑，验证遗传查询优化器 GEQO 的触发边界（geqo_threshold）、EXPLAIN 从不打印 GEQO 标记、seed 改变 join 顺序的旁证，以及 join_collapse_limit 越过阈值会意外触发 GEQO。">
     <meta property="og:title" content="遗传查询优化器 GEQO 实测：它何时介入、为何 EXPLAIN 从不告诉你、以及那个意外触发它的旋钮">
-    <meta property="og:description" content="双版本实跑：geqo_threshold 是唯一有价值的旋钮；EXPLAIN 计划树里没有任何 GEQO 标记；改 geqo_seed 会改变 join 顺序（GEQO 介入硬证据）；join_collapse_limit 抬高会意外触发 GEQO。">
+    <meta property="og:description" content="双版本实跑：geqo_threshold 控制 GEQO 触发边界；EXPLAIN 计划树里没有任何 GEQO 标记；改 geqo_seed 会改变 join 顺序（GEQO 介入硬证据）；effort 调高显著拉长 Planning Time；seed 固定后计划可复现；join_collapse_limit 抬高会意外触发 GEQO。">
     <meta property="og:type" content="article">
     <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/geqo-genetic-query-optimizer.html">
 </head>
@@ -166,9 +166,15 @@ postgres=# SHOW geqo_seed;          -- 0</code></pre>
 
         <ol>
             <li><strong>geqo = on 保持</strong>：它是防 planner 在巨量 join 上算到超时 / OOM 的最后防线，没有理由关。</li>
-            <li><strong>geqo_threshold 是唯一值得动的旋钮</strong>：默认 12 源自 20 年前的硬件假设。现代机器上，把阈值提到 <strong>15~20</strong> 往往能让更多查询走"确定且更优"的常规 planner——但这是<strong>经验建议，不是单一测试能证明的</strong>：必须在你的真实大 join 上对比 <code>Planning Time</code> 再定，别拍脑袋套数。</li>
-            <li><strong>其余 5 个参数（effort / pool_size / generations / selection_bias / seed）DBA 实践不可调</strong>：它们只在关系数已越过阈值、GEQO 真正运行时才微弱影响搜索质量，日常基本碰不到。</li>
-            <li><strong>排查 GEQO 闯祸的三板斧</strong>（因 EXPLAIN 无标记）：① 临时把 <code>geqo_threshold</code> 调高看计划是否变好；② 数查询的 FROM / JOIN 项数，对照当前阈值；③ 改 <code>geqo_seed</code> 看 join 顺序是否变化（变了就是它）。</li>
+            <li><strong>geqo_threshold 是唯一能控制 GEQO 触发边界的旋钮</strong>：默认 12 源自 20 年前的硬件假设。现代机器上，把阈值提到 <strong>15~20</strong> 往往能让更多查询走"确定且更优"的常规 planner——但这是<strong>经验建议，不是单一测试能证明的</strong>：必须在你的真实大 join 上对比 <code>Planning Time</code> 再定，别拍脑袋套数。</li>
+            <li><strong>其余 6 个参数都能 SET 生效，但价值分三档（双版本实测）</strong>：
+                <ul>
+                    <li><strong>有真实用途的 3 个</strong>：<code>geqo</code> 本身可在排查时临时关闭（看常规 planner 给什么计划，是诊断 GEQO 闯祸的第一板斧，双版本实测 SET off 生效）；<code>geqo_seed</code> 固定后计划逐行可复现（锁定已知好计划 / 消除随机抖动，双版本实测 seed=0.5 时 run1 与 run2 计划树完全一致）；<code>geqo_effort</code>（1~10）实测调高会显著拉长 Planning Time（16.14 上 16.8ms→70.8ms，翻 4 倍）且改变 join 顺序——GEQO 已触发、规划预算充足时可调高换更好计划。</li>
+                    <li><strong>默认自适应、专家级调的 2 个</strong>：<code>geqo_pool_size</code> / <code>geqo_generations</code> 默认 0（由 effort 推导），手动覆盖通常是源码级调优或极端场景，普通 DBA 用不到。</li>
+                    <li><strong>几乎不可调的 1 个</strong>：<code>geqo_selection_bias</code> 合法范围仅 <strong>1.5~2.0</strong>，默认 2.0 已是上限（双版本实测设 2.5 直接报错），几乎没有调节空间。</li>
+                </ul>
+            </li>
+            <li><strong>排查 GEQO 闯祸的三板斧</strong>（因 EXPLAIN 无标记）：① 临时把 <code>geqo_threshold</code> 调高看计划是否变好；② 数查询的 FROM / JOIN 项数，对照当前阈值；③ 改 <code>geqo_seed</code> 看 join 顺序是否变化（变了就是它）。反过来，若某次随机恰好给了好计划，把该 <code>geqo_seed</code> 固定下来即可锁定它、消除后续随机抖动。</li>
             <li><strong>动 collapse limit 必同动 geqo_threshold</strong>：避免"我只是想重排连接，结果唤醒了遗传算法"的意外。</li>
         </ol>
 
