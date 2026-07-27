@@ -171,7 +171,7 @@ postgres=# SHOW geqo_seed;          -- 0</code></pre>
                 <ul>
                     <li><strong>有真实用途的 3 个</strong>：<code>geqo</code> 本身可在排查时临时关闭（看常规 planner 给什么计划，是诊断 GEQO 闯祸的第一板斧，双版本实测 SET off 生效）；<code>geqo_seed</code> 固定后计划逐行可复现（锁定已知好计划 / 消除随机抖动，双版本实测 seed=0.5 时 run1 与 run2 计划树完全一致）；<code>geqo_effort</code>（1~10）实测调高会显著拉长 Planning Time（16.14 上 16.8ms→70.8ms，翻 4 倍）且改变 join 顺序——GEQO 已触发、规划预算充足时可调高换更好计划。</li>
                     <li><strong>默认自适应、专家级调的 2 个</strong>：<code>geqo_pool_size</code> / <code>geqo_generations</code> 默认 0（由 effort 推导），手动覆盖通常是源码级调优或极端场景，普通 DBA 用不到。</li>
-                    <li><strong>几乎不可调的 1 个</strong>：<code>geqo_selection_bias</code> 合法范围仅 <strong>1.5~2.0</strong>，默认 2.0 已是上限（双版本实测设 2.5 直接报错），几乎没有调节空间。</li>
+                    <li><strong>能调但实战无价值的 1 个</strong>：<code>geqo_selection_bias</code> 合法范围 <strong>1.5~2.0</strong>（默认 2.0 封顶），区间内任意值（如 1.5）均可 SET / ALTER SYSTEM 成功，仅越界值（如 2.5）报错。窗口极窄且默认已是上限，调低边际收益微乎其微，属教科书参数，实战几乎无人动。</li>
                 </ul>
             </li>
             <li><strong>排查 GEQO 闯祸的三板斧</strong>（因 EXPLAIN 无标记）：① 临时把 <code>geqo_threshold</code> 调高看计划是否变好；② 数查询的 FROM / JOIN 项数，对照当前阈值；③ 改 <code>geqo_seed</code> 看 join 顺序是否变化（变了就是它）。反过来，若某次随机恰好给了好计划，把该 <code>geqo_seed</code> 固定下来即可锁定它、消除后续随机抖动。</li>
