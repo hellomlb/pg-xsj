@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>遗传查询优化器 GEQO 实测：它何时介入、为何 EXPLAIN 从不告诉你、以及那个意外触发它的旋钮 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="基于 PG 16.11 与 16.14 双版本实跑，验证遗传查询优化器 GEQO 的触发边界（geqo_threshold）、EXPLAIN 从不打印 GEQO 标记、seed 改变 join 顺序的旁证，以及 join_collapse_limit 越过阈值会意外触发 GEQO。">
+    <meta property="og:title" content="遗传查询优化器 GEQO 实测：它何时介入、为何 EXPLAIN 从不告诉你、以及那个意外触发它的旋钮">
+    <meta property="og:description" content="双版本实跑：geqo_threshold 是唯一有价值的旋钮；EXPLAIN 计划树里没有任何 GEQO 标记；改 geqo_seed 会改变 join 顺序（GEQO 介入硬证据）；join_collapse_limit 抬高会意外触发 GEQO。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/geqo-genetic-query-optimizer.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>遗传查询优化器 GEQO 实测：它何时介入、为何 EXPLAIN 从不告诉你、以及那个意外触发它的旋钮</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-27">2026-07-27</time>
+            <span class="post-category sql-optimize">SQL优化</span>
+            <span class="post-tags">
+                <span class="tag">geqo</span>
+                <span class="tag">geqo_threshold</span>
+                <span class="tag">规划器</span>
+                <span class="tag">join_collapse_limit</span>
+                <span class="tag">遗传算法</span>
+                <span class="tag">执行计划</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + 16.14 双版本实跑</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p>遗传查询优化器（GEQO）是 PostgreSQL 在 join 关系过多、常规规划器算不动时启用的"<strong>近似优化</strong>"兜底。我在 <strong>PG 16.11 与 16.14</strong> 上实跑验证后，三个结论最值得记：<strong>① geqo_threshold 是 7 个参数里唯一真正有价值的旋钮</strong>（其余 6 个基本不可调）；<strong>② EXPLAIN 计划树里永远没有任何 GEQO 标记</strong>——它悄悄介入却从不告诉你；<strong>③ 当你调高 join_collapse_limit / from_collapse_limit 后，视图被内联，planner 看到的关系数越过 geqo_threshold，会"意外"触发 GEQO</strong>。排查 GEQO 闯祸，靠的是经验而非 EXPLAIN 里的字面证据。</p>
+
+        <hr>
+
+        <h2>一、7 个参数默认值（双版本一致）</h2>
+
+        <p>在 16.11 与 16.14 上分别 <code>SHOW</code>，结果完全相同：</p>
+
+        <pre><code>postgres=# SHOW geqo;               -- on
+postgres=# SHOW geqo_threshold;     -- 12
+postgres=# SHOW geqo_effort;        -- 5
+postgres=# SHOW geqo_pool_size;     -- 0
+postgres=# SHOW geqo_generations;   -- 0
+postgres=# SHOW geqo_selection_bias;-- 2
+postgres=# SHOW geqo_seed;          -- 0</code></pre>
+
+        <p>核心只有 <code>geqo_threshold</code>：当查询的<strong>逻辑关系数达到该值</strong>，常规规划器放弃穷举、fallback 到 GEQO。<code>geqo</code> 总开关保持 <code>on</code> 即可，它是防 planner 在巨量 join 上算到 OOM / 超时的最后防线。</p>
+
+        <h2>二、geqo_threshold 边界：触发 vs 不触发</h2>
+
+        <p>准备 7 张 80 行小表，做 7 表 join。把阈值从默认的 12 调到 <code>4</code>（远低于 7，应触发 GEQO），再调到 <code>20</code>（高于 7，应走常规 planner），对比同一句 SQL 的计划（以下输出取自 PG 16.14）：</p>
+
+        <pre><code>-- scene1：geqo_threshold = 4（7 表 join ≥ 4 → GEQO 介入）
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (t4.a = t1.a)
+         ->  Sort ... Seq Scan on t4
+         ->  Materialize
+               ->  Merge Join
+                     Merge Cond: (t7.a = t1.a)
+                     ->  Sort ... Seq Scan on t7
+                     ->  Materialize
+                           ->  Merge Join
+                                 Merge Cond: (t5.a = t1.a)
+                                 ...
+                                 ->  Merge Join
+                                       Merge Cond: (t2.a = t1.a)
+                                       ->  Merge Join
+                                             Merge Cond: (t1.a = t3.a)
+                                             ...
+
+-- scene2：geqo_threshold = 20（7 表 join < 20 → 常规 planner）
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (t1.a = t4.a)
+         ->  Merge Join
+               Merge Cond: (t3.a = t1.a)
+               ->  Sort ... Seq Scan on t3
+               ->  Materialize
+                     ->  Merge Join
+                           Merge Cond: (t1.a = t2.a)
+                           ...
+         ->  Materialize
+               ->  Merge Join
+                     Merge Cond: (t4.a = t6.a)
+                     ->  Merge Join
+                           Merge Cond: (t4.a = t5.a)
+                           ...
+                     ->  Merge Join
+                           Merge Cond: (t6.a = t7.a)
+                           ...</code></pre>
+
+        <p><strong>同一个 SQL、只改阈值，join 顺序天差地别</strong>：scene1 是以 <code>t1</code> 为中心向外辐射的遗传顺序（<code>t4,t7,t5,t6,t2,t3</code>），scene2 是常规 planner 的左深树（<code>t1,t3,t2</code> 成组、<code>t4,t5,t6,t7</code> 成组）。两版本（16.11 / 16.14）的顶层 <code>Merge Cond</code> 完全一致：scene1 均为 <code>(t4.a = t1.a)</code>，scene2 均为 <code>(t1.a = t4.a)</code>。</p>
+
+        <h2>三、关键坑：EXPLAIN 从不打印 GEQO 标记</h2>
+
+        <p>上面 scene1 那 39 行计划里，你找不到任何 <code>GEQO</code> / "遗传" / "approximate" 字样——只有 <code>Aggregate / Merge Join / Sort / Seq Scan / Materialize</code>。我专门用脚本在 EXPLAIN 输出里检索 <code>geqo</code>（大小写不敏感），<strong>计划树部分命中数为 0</strong>（命中的全是 <code>SHOW geqo*</code> 这些参数显示行，与计划无关）。</p>
+
+        <p>这意味着：<strong>你永远无法从 EXPLAIN 字面判断"这是 GEQO 生成的计划"</strong>。GEQO 只改 join 顺序的决策，不打印任何标记。这个负向证据，比正向的阈值对比更难拿到，却是坐实"GEQO 介入"的关键。</p>
+
+        <h2>四、seed 旁证：改 geqo_seed 就改 join 顺序</h2>
+
+        <p>常规 planner 不读 <code>geqo_seed</code>；只有 GEQO 会用它做随机搜索的随机源。所以"改 seed 看顺序变不变"是 GEQO 介入的硬证据。在 <code>threshold=4</code> 下对比：</p>
+
+        <pre><code>-- seed = 0（顶层 Merge Cond）
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (t4.a = t1.a)     ← 与 scene1 完全相同
+
+-- seed = 0.7（threshold 仍为 4，仅改 seed）
+ Aggregate
+   ->  Merge Join
+         Merge Cond: (t1.a = t2.a)     ← 换了一棵完全不同的树</code></pre>
+
+        <p>只改 <code>geqo_seed</code>（其余不变），join 顺序从以 <code>t1</code> 为中心变成以 <code>t2</code> 为中心——常规 planner 绝不会这样。两版本（16.11 / 16.14）表现一致，这是 GEQO 确实在读 seed 的实锤。</p>
+
+        <h2>五、意外触发：join_collapse_limit 越过阈值会唤醒 GEQO</h2>
+
+        <p>GEQO 看的是 planner 实际看到的"<strong>逻辑关系数</strong>"。如果你调高 <code>join_collapse_limit</code>，原本该保留为独立单元的视图会被内联、打散进主 join 层，关系数随之越过 <code>geqo_threshold</code>——于是你"语义上只写了 3 个 FROM 项"的查询，意外被 GEQO 接管。用带 <code>DISTINCT</code> 的视图演示（<code>DISTINCT</code> 阻止子查询上拉，planner 必须保留为独立单元）：</p>
+
+        <pre><code>-- scene5：join_collapse_limit = 8（视图内联，5 个基表进主 join 层 → 关系数 5 ≥ 4 → 触发）
+ Aggregate
+   ->  Hash Join
+         Hash Cond: (t1.a = t3.a)
+         ->  Hash Join
+               Hash Cond: (t5.a = t1.a)
+               ...
+         ->  Hash
+               ->  Unique                  ← v_d12(t1,t2) 被展开进主 join 层
+                     ->  Merge Join ...
+         ->  Hash
+               ->  Unique                  ← v_d34(t3,t4) 也被展开
+
+-- scene6：join_collapse_limit = 1（视图保留，主 join 仅 t5 + 两个视图 = 3 关系 < 4 → 不触发）
+ Aggregate
+   ->  Hash Join
+         Hash Cond: (t5.a = t1.a)
+         ->  Seq Scan on t5
+         ->  Hash
+               ->  Merge Join
+                     Merge Cond: (t1.a = t3.a)
+                     ->  Unique            ← v_d12 保留为独立单元
+                     ->  Unique            ← v_d34 保留为独立单元</code></pre>
+
+        <p>两版本一致：<code>jcl=8</code> 时 Unique 节点被推到主 join 层（关系数 5，触发），<code>jcl=1</code> 时 Unique 作为子单元保留（关系数 3，不触发）。这正是 <code>from_collapse_limit</code> 与 GEQO 的隐藏关系——<strong>动 collapse limit 必同动 geqo_threshold</strong>。关于 <code>from_collapse_limit</code> 为何很少被触发、真正管用的旋钮是谁，详见 <a href="/pg-xsj/sql-optimize/from_collapse_limit.html">《from_collapse_limit 深度实测》</a>。</p>
+
+        <h2>六、实战建议</h2>
+
+        <ol>
+            <li><strong>geqo = on 保持</strong>：它是防 planner 在巨量 join 上算到超时 / OOM 的最后防线，没有理由关。</li>
+            <li><strong>geqo_threshold 是唯一值得动的旋钮</strong>：默认 12 源自 20 年前的硬件假设。现代机器上，把阈值提到 <strong>15~20</strong> 往往能让更多查询走"确定且更优"的常规 planner——但这是<strong>经验建议，不是单一测试能证明的</strong>：必须在你的真实大 join 上对比 <code>Planning Time</code> 再定，别拍脑袋套数。</li>
+            <li><strong>其余 5 个参数（effort / pool_size / generations / selection_bias / seed）DBA 实践不可调</strong>：它们只在关系数已越过阈值、GEQO 真正运行时才微弱影响搜索质量，日常基本碰不到。</li>
+            <li><strong>排查 GEQO 闯祸的三板斧</strong>（因 EXPLAIN 无标记）：① 临时把 <code>geqo_threshold</code> 调高看计划是否变好；② 数查询的 FROM / JOIN 项数，对照当前阈值；③ 改 <code>geqo_seed</code> 看 join 顺序是否变化（变了就是它）。</li>
+            <li><strong>动 collapse limit 必同动 geqo_threshold</strong>：避免"我只是想重排连接，结果唤醒了遗传算法"的意外。</li>
+        </ol>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成。</em></p>
+    </div>
+    </article>
+    </main>
+</body>
+</html>

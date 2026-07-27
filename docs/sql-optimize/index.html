@@ -29,6 +29,24 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/geqo-genetic-query-optimizer.html">遗传查询优化器 GEQO 实测：它何时介入、为何 EXPLAIN 从不告诉你、以及那个意外触发它的旋钮</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-27">2026-07-27</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">GEQO 是 join 关系过多时规划器的近似优化兜底。PG 16.11 与 16.14 双版本实跑：geqo_threshold 是 7 参数里唯一真正有价值的旋钮；EXPLAIN 计划树永远不打印 GEQO 标记（负向铁证）；改 geqo_seed 改变 join 顺序即 GEQO 介入的硬证据；调高 join_collapse_limit 让视图内联、关系数越过阈值会意外唤醒 GEQO。排查三板斧与 from_collapse_limit 的隐藏关系一并讲清。</p>
+        <a href="/pg-xsj/sql-optimize/geqo-genetic-query-optimizer.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/gin_fuzzy_search_limit.html">gin_fuzzy_search_limit 实测：默认 0 的 GUC，为何能让 GIN 索引静默丢行</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-27">2026-07-27</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">gin_fuzzy_search_limit 默认 0 即精确搜索；设非 0 启用 GIN 模糊搜索，扫描只返回 posting list 的随机近似子集。PG 16.11 与 16.14 双版本实跑：jsonb ?、数组 @>、pg_trgm 的 LIKE 三类 GIN 索引，count(*) 从正确的 5000 塌到 80~110，且同一查询两次执行结果不同——静默返错、无报错。生产保持 0，它不是诊断探针。</p>
+        <a href="/pg-xsj/sql-optimize/gin_fuzzy_search_limit.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/from_collapse_limit.html">from_collapse_limit 深度实测：PG 16/19 里它为何很少被触发，真正管用的旋钮是谁</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-24">2026-07-24</time>

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gin_fuzzy_search_limit 实测：默认 0 的 GUC，为何能让 GIN 索引静默丢行 - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="基于 PG 16.11 与 16.14 双版本实跑，验证 gin_fuzzy_search_limit 设非 0 后 GIN 索引（jsonb、数组、pg_trgm）静默随机丢弃匹配行、count(*) 返回错误数字、同一查询两次结果不同。默认 0 才是精确搜索。">
+    <meta property="og:title" content="gin_fuzzy_search_limit 实测：默认 0 的 GUC，为何能让 GIN 索引静默丢行">
+    <meta property="og:description" content="双版本实跑证明：gin_fuzzy_search_limit 默认 0 精确；设非 0 触发 GIN 模糊搜索，jsonb/数组/pg_trgm 三类索引静默丢行、count(*) 返错、结果非确定。生产慎用。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/gin_fuzzy_search_limit.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>gin_fuzzy_search_limit 实测：默认 0 的 GUC，为何能让 GIN 索引静默丢行</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-27">2026-07-27</time>
+            <span class="post-category sql-optimize">SQL优化</span>
+            <span class="post-tags">
+                <span class="tag">gin_fuzzy_search_limit</span>
+                <span class="tag">GIN</span>
+                <span class="tag">jsonb</span>
+                <span class="tag">数组包含</span>
+                <span class="tag">pg_trgm</span>
+                <span class="tag">查询正确性</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + 16.14 双版本实跑</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>gin_fuzzy_search_limit</code> 默认 <code>0</code>，含义是"<strong>不限制 = 精确搜索</strong>"。一旦把它设成非 0 值，PostgreSQL 会对 GIN 索引扫描启用"<strong>模糊搜索</strong>"：扫描只返回 posting list 的<strong>随机子集</strong>，且数量只是近似；同一个 <code>SELECT</code> 跑两次可能返回<strong>不同行</strong>。我在 <strong>PG 16.11 与 16.14</strong> 上用 jsonb、数组、pg_trgm 三类 GIN 索引实跑验证，<code>count(*)</code> 从正确的 5000 塌到 80~110，且两次执行结果不一致。这个参数平时看不见，但谁手贱设了非 0，生产查询就可能<strong>静默返回错误结果</strong>——这是最危险的失败模式：不是报错，是返错还一声不吭。</p>
+
+        <hr>
+
+        <h2>一、参数层：默认 0，双版本一致</h2>
+
+        <p>在 16.11 与 16.14 上分别 <code>SHOW</code>，结果完全相同：</p>
+
+        <pre><code>postgres=# SHOW gin_fuzzy_search_limit;
+ gin_fuzzy_search_limit
+------------------------
+ 0
+(1 row)</code></pre>
+
+        <ul>
+            <li><strong>默认值 0</strong>：不限制，GIN 扫描返回全部匹配行（精确）。</li>
+            <li><strong>context = user</strong>：可在会话 / 角色 / 库级 <code>SET</code>，无需重启。</li>
+            <li><strong>两版本一致</strong>：16.11 与 16.14 的默认值、上下文、分类完全相同。</li>
+        </ul>
+
+        <p>也正因它是 <code>user</code> 级，任何会话都能悄悄打开——所以"谁动了它"很难从配置文件里反查，只能从异常结果倒推。</p>
+
+        <h2>二、jsonb 家族实测（j ? 操作符）</h2>
+
+        <p>构造 5000 行、每行 <code>j</code> 都含键 <code>a</code>，建 GIN 索引，强制走索引扫描（<code>enable_seqscan=off</code>），对比 <code>limit=0</code> 与 <code>limit=100</code>（以下输出取自 PG 16.14）：</p>
+
+        <pre><code>postgres=# SET enable_seqscan = off;
+postgres=# SET gin_fuzzy_search_limit = 0;
+postgres=# SELECT count(*) FROM t_json WHERE j ? 'a';
+ count
+-------
+  5000          ← 正确：5000 行全匹配
+
+postgres=# SET gin_fuzzy_search_limit = 100;
+postgres=# SELECT count(*) FROM t_json WHERE j ? 'a';
+ count
+-------
+   80           ← 本应 5000，少了 4920 行（PG 16.14 第一次）
+postgres=# SELECT count(*) FROM t_json WHERE j ? 'a';
+ count
+-------
+  109           ← 同一句 SQL 再跑一次：又变了（PG 16.14 第二次）</code></pre>
+
+        <p>双版本完整数据（各跑两次 <code>limit=100</code>，注意同一版本两次结果也不同）：</p>
+
+        <table>
+            <thead>
+                <tr><th>GIN 家族</th><th>版本</th><th>limit=0（正确值）</th><th>limit=100（第1次）</th><th>limit=100（第2次）</th></tr>
+            </thead>
+            <tbody>
+                <tr><td rowspan="2"><code>jsonb ?</code></td><td>16.11</td><td>5000</td><td>110</td><td>84</td></tr>
+                <tr><td>16.14</td><td>5000</td><td>80</td><td>109</td></tr>
+                <tr><td rowspan="2"><code>数组 @&gt;</code></td><td>16.11</td><td>5000</td><td>106</td><td>107</td></tr>
+                <tr><td>16.14</td><td>5000</td><td>100</td><td>92</td></tr>
+                <tr><td rowspan="2"><code>pg_trgm LIKE</code></td><td>16.11</td><td>5000</td><td>89</td><td>108</td></tr>
+                <tr><td>16.14</td><td>5000</td><td>103</td><td>95</td></tr>
+            </tbody>
+        </table>
+
+        <h2>三、数组与 pg_trgm 家族：同一个坑</h2>
+
+        <p>数组包含 <code>@&gt;</code> 与 pg_trgm 的 <code>LIKE '%abc%'</code> 走了 GIN 索引后，行为完全一致——<code>limit=0</code> 全对，<code>limit=100</code> 塌到 ~100 且两次结果不同（以下输出取自 PG 16.14）：</p>
+
+        <pre><code>-- 数组 @> ARRAY[1]
+postgres=# SET gin_fuzzy_search_limit = 0;
+postgres=# SELECT count(*) FROM t_arr WHERE a @> ARRAY[1];
+ count
+-------
+  5000
+postgres=# SET gin_fuzzy_search_limit = 100;
+postgres=# SELECT count(*) FROM t_arr WHERE a @> ARRAY[1];
+ count
+-------
+  100           ← 第一次；第二次变成 92
+
+-- pg_trgm：LIKE '%abc%'（gin_trgm_ops 索引）
+postgres=# SET gin_fuzzy_search_limit = 0;
+postgres=# SELECT count(*) FROM t_txt WHERE t LIKE '%abc%';
+ count
+-------
+  5000
+postgres=# SET gin_fuzzy_search_limit = 100;
+postgres=# SELECT count(*) FROM t_txt WHERE t LIKE '%abc%';
+ count
+-------
+  103           ← 第一次；第二次变成 95</code></pre>
+
+        <h2>四、机制：为什么会丢行？</h2>
+
+        <p>GIN 索引对高频键维护一个 <strong>posting list</strong>（命中行指针列表）。当某个键的 posting list 很大时，<code>gin_fuzzy_search_limit</code> 非 0 会让扫描<strong>只取前 N 个（近似）指针</strong>就不再继续，从而"以正确性换速度"。三个要点：</p>
+
+        <ul>
+            <li><strong>触发条件看 posting list 大小，不看操作符</strong>：jsonb <code>?</code>、数组 <code>@&gt;</code>、pg_trgm 的 <code>LIKE</code>（gin_trgm_ops 索引）机制相同；只有当某键匹配量足够大、posting list 超过阈值，模糊才生效。这也解释了为什么小表测不出问题——<strong>表越大、匹配越密，坑越深</strong>。</li>
+            <li><strong>返回的是随机子集，不是"前 N 行"</strong>：所以同一查询两次执行，取的子集不同 → 行数不同、内容也不同。</li>
+            <li><strong>count(*) 也中招</strong>：聚合统计同样基于这个残缺子集，于是"总数"也是错的。这比漏几行更毒——它让你的监控、对账、分页都建立在错误数字上，却没有任何报错提醒。</li>
+        </ul>
+
+        <h2>五、实战建议</h2>
+
+        <ol>
+            <li><strong>生产保持默认 0</strong>：除非你明确知道自己在做"近似去重 / 采样"且能接受丢行，否则永远别动它。</li>
+            <li><strong>排查线索</strong>：若某 GIN 查询（尤其全文检索、jsonb 路径、模糊 LIKE）结果忽多忽少、count 与明细对不上，先查 <code>SELECT current_setting('gin_fuzzy_search_limit')</code> 是不是被会话 / 角色 / 库级改过。</li>
+            <li><strong>它不是诊断探针</strong>：与 enable_* 系列不同，设非 0 是"真的丢数据"，不是"换执行计划"。把它当性能开关用是危险误解。</li>
+            <li><strong>双版本无差异</strong>：16.11 与 16.14 行为完全一致，升级不会自动改变这个坑——但也不会自动帮你避开。</li>
+        </ol>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成。</em></p>
+    </div>
+    </article>
+    </main>
+</body>
+</html>
