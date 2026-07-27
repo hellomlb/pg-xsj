@@ -114,7 +114,9 @@ postgres=# SHOW geqo_seed;          -- 0</code></pre>
 
         <p>上面 scene1 那 39 行计划里，你找不到任何 <code>GEQO</code> / "遗传" / "approximate" 字样——只有 <code>Aggregate / Merge Join / Sort / Seq Scan / Materialize</code>。我专门用脚本在 EXPLAIN 输出里检索 <code>geqo</code>（大小写不敏感），<strong>计划树部分命中数为 0</strong>（命中的全是 <code>SHOW geqo*</code> 这些参数显示行，与计划无关）。</p>
 
-        <p>这意味着：<strong>你永远无法从 EXPLAIN 字面判断"这是 GEQO 生成的计划"</strong>。GEQO 只改 join 顺序的决策，不打印任何标记。这个负向证据，比正向的阈值对比更难拿到，却是坐实"GEQO 介入"的关键。</p>
+        <p>这意味着：<strong>你永远无法从 EXPLAIN 字面判断"这是 GEQO 生成的计划"</strong>。GEQO 只改 join 顺序的决策，不打印任何标记——所以"在 EXPLAIN 里找 GEQO 字样"这条正面取证之路，从根上就死了。</p>
+
+        <p>那怎么证明 GEQO 真的介入了？只能走<strong>排除法</strong>：既然正面认不出，就反过来证明"这个计划不可能是常规 planner（动态规划）生成的"。排除法的硬动作只有一个——<strong>seed 抖动对照</strong>：常规 planner 是确定性的、且根本不读 <code>geqo_seed</code>，它绝不会因为 seed 而换 join 顺序；一旦只改 <code>geqo_seed</code> 顺序就抖（见第四节），就排除了 DP，而 PG 里会读 seed 的随机化 join 优化器只有 GEQO 一家 → 坐实介入。所谓"负向证据"，指的不是"EXPLAIN 没标记"本身，而是"没标记"逼出来的这条排除链——它比正向的阈值对比更难构造（要绕过子查询上拉、要对照 <code>geqo=off</code>），却是唯一能坐实"GEQO 介入"的路径。</p>
 
         <h2>四、seed 旁证：改 geqo_seed 就改 join 顺序</h2>
 
