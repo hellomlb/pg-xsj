@@ -29,6 +29,15 @@
 
 <div class="post-list">
     <article class="post-card">
+        <h3><a href="/pg-xsj/sql-optimize/hash_mem_multiplier.html">hash_mem_multiplier 实测：PG15 为何把默认从 1.0 提到 2.0，以及它如何"只喂哈希不喂排序"</a></h3>
+        <div class="post-meta">
+            <time datetime="2026-07-29">2026-07-29</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+        </div>
+        <p class="post-excerpt">hash_mem_multiplier 只放大哈希操作（HashAgg/HashJoin）内存 = work_mem × 倍数。PG 16.11 与 16.14 双版本实跑：work_mem=1MB 下倍数 1→4，HashAgg 溢盘 Batches 从 17 降到 5、磁盘从 30MB 砍到 7MB；同查询含 Sort+HashAgg 时调它只动哈希、排序纹丝不动——这就是比全局加 work_mem 更精准的「外科手术式」调优。也讲清 PG15 默认从 1.0 改 2.0 的实证收益。</p>
+        <a href="/pg-xsj/sql-optimize/hash_mem_multiplier.html" class="read-more">阅读全文 →</a>
+    </article>
+    <article class="post-card">
         <h3><a href="/pg-xsj/sql-optimize/geqo-genetic-query-optimizer.html">遗传查询优化器 GEQO 实测：它何时介入、为何 EXPLAIN 从不告诉你、以及那个意外触发它的旋钮</a></h3>
         <div class="post-meta">
             <time datetime="2026-07-27">2026-07-27</time>

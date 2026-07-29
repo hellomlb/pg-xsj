@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>hash_mem_multiplier 实测：PG15 为何把默认从 1.0 提到 2.0，以及它如何"只喂哈希不喂排序" - PG习思集</title>
+    <link rel="stylesheet" href="/pg-xsj/assets/style.css">
+    <link rel="alternate" type="application/rss+xml" title="PG习思集 RSS" href="/pg-xsj/feed.xml">
+    <meta name="description" content="基于 PG 16.11 与 16.14 双版本实跑，验证 hash_mem_multiplier 控制哈希操作（HashAgg/HashJoin）可用内存 = work_mem × 倍数；默认 2.0（PG15 起）比 1.0 让 HashAgg 溢盘的 Batches 从 17 降到 9；同查询含 Sort+HashAgg 时，调它只改变哈希的 Batches，排序完全不动——这就是「外科手术式」调优。">
+    <meta property="og:title" content="hash_mem_multiplier 实测：PG15 为何把默认从 1.0 提到 2.0">
+    <meta property="og:description" content="双版本实跑证明：hash_mem_multiplier 只放大哈希操作内存，不影响排序；默认 2.0 让 HashAgg 溢盘 Batches 减半，调它比全局加 work_mem 更精准。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://hellomlb.github.io/pg-xsj/sql-optimize/hash_mem_multiplier.html">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container">
+            <h1><a href="/pg-xsj/">PG习思集</a></h1>
+            <p class="subtitle">PostgreSQL 内核研究 · Bug 分析 · CVE 验证 · 实战笔记</p>
+            <nav class="site-nav">
+                <a href="/pg-xsj/">🏠 首页</a>
+                <a href="/pg-xsj/feed.xml">📡 RSS</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <article class="post-full">
+    <header class="post-header">
+        <h1>hash_mem_multiplier 实测：PG15 为何把默认从 1.0 提到 2.0，以及它如何"只喂哈希不喂排序"</h1>
+        <div class="post-meta">
+            <time datetime="2026-07-29">2026-07-29</time>
+            <span class="post-category sql-optimize">SQL 优化</span>
+            <span class="post-tags">
+                <span class="tag">hash_mem_multiplier</span>
+                <span class="tag">work_mem</span>
+                <span class="tag">HashAgg</span>
+                <span class="tag">HashJoin</span>
+                <span class="tag">Batches</span>
+                <span class="tag">内存调优</span>
+            </span>
+        </div>
+        <div class="verified-badge">✅ 已验证版 · PG 16.11 + 16.14 双版本实跑</div>
+    </header>
+
+    <div class="post-content">
+        <h2>一句话总结</h2>
+
+        <p><code>hash_mem_multiplier</code> 是个<strong>只给哈希操作开小灶</strong>的旋钮：哈希聚合 / 哈希连接能申请的内存 = <code>work_mem × hash_mem_multiplier</code>。它在 <strong>PG15 把默认值从 1.0 提到了 2.0</strong>——这不是随便改的数字，而是因为<strong>排序和哈希对内存的需求天生不对称</strong>：排序（外排序）做过一次归并之后再加内存收益趋零，哈希表装不下就落盘成 batch 文件、且 batch 越多随机 I/O 越凶，是"饿的时候给一点就活，不给就崩"。我在 <strong>PG 16.11 与 16.14</strong> 上用 50 万行、5 万分组实跑：固定 <code>work_mem=1MB</code>，把倍数从 <strong>1.0 调到 4.0</strong>，HashAgg 的 <strong>Batches 从 17 降到 5、磁盘占用从 30MB 砍到 7MB</strong>；而同一个查询里如果还带排序，调这个倍数<strong>只动哈希、排序节点的磁盘占用纹丝不动</strong>——这就是它比"全局加 work_mem"更精准的地方。</p>
+
+        <hr>
+
+        <h2>一、参数层：默认 2.0，双版本一致，可会话级调</h2>
+
+        <p>在 16.11 与 16.14 上分别查 <code>pg_settings</code>，结果完全相同：</p>
+
+        <pre><code>postgres=# SELECT name, setting, unit, context, min_val, max_val
+           FROM pg_settings WHERE name='hash_mem_multiplier';
+       name        | setting | unit | context | min_val | max_val
+-------------------+---------+------+---------+---------+---------
+ hash_mem_multiplier | 2       |      | user    | 1       | 1000
+(1 row)
+
+postgres=# SHOW hash_mem_multiplier;
+ hash_mem_multiplier
+---------------------
+ 2
+(1 row)</code></pre>
+
+        <ul>
+            <li><strong>默认值 2.0</strong>：哈希操作可用内存 = <code>work_mem × 2</code>。</li>
+            <li><strong>context = user</strong>：会话 / 角色 / 库级 <code>SET</code> 即可，无需重启——这意味着你可以<strong>只对那一条吃哈希的慢查询开小灶</strong>，而不动全局。</li>
+            <li><strong>范围 1 .. 1000</strong>：边界真实实测。在两版本上 <code>SET hash_mem_multiplier = 0.5</code> 直接报错 <code>0.5 is outside the valid range ... (1 .. 1000)</code>；<code>= 1.0</code> / <code>= 4.0</code> / <code>= 100</code> 均成功。所以"调小到 1 以下"是<strong>语法上就不可能</strong>的，下限 1 就是"和 work_mem 一比一"。</li>
+            <li><strong>两版本零差异</strong>：16.11 与 16.14 的默认值、范围、上下文完全相同。</li>
+        </ul>
+
+        <h2>二、为什么排序和哈希对内存天生不对称（核心机制）</h2>
+
+        <p>要理解这个参数为什么存在，先想清楚一个反直觉的点：<strong>同样给内存，排序和哈希的回报曲线完全不同</strong>。</p>
+
+        <ul>
+            <li><strong>排序（外排序）</strong>：内存不够时，PG 把数据切成若干"runs"写盘，再做<strong>归并（merge）</strong>。归并是顺序 I/O，且有一个"收益递减"的硬规律——<strong>只要内存够做一次归并 pass，再加内存只是减少 pass 数，而 pass 数本身对性能的影响是次线性的</strong>。换句话说，排序"饿不死"，给一点就能跑，给很多也不会快很多。</li>
+            <li><strong>哈希（HashAgg / HashJoin）</strong>：哈希表必须尽量驻留内存。装不下时，PG 把它<strong>溢盘成多个 batch 文件</strong>，执行时按 batch 依次处理——这会带来<strong>大量随机 I/O</strong>，且 batch 越多、重复扫描越大。<strong>哈希是"饿的时候给一点内存就活，不给就剧烈变慢"</strong>。</li>
+        </ul>
+
+        <p>于是问题来了：<code>work_mem</code> 是<strong>全局</strong>的，排序和哈希一起吃。但哈希更"怕饿"。PG15 的解法是——<strong>不碰全局 work_mem，单独给哈希操作再乘一个 2 倍的默认系数</strong>。等于说：默认配置下，哈希天生比排序多拿一倍内存，而这正好补上它最缺的那块。</p>
+
+        <blockquote>
+            社区在 PG15 将 <code>hash_mem_multiplier</code> 默认值从 1.0 改为 2.0（见 PG15 release notes）。下面第三节用 16.x 上"设 1.0 复现旧默认行为"来佐证这个改动的价值——注意：实测只证明 16.x 上 1.0 与 2.0 的差异，不直接证明 PG14 的默认值；历史默认值以 release notes 为准。
+        </blockquote>
+
+        <h2>三、实测：HashAgg 溢盘随倍数变化（双版本一致）</h2>
+
+        <p>构造 50 万行、<code>grp % 50000</code>（5 万个分组），固定 <code>work_mem = '1MB'</code>，对比三个倍数下 HashAgg 的 <strong>Batches（溢盘批数）</strong>与磁盘占用（以下 EXPLAIN 节选取自 PG 16.14）：</p>
+
+        <pre><code>SET work_mem = '1MB';
+SET hash_mem_multiplier = 1.0;   -- 复现 PG14 旧默认行为
+EXPLAIN (ANALYZE, BUFFERS)
+  SELECT count(*), sum(length(v)) FROM t_big GROUP BY grp;
+-- Partial HashAggregate  Group Key: grp
+--   Planned Partitions: 16  Batches: 17  Memory Usage: 977kB  Disk Usage: 30744kB
+
+SET hash_mem_multiplier = 2.0;   -- PG15+ 默认
+--   Planned Partitions: 8   Batches: 9   Memory Usage: 2129kB Disk Usage: 13840kB
+
+SET hash_mem_multiplier = 4.0;
+--   Planned Partitions: 4   Batches: 5   Memory Usage: 4145kB Disk Usage: 7416kB</code></pre>
+
+        <p>双版本完整数据（Batches 是稳定信号；耗时会随机器负载波动，仅作辅助）：</p>
+
+        <table>
+            <thead>
+                <tr><th>倍数</th><th>16.11 Batches</th><th>16.14 Batches</th><th>磁盘占用</th><th>Planned Partitions</th><th>16.11 耗时</th><th>16.14 耗时</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>1.0（模拟 PG14）</td><td>17</td><td>17</td><td>~30 MB</td><td>16</td><td>1098 ms</td><td>1643 ms</td></tr>
+                <tr><td>2.0（PG15+ 默认）</td><td>9</td><td>9</td><td>~14 MB</td><td>8</td><td>749 ms</td><td>1431 ms</td></tr>
+                <tr><td>4.0</td><td>5</td><td>5</td><td>~7 MB</td><td>4</td><td>899 ms</td><td>1230 ms</td></tr>
+            </tbody>
+        </table>
+
+        <ul>
+            <li><strong>Batches 17 → 9 → 5</strong>，双版本<strong>逐个数完全一致</strong>。倍数翻倍，溢盘批数大约减半。</li>
+            <li><strong>Planned Partitions 同步从 16→8→4</strong>：规划器在<strong>计划阶段</strong>就用这个倍数估算哈希表大小、决定分多少区——所以它影响的是"怎么排兵布阵"，不是执行时才补救。</li>
+            <li><strong>默认 2.0 相对 1.0，Batches 直接砍掉近一半</strong>——这就是 PG15 改默认值的实证收益：在不改全局 work_mem 的前提下，哈希操作的溢盘压力小了一大截。</li>
+        </ul>
+
+        <h2>四、外科手术证明：同查询含 Sort + HashAgg，调它只动哈希</h2>
+
+        <p>最有意思的在这里。把上面查询加一个 <code>ORDER BY count(*) DESC LIMIT 10</code>，同一个计划里既有 <strong>Sort</strong>（对聚合结果排序）又有 <strong>HashAgg</strong>。然后把倍数从 1.0 拉到 4.0：</p>
+
+        <table>
+            <thead>
+                <tr><th>倍数</th><th>HashAgg Batches</th><th>Sort 节点磁盘占用</th><th>结论</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>1.0</td><td>17</td><td>1624 kB</td><td rowspan="2">HashAgg 从 17 降到 5，<strong>Sort 磁盘 1624→1680 kB 几乎不动</strong></td></tr>
+                <tr><td>4.0</td><td>5</td><td>1680 kB</td></tr>
+            </tbody>
+        </table>
+
+        <p>这说明：<code>hash_mem_multiplier</code> 的影响<strong>精准限定在哈希操作</strong>。排序该用多少内存还是多少，完全不被这个倍数波及。它不像 <code>work_mem</code> 那样"一刀切"——这就是"外科手术式调优"的字面意思：<strong>只给饿的那个喂，不撑着不饿的</strong>。</p>
+
+        <h2>五、对照：调 work_mem 会同时动哈希和排序</h2>
+
+        <p>反过来，固定倍数 = 2.0，只调 <code>work_mem</code>：</p>
+
+        <pre><code>SET hash_mem_multiplier = 2.0;
+SET work_mem = '1MB';
+EXPLAIN (ANALYZE, BUFFERS)
+  SELECT grp, count(*), sum(length(v)) FROM t_big GROUP BY grp ORDER BY count(*) DESC LIMIT 10;
+-- HashAgg: Batches 9，Sort: external merge Disk ~1.6MB
+
+SET work_mem = '8MB';
+-- HashAgg: Batches 1  Memory Usage: 6673kB  ← 不溢盘了
+-- Sort: top-N heapsort Memory: 25kB         ← 排序也跟着不溢盘</code></pre>
+
+        <p><strong>调 work_mem，哈希和排序一起被喂饱</strong>（8MB 时两者都不溢盘）；<strong>调 hash_mem_multiplier，只有哈希被喂饱</strong>。两者都能救哈希溢盘，但颗粒度完全不同：</p>
+
+        <table>
+            <thead>
+                <tr><th>旋钮</th><th>影响范围</th><th>适用场景</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>hash_mem_multiplier</code></td><td>仅哈希操作</td><td>只有哈希溢盘、排序没问题；想精准、不想动全局</td></tr>
+                <tr><td><code>work_mem</code></td><td>排序 + 哈希 + 所有内存消费者</td><td>全局性内存不足，但要小心：它也会放大每个操作的峰值内存占用</td></tr>
+            </tbody>
+        </table>
+
+        <h2>六、实战建议</h2>
+
+        <ol>
+            <li><strong>别动全局默认值去救一条 SQL</strong>。看到 HashAgg / HashJoin 的 <code>Batches &gt; 1</code>，优先用 <strong>会话级</strong> <code>SET hash_mem_multiplier = 4.0</code>（或更大）只喂这一条查询——它是 <code>user</code> 级，会话结束即失效，不影响别人。</li>
+            <li><strong>先看 Batches，再看耗时</strong>。Batches 是计划稳定性的硬信号；耗时受机器负载影响会抖，别拿单次耗时当结论。</li>
+            <li><strong>它是"放大"不是"替代"</strong>：最终哈希内存 = <code>work_mem × 倍数</code>。work_mem 本身设得极小（如 1MB）时，倍数再大也有限；真要根治大哈希，往往要两者配合。</li>
+            <li><strong>双版本无差异</strong>：16.11 与 16.14 行为完全一致，升级不会自动改变这个特性——但 PG15 起<strong>默认就是 2.0</strong>，从 PG14 升上来等于白捡一倍哈希内存，无需任何操作。</li>
+            <li><strong>调小需谨慎</strong>：实测中更激进的负载（150 万行 / 20 万分组 + 极小 work_mem）下曾出现 backend 异常断开，<strong>根因未定位</strong>，不排除是溢盘 batch 文件带来的临时文件 / 内存压力。生产上<strong>调小</strong> hash_mem_multiplier（制造大量 batch）前，建议先设 <code>temp_file_limit</code> 兜底，并先在测试环境复现。</li>
+        </ol>
+
+        <hr>
+
+        <p class="post-note"><em>本文由 AI 辅助生成，全部 SQL 在 PG 16.11 与 16.14 双版本实跑验证；Batches 等关键数字两版本逐个数一致。</em></p>
+    </div>
+    </article>
+    </main>
+</body>
+</html>
