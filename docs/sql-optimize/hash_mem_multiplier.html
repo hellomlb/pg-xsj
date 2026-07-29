@@ -106,7 +106,7 @@ SET hash_mem_multiplier = 2.0;   -- PG15+ 默认
 SET hash_mem_multiplier = 4.0;
 --   Planned Partitions: 4   Batches: 5   Memory Usage: 4145kB Disk Usage: 7416kB</code></pre>
 
-        <p>16.14 与 19 完整数据（Batches 是稳定信号；耗时会随机器负载波动，仅作辅助）：</p>
+        <p>16.14 与 19 完整数据（<strong>Batches 是稳定硬信号</strong>，耗时会随机器负载波动，仅作辅助参考）：</p>
 
         <table>
             <thead>
@@ -170,9 +170,13 @@ SET work_mem = '8MB';
 
         <h2>六、实战建议</h2>
 
+        <div class="hard-signal">
+            <span class="hard-signal-title">📌 Batches 是硬信号，耗时是软信号</span>
+            <p>衡量 <code>hash_mem_multiplier</code> 调优成效，唯一可信的指标是 <strong>HashAgg / HashJoin 的 <code>Batches</code>（溢盘批数）</strong>——它只由「数据量 × work_mem × 倍数」决定，与机器瞬时负载无关，本实测 16.14 与 19 逐个数完全一致（17 / 9 / 5）。耗时则受 CPU、IO、并行 worker 启动等影响会剧烈抖动：本实测中 19 的 <code>m=1.0</code> 首跑 10982ms、温水重跑 1799ms，相差 6 倍。<strong>任何调优结论，都以 Batches 收敛为准，不要拿单次耗时当成效。</strong></p>
+        </div>
+
         <ol>
             <li><strong>别动全局默认值去救一条 SQL</strong>。看到 HashAgg / HashJoin 的 <code>Batches &gt; 1</code>，优先用 <strong>会话级</strong> <code>SET hash_mem_multiplier = 4.0</code>（或更大）只喂这一条查询——它是 <code>user</code> 级，会话结束即失效，不影响别人。</li>
-            <li><strong>先看 Batches，再看耗时</strong>。Batches 是计划稳定性的硬信号；耗时受机器负载影响会抖，别拿单次耗时当结论。</li>
             <li><strong>它是"放大"不是"替代"</strong>：最终哈希内存 = <code>work_mem × 倍数</code>。work_mem 本身设得极小（如 1MB）时，倍数再大也有限；真要根治大哈希，往往要两者配合。</li>
             <li><strong>双版本无差异</strong>：16.14 与 19 行为完全一致，升级不会自动改变这个特性——但 PG15 起<strong>默认就是 2.0</strong>，从 PG14 升上来等于白捡一倍哈希内存，无需任何操作。</li>
         </ol>

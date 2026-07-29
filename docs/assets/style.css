@@ -266,3 +266,31 @@ body {
     .post-header h1 { font-size: 22px; }
     .container { padding: 0 16px; }
 }
+
+/* Hard Signal Callout - 强调稳定硬指标（如 Batches）vs 波动软指标（如耗时） */
+.hard-signal {
+    background: var(--tag-bg);
+    border-left: 4px solid var(--accent);
+    border-radius: 4px;
+    padding: 14px 18px;
+    margin: 18px 0;
+}
+.hard-signal .hard-signal-title {
+    display: block;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 6px;
+}
+.hard-signal p {
+    margin: 0;
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.7;
+}
+.hard-signal code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 13px;
+}
