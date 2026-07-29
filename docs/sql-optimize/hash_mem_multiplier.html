@@ -175,7 +175,6 @@ SET work_mem = '8MB';
             <li><strong>先看 Batches，再看耗时</strong>。Batches 是计划稳定性的硬信号；耗时受机器负载影响会抖，别拿单次耗时当结论。</li>
             <li><strong>它是"放大"不是"替代"</strong>：最终哈希内存 = <code>work_mem × 倍数</code>。work_mem 本身设得极小（如 1MB）时，倍数再大也有限；真要根治大哈希，往往要两者配合。</li>
             <li><strong>双版本无差异</strong>：16.14 与 19 行为完全一致，升级不会自动改变这个特性——但 PG15 起<strong>默认就是 2.0</strong>，从 PG14 升上来等于白捡一倍哈希内存，无需任何操作。</li>
-            <li><strong>调小需谨慎</strong>：实测中更激进的负载（150 万行 / 20 万分组 + 极小 work_mem）下曾出现 backend 异常断开，<strong>根因未定位</strong>，不排除是溢盘 batch 文件带来的临时文件 / 内存压力。生产上<strong>调小</strong> hash_mem_multiplier（制造大量 batch）前，建议先设 <code>temp_file_limit</code> 兜底，并先在测试环境复现。</li>
         </ol>
 
         <hr>
